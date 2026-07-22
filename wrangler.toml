@@ -1,0 +1,8 @@
+name = "jkbms-cloud"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+[[kv_namespaces]]
+binding = "DEVICES"
+id = "8008ca076b924768aa29505bfba8c7f9"
+preview_id = "8008ca076b924768aa29505bfba8c7f9"

@@ -34,6 +34,7 @@ app.post('/api/register-device', (req, res) => {
         mac: body.mac || existing.mac || '',
         local_ip: body.local_ip || existing.local_ip || '',
         ssid: body.ssid || existing.ssid || '',
+        rssi: body.rssi || existing.rssi || 0,
         hostname: body.hostname || existing.hostname || '',
         firmware_version: body.firmware_version || existing.firmware_version || '',
         active_bms_mac: body.active_bms_mac || existing.active_bms_mac || '',
@@ -49,11 +50,11 @@ app.post('/api/register-device', (req, res) => {
         mos_temp: existing.mos_temp || 0,
     });
 
-    console.log(`[REGISTER] Device: ${deviceId} | IP: ${body.local_ip} | WiFi: ${body.ssid} | FW: ${body.firmware_version}`);
+    console.log(`[REGISTER] Device: ${deviceId} | IP: ${body.local_ip} | WiFi: ${body.ssid} (${body.rssi}dBm) | FW: ${body.firmware_version}`);
     res.json({ status: 'ok', message: 'Device registered successfully', device_id: deviceId });
 });
 
-// POST /api/device-heartbeat — called by ESP32 every 60 seconds
+// POST /api/device-heartbeat — called by ESP32
 app.post('/api/device-heartbeat', (req, res) => {
     const body = req.body;
     const deviceId = body.device_id;
@@ -65,16 +66,39 @@ app.post('/api/device-heartbeat', (req, res) => {
         ...existing,
         device_id: deviceId,
         local_ip: body.local_ip || existing.local_ip || '',
-        firmware_version: body.firmware || existing.firmware_version || '',
-        connected: body.connected || false,
-        voltage: body.voltage || 0,
-        current: body.current || 0,
-        soc: body.soc || 0,
-        mos_temp: body.mos_temp || 0,
+        ssid: body.ssid || existing.ssid || '',
+        rssi: body.rssi || existing.rssi || 0,
+        connected: body.connected !== undefined ? Boolean(body.connected) : false,
+        voltage: body.voltage !== undefined ? parseFloat(body.voltage) : 0,
+        current: body.current !== undefined ? parseFloat(body.current) : 0,
+        soc: body.soc !== undefined ? parseInt(body.soc) : 0,
+        mos_temp: body.mos_temp !== undefined ? parseFloat(body.mos_temp) : 0,
         lastSeen: Date.now(),
     });
 
     res.json({ status: 'ok' });
+});
+
+// Command Queue Store
+const commandQueue = new Map();
+
+// POST /api/send-command — Queue command for device
+app.post('/api/send-command', (req, res) => {
+    const { device_id, cmd } = req.body;
+    if (!device_id || !cmd) return res.status(400).json({ error: 'device_id and cmd required' });
+    if (!commandQueue.has(device_id)) commandQueue.set(device_id, []);
+    commandQueue.get(device_id).push(cmd);
+    console.log(`[Command] Queued command for ${device_id}:`, cmd);
+    res.json({ status: 'ok', message: 'Command queued' });
+});
+
+// GET /api/device-commands — ESP32 polling endpoint
+app.get('/api/device-commands', (req, res) => {
+    const deviceId = req.query.device_id;
+    if (!deviceId) return res.json([]);
+    const cmds = commandQueue.get(deviceId) || [];
+    commandQueue.set(deviceId, []);
+    res.json(cmds);
 });
 
 // GET /api/devices — return all devices (for dashboard)
@@ -88,15 +112,26 @@ app.get('/api/devices', (req, res) => {
     res.json(list);
 });
 
+// GET /d/:deviceId — Customer device page
+app.get('/d/:deviceId', (req, res) => {
+    const deviceId = req.params.deviceId;
+    const d = devices.get(deviceId) || { device_id: deviceId, registeredAt: Date.now() };
+    d.online = isOnline(d);
+    d.lastSeenAgo = d.lastSeen ? Math.floor((Date.now() - d.lastSeen) / 1000) : null;
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+    res.send(CUSTOMER_DEVICE_HTML(d));
+});
+
 // ─── WEB DASHBOARD ───────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
     res.send(DASHBOARD_HTML);
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
     console.log(`[Server] JK BMS Cloud Server running on port ${PORT}`);
-    console.log(`[Server] Dashboard: http://localhost:${PORT}`);
+    console.log(`[Server] Live Domain: https://jkbms.namka.vn (Local: http://localhost:${PORT})`);
 });
 
 // ─── EMBEDDED DASHBOARD HTML ─────────────────────────────────────────────────
@@ -544,13 +579,268 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       }).join('');
 
     } catch(e) {
-      document.getElementById('refresh-label').textContent = 'Lỗi kết nối server!';
+      document.getElementById('refresh-label').textContent = 'Lỗi kết nối!';
     }
   }
-
   fetchDevices();
-  setInterval(fetchDevices, 10000);
+  setInterval(fetchDevices, 5000);
 </script>
-
 </body>
 </html>`;
+
+function CUSTOMER_DEVICE_HTML(d) {
+  const online = d.online;
+  const bleConnected = d.connected;
+  const soc = d.soc || 0;
+  const voltage = (d.voltage || 0).toFixed(2);
+  const current = (d.current || 0).toFixed(1);
+  const power = (d.power || (d.voltage * d.current) || 0).toFixed(1);
+  const temp = (d.mos_temp || 0).toFixed(1);
+  const temp1 = d.temp1 !== undefined ? d.temp1.toFixed(1) : '—';
+  const temp2 = d.temp2 !== undefined ? d.temp2.toFixed(1) : '—';
+  const capacityAh = d.capacity_ah !== undefined ? d.capacity_ah.toFixed(1) : '—';
+  const cycleCount = d.cycle_count !== undefined ? d.cycle_count : '—';
+  
+  const cellMin = d.cell_min !== undefined ? d.cell_min.toFixed(3) : '—';
+  const cellMax = d.cell_max !== undefined ? d.cell_max.toFixed(3) : '—';
+  const cellDelta = d.cell_delta !== undefined ? d.cell_delta.toFixed(3) : '—';
+  const cellMinNum = d.cell_min_num || '-';
+  const cellMaxNum = d.cell_max_num || '-';
+  const cells = d.cells || [];
+
+  const chargeMos = d.charge_mos;
+  const dischargeMos = d.discharge_mos;
+  const balance = d.balance;
+
+  const socColor = soc > 60 ? '#3fb950' : soc > 25 ? '#e3b341' : '#f85149';
+  const statusText = online ? 'WiFi Online' : 'WiFi Offline';
+  const statusColor = online ? '#3fb950' : '#f85149';
+  const bleText = bleConnected ? '🟢 Đã kết nối BMS' : '🔴 Chưa kết nối Bluetooth';
+  const bleColor = bleConnected ? '#3fb950' : '#f85149';
+  const rssiVal = d.rssi ? `${d.rssi} dBm` : 'Chưa có';
+  const reg = d.registeredAt ? new Date(d.registeredAt).toLocaleDateString('vi-VN') : '—';
+
+  // Render Cell Grid HTML
+  let cellsGridHtml = '';
+  if (cells.length > 0) {
+    cellsGridHtml = cells.map((v, i) => {
+      const num = i + 1;
+      let borderStyle = '1px solid rgba(255,255,255,0.1)';
+      let bgStyle = 'rgba(15,23,42,0.8)';
+      if (num === cellMinNum) { borderStyle = '1px solid #f85149'; bgStyle = 'rgba(248,81,73,0.15)'; }
+      if (num === cellMaxNum) { borderStyle = '1px solid #3fb950'; bgStyle = 'rgba(63,185,80,0.15)'; }
+      const valStr = typeof v === 'number' ? v.toFixed(3) : parseFloat(v).toFixed(3);
+      return `<div style="background:${bgStyle};border:${borderStyle};padding:8px 6px;border-radius:8px;text-align:center;">
+        <div style="font-size:0.68rem;color:#8b949e;">C${num}</div>
+        <div style="font-size:0.85rem;font-weight:700;color:#e6edf3;margin-top:2px;">${valStr}V</div>
+      </div>`;
+    }).join('');
+  } else {
+    cellsGridHtml = `<div style="grid-column:span 4;text-align:center;padding:12px;color:#8b949e;font-size:0.8rem;">Đang chờ nhận dữ liệu các Cell pin từ JK-BMS...</div>`;
+  }
+
+  return `<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Giám Sát Pin - ${d.device_id}</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  *{margin:0;padding:0;box-sizing:border-box;}
+  body{font-family:'Inter',sans-serif;background:#0d1117;color:#e6edf3;min-height:100vh;padding-bottom:30px;}
+  .hero{background:linear-gradient(135deg,#0d1117 0%,#161b22 50%,#0d1117 100%);padding:28px 20px 0;text-align:center;position:relative;overflow:hidden;}
+  .hero::before{content:'';position:absolute;inset:0;background:radial-gradient(ellipse at 50% 0%,rgba(63,185,80,0.12) 0%,transparent 70%);}
+  .status-dot{width:10px;height:10px;border-radius:50%;background:${statusColor};display:inline-block;margin-right:6px;animation:${online ? 'pulse' : 'none'} 1.5s ease-in-out infinite;}
+  .status-badge{display:inline-flex;align-items:center;background:${online ? 'rgba(63,185,80,0.15)' : 'rgba(248,81,73,0.15)'};border:1px solid ${statusColor}33;color:${statusColor};padding:5px 14px;border-radius:20px;font-size:0.8rem;font-weight:600;margin-bottom:14px;}
+  h1{font-size:1.5rem;font-weight:800;letter-spacing:-0.02em;margin-bottom:2px;}
+  .device-id{font-size:0.8rem;color:#8b949e;font-family:monospace;margin-bottom:14px;}
+  .ble-status{font-size:0.9rem;font-weight:700;color:${bleColor};margin-bottom:20px;padding:6px 16px;background:rgba(255,255,255,0.04);border-radius:20px;display:inline-block;}
+  
+  .soc-ring{position:relative;width:170px;height:170px;margin:0 auto 24px;}
+  .soc-ring svg{transform:rotate(-90deg);}
+  .soc-ring circle{fill:none;stroke-width:12;stroke-linecap:round;}
+  .soc-track{stroke:#21262d;}
+  .soc-fill{stroke:${socColor};stroke-dasharray:${Math.PI * 2 * 68};stroke-dashoffset:${Math.PI * 2 * 68 * (1 - soc / 100)};transition:stroke-dashoffset 1s ease;}
+  .soc-label{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;}
+  .soc-val{font-size:2.4rem;font-weight:800;color:${socColor};line-height:1;}
+  .soc-unit{font-size:0.8rem;color:#8b949e;margin-top:2px;}
+
+  .section{max-width:440px;margin:0 auto;padding:0 16px 16px;}
+  .section-title{font-size:0.8rem;font-weight:700;color:#58a6ff;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:10px;display:flex;align-items:center;gap:6px;}
+
+  .metrics{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+  .metric-card{background:#161b22;border:1px solid rgba(255,255,255,0.08);border-radius:14px;padding:14px 14px;}
+  .metric-icon{font-size:1.3rem;margin-bottom:6px;}
+  .metric-val{font-size:1.35rem;font-weight:800;line-height:1;}
+  .metric-label{font-size:0.7rem;color:#8b949e;margin-top:4px;text-transform:uppercase;letter-spacing:0.05em;}
+
+  .info-card{background:#161b22;border:1px solid rgba(255,255,255,0.08);border-radius:14px;padding:14px 16px;}
+  .info-row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.05);}
+  .info-row:last-child{border-bottom:none;}
+  .info-key{font-size:0.78rem;color:#8b949e;}
+  .info-val{font-size:0.82rem;font-weight:600;font-family:monospace;color:#e6edf3;}
+
+  .cells-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:10px;}
+
+  .status-pill{padding:4px 10px;border-radius:12px;font-size:0.75rem;font-weight:700;}
+  .status-pill.on{background:rgba(63,185,80,0.15);color:#3fb950;border:1px solid rgba(63,185,80,0.3);}
+  .status-pill.off{background:rgba(248,81,73,0.15);color:#f85149;border:1px solid rgba(248,81,73,0.3);}
+
+  .footer{text-align:center;padding:16px;color:#484f58;font-size:0.72rem;}
+  .footer a{color:#58a6ff;text-decoration:none;}
+  @keyframes pulse{0%,100%{opacity:1;}50%{opacity:0.4;}}
+</style>
+</head>
+<body>
+<div class="hero">
+  <div style="position:relative;z-index:1;">
+    <div class="status-badge"><span class="status-dot"></span>${statusText} • 📶 ${rssiVal}</div>
+    <h1>🔋 Giám Sát Pin JK-BMS</h1>
+    <div class="device-id">ID: ${d.device_id}</div>
+    <div class="ble-status">${bleText}</div>
+    
+    <div class="soc-ring">
+      <svg width="170" height="170" viewBox="0 0 170 170">
+        <circle class="soc-track" cx="85" cy="85" r="68"/>
+        <circle class="soc-fill" cx="85" cy="85" r="68"/>
+      </svg>
+      <div class="soc-label">
+        <span class="soc-val">${soc}</span>
+        <span class="soc-unit">% Dung Lượng</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- BLOCK 1: THÔNG SỐ TỔNG QUAN -->
+<div class="section">
+  <div class="section-title">⚡ Thông Số Điện Áp & Dòng Điện</div>
+  <div class="metrics">
+    <div class="metric-card">
+      <div class="metric-icon">⚡</div>
+      <div class="metric-val" style="color:#58a6ff;">${voltage} V</div>
+      <div class="metric-label">Điện Áp Pack</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-icon">🔌</div>
+      <div class="metric-val" style="color:${parseFloat(current) < 0 ? '#f85149' : '#3fb950'};">${current} A</div>
+      <div class="metric-label">Dòng Điện Sạc / Xả</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-icon">💡</div>
+      <div class="metric-val" style="color:#e3b341;">${power} W</div>
+      <div class="metric-label">Công Suất Tức Thời</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-icon">🔋</div>
+      <div class="metric-val">${capacityAh} Ah</div>
+      <div class="metric-label">Dung Lượng Còn Lại</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-icon">🌡️</div>
+      <div class="metric-val" style="color:#e3b341;">${temp} °C</div>
+      <div class="metric-label">Nhiệt Độ MOS</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-icon">🌡️</div>
+      <div class="metric-val" style="color:#38bdf8;">${temp1} / ${temp2} °C</div>
+      <div class="metric-label">Nhiệt Đồ Cảm Biến T1 / T2</div>
+    </div>
+  </div>
+</div>
+
+<!-- BLOCK 2: CHI TIẾT CELL VOLTAGES -->
+<div class="section">
+  <div class="section-title">📊 Điện Áp Chi Tiết Từng Cell</div>
+  <div class="info-card">
+    <div class="info-row"><span class="info-key">Cell Cao Nhất (Max)</span><span class="info-val" style="color:#3fb950;">Cell ${cellMaxNum} (${cellMax} V)</span></div>
+    <div class="info-row"><span class="info-key">Cell Thấp Nhất (Min)</span><span class="info-val" style="color:#f85149;">Cell ${cellMinNum} (${cellMin} V)</span></div>
+    <div class="info-row"><span class="info-key">Chênh Lệch App (ΔV)</span><span class="info-val" style="color:#e3b341;">${cellDelta} V</span></div>
+    <div class="info-row"><span class="info-key">Số Chu Kỳ Sạc/Xả</span><span class="info-val">${cycleCount} Chu Kỳ</span></div>
+    
+    <div style="font-size:0.75rem;color:#8b949e;margin-top:12px;margin-bottom:6px;font-weight:bold;">LƯỚI ĐIỆN ÁP CELL (C1 - C${cells.length || 'N'}):</div>
+    <div class="cells-grid">
+      ${cellsGridHtml}
+    </div>
+  </div>
+</div>
+
+<!-- BLOCK 3: TRẠNG THÁI MOSFET & CÂN BẰNG -->
+<div class="section">
+  <div class="section-title">⚙️ Công Tắc MOSFET & Cân Bằng</div>
+  <div class="info-card">
+    <div class="info-row">
+      <span class="info-key">MOSFET Sạc (Charge MOS)</span>
+      <span class="status-pill ${chargeMos ? 'on' : 'off'}">${chargeMos ? '🟢 ĐANG BẬT' : '🔴 TẮT'}</span>
+    </div>
+    <div class="info-row">
+      <span class="info-key">MOSFET Xả (Discharge MOS)</span>
+      <span class="status-pill ${dischargeMos ? 'on' : 'off'}">${dischargeMos ? '🟢 ĐANG BẬT' : '🔴 TẮT'}</span>
+    </div>
+    <div class="info-row">
+      <span class="info-key">Cân Bằng Chủ Động (Active Balance)</span>
+      <span class="status-pill ${balance ? 'on' : 'off'}">${balance ? '🟢 ĐANG CÂN BẰNG' : '⚪ TẮT'}</span>
+    </div>
+  </div>
+</div>
+
+<!-- BLOCK 4: QUẢN LÝ WIFI & HỆ THỐNG -->
+<div class="section">
+  <div class="section-title">🌐 Thông Tin Wi-Fi & Thiết Bị</div>
+  <div class="info-card">
+    <div class="info-row"><span class="info-key">Mạng Wi-Fi</span><span class="info-val">${d.ssid || '—'}</span></div>
+    <div class="info-row"><span class="info-key">Mức Sóng WiFi (RSSI)</span><span class="info-val" style="color:#3fb950;">📶 ${rssiVal}</span></div>
+    <div class="info-row"><span class="info-key">IP Local</span><span class="info-val">${d.local_ip || '—'}</span></div>
+    <div class="info-row"><span class="info-key">Hostname</span><span class="info-val">${d.hostname || '—'}.local</span></div>
+    <div class="info-row"><span class="info-key">Firmware</span><span class="info-val">v${d.firmware_version || '—'}</span></div>
+    <div class="info-row"><span class="info-key">Lắp đặt từ</span><span class="info-val">${reg}</span></div>
+  </div>
+</div>
+
+<div class="section">
+  <div class="info-card" style="border:1px solid rgba(248,81,73,0.3);text-align:center;">
+    <div style="font-size:0.85rem;font-weight:700;color:#e6edf3;margin-bottom:6px;">⚙️ Quản Lý Cài Đặt Wi-Fi</div>
+    <div style="font-size:0.75rem;color:#8b949e;margin-bottom:14px;">Bấm nút để xóa cấu hình Wi-Fi hiện tại và mở lại điểm truy cập cài đặt trên thiết bị.</div>
+    <button onclick="resetWifi()" style="background:rgba(248,81,73,0.15);border:1px solid rgba(248,81,73,0.4);color:#f85149;padding:10px 20px;border-radius:10px;font-size:0.85rem;font-weight:700;cursor:pointer;width:100%;transition:all 0.2s;">
+      🔄 Reset Cấu Hình Wi-Fi
+    </button>
+    <div id="reset-msg" style="font-size:0.78rem;margin-top:10px;display:none;font-weight:600;"></div>
+  </div>
+</div>
+
+<div class="footer">
+  Tự động cập nhật mỗi 10 giây • <a href="/">Trang quản lý</a>
+</div>
+
+<script>
+  async function resetWifi() {
+    if (!confirm('Bạn có chắc chắn muốn Reset Cấu Hình Wi-Fi của thiết bị ${d.device_id}? ESP32 sẽ xóa Wi-Fi và phát lại điểm truy cập cài đặt.')) return;
+    const msgEl = document.getElementById('reset-msg');
+    msgEl.style.display = 'block';
+    msgEl.style.color = '#e3b341';
+    msgEl.textContent = '⏳ Đang gửi lệnh Reset Wi-Fi tới thiết bị...';
+    try {
+      const res = await fetch('/api/send-command', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ device_id: '${d.device_id}', cmd: { cmd: 'reset_wifi' } })
+      });
+      const data = await res.json();
+      if (data.status === 'ok') {
+        msgEl.style.color = '#3fb950';
+        msgEl.textContent = '✅ Đã gửi lệnh! ESP32 đang xóa Wi-Fi và khởi động lại...';
+      } else {
+        msgEl.style.color = '#f85149';
+        msgEl.textContent = '❌ Lỗi khi gửi lệnh reset!';
+      }
+    } catch(e) {
+      msgEl.style.color = '#f85149';
+      msgEl.textContent = '❌ Lỗi kết nối máy chủ!';
+    }
+  }
+  setTimeout(()=>location.reload(), 10000);
+</script>
+</body>
+</html>`;
+}
