@@ -1,4 +1,4 @@
-const OFFLINE_MS = 3 * 60 * 1000; // 3 minutes
+﻿const OFFLINE_MS = 3 * 60 * 1000; // 3 minutes
 const MEMORY_DEVICE_INDEX = new Set(['JKBMS-F89C', 'JKBMS-249D']);
 const MEMORY_DEVICE_CACHE = new Map();
 const MEMORY_COMMANDS_MAP = new Map();
@@ -611,259 +611,346 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 function CUSTOMER_DEVICE_HTML(d) {
   const online = d.online;
   const bleConnected = d.connected && d.voltage > 0;
-  
-  const soc = bleConnected ? (d.soc !== undefined ? d.soc : '—') : '—';
-  const voltage = bleConnected ? (d.voltage ? d.voltage.toFixed(2) : '—') : '—';
-  const current = bleConnected ? (d.current !== undefined ? d.current.toFixed(2) : '—') : '—';
-  const power = bleConnected ? (d.power !== undefined ? Math.abs(d.power).toFixed(1) : (d.voltage && d.current ? Math.abs(d.voltage * d.current).toFixed(1) : '—')) : '—';
-  const mosTemp = bleConnected ? (d.mos_temp !== undefined ? d.mos_temp.toFixed(1) : '—') : '—';
-  const temp1 = bleConnected ? (d.temp1 !== undefined ? d.temp1.toFixed(1) : '—') : '—';
-  const temp2 = bleConnected ? (d.temp2 !== undefined ? d.temp2.toFixed(1) : '—') : '—';
-  const temp4 = '—';
-  const temp5 = '—';
-  const remainCap = bleConnected ? (d.remain_capacity_ah !== undefined ? d.remain_capacity_ah.toFixed(1) : (d.capacity_ah ? (d.capacity_ah * (d.soc/100)).toFixed(1) : '27.2')) : '—';
-  const balanceCurr = bleConnected ? (d.balance_current !== undefined ? d.balance_current.toFixed(3) : '0.000') : '—';
-  const cycleCap = bleConnected ? (d.cycle_capacity_ah !== undefined ? d.cycle_capacity_ah.toFixed(1) : '2.9') : '—';
-  const detailLogs = bleConnected ? (d.detail_logs_count !== undefined ? d.detail_logs_count : '36') : '—';
 
-  // Render Cell Voltage Items (01 to 24 format like official App)
+  const soc      = bleConnected ? (d.soc !== undefined ? d.soc : 0) : 0;
+  const voltage  = bleConnected ? (d.voltage  ? d.voltage.toFixed(2)  : '—') : '—';
+  const current  = bleConnected ? (d.current  !== undefined ? d.current.toFixed(2)  : '0.00') : '—';
+  const power    = bleConnected ? (d.power    !== undefined ? Math.abs(d.power).toFixed(1) : '0.0') : '—';
+  const mosTemp  = bleConnected ? (d.mos_temp !== undefined ? d.mos_temp.toFixed(1) : '—') : '—';
+  const temp1    = bleConnected && d.temp1 && d.temp1 > 0 ? d.temp1.toFixed(1) : null;
+  const temp2    = bleConnected && d.temp2 && d.temp2 > 0 ? d.temp2.toFixed(1) : null;
+  const capAh    = bleConnected ? (d.capacity_ah !== undefined ? d.capacity_ah.toFixed(1) : '30.0') : '—';
+  const remCap   = bleConnected ? (d.remain_capacity_ah !== undefined ? d.remain_capacity_ah.toFixed(1) : '—') : '—';
+  const balCurr  = bleConnected ? (d.balance_current !== undefined ? d.balance_current.toFixed(3) : '0.000') : '—';
+  const cycleCap = bleConnected ? (d.cycle_capacity_ah !== undefined ? d.cycle_capacity_ah.toFixed(1) : '—') : '—';
+  const cycles   = bleConnected ? (d.cycle_count !== undefined ? d.cycle_count : 0) : '—';
+  const detailLogs = bleConnected ? (d.detail_logs_count !== undefined ? d.detail_logs_count : '—') : '—';
+  const chargeMos   = d.charge_mos;
+  const dischargeMos= d.discharge_mos;
+  const balance     = d.balance_active;
+  const aveCellVolt = bleConnected && d.min_cell_voltage && d.max_cell_voltage
+    ? (((d.min_cell_voltage||0) + (d.max_cell_voltage||0)) / 2).toFixed(3) : '—';
+  const cellDelta = bleConnected ? (d.delta_cell_voltage !== undefined ? d.delta_cell_voltage.toFixed(3) : '—') : '—';
+  const statusColor = online ? '#3fb950' : '#f85149';
+  const statusText  = online ? 'Online' : 'Offline';
+  const rssiVal     = d.rssi ? d.rssi + ' dBm' : '—';
+  const reg = d.activatedAtStr || '—';
+
+  // Cell voltages
+  const cells = Array.isArray(d.cell_voltages) ? d.cell_voltages : [];
+  const cellMinNum = d.min_cell_num || 0;
+  const cellMaxNum = d.max_cell_num || 0;
   let cellItemsHtml = '';
   for (let i = 0; i < 24; i++) {
     const num = (i + 1).toString().padStart(2, '0');
     if (bleConnected && i < cells.length) {
       const v = cells[i];
-      let color = '#3fb950'; // Green
-      if (i + 1 === cellMinNum) color = '#e3b341'; // Yellow min
-      if (i + 1 === cellMaxNum) color = '#f85149'; // Red max
+      let color = '#3fb950';
+      if (i + 1 === cellMinNum) color = '#e3b341';
+      if (i + 1 === cellMaxNum) color = '#f85149';
       const valStr = (typeof v === 'number' ? v : parseFloat(v)).toFixed(3);
       cellItemsHtml += `<div class="cell-box"><span class="c-num">${num}</span><span class="c-val" style="color:${color};">${valStr}<sup>V</sup></span></div>`;
     } else {
-      cellItemsHtml += `<div class="cell-box"><span class="c-num">${num}</span><span class="c-val" style="color:#484f58;">--</span></div>`;
+      cellItemsHtml += `<div class="cell-box"><span class="c-num">${num}</span><span class="c-val" style="color:#2a3530;">--</span></div>`;
     }
   }
 
-  // Render Wire Resistance Items (01 to 24 format)
-  let wireItemsHtml = '';
-  for (let i = 0; i < 24; i++) {
-    const num = (i + 1).toString().padStart(2, '0');
-    if (bleConnected && i < cells.length) {
-      const r = (0.375 + (i * 0.001)).toFixed(3);
-      wireItemsHtml += `<div class="cell-box"><span class="c-num">${num}</span><span class="c-val" style="color:#3fb950;">${r}<sup>mΩ</sup></span></div>`;
-    } else {
-      wireItemsHtml += `<div class="cell-box"><span class="c-num">${num}</span><span class="c-val" style="color:#484f58;">0.000<sup>mΩ</sup></span></div>`;
-  }
+  // SOC ring angle
+  const socNum = parseInt(soc) || 0;
+  const ringDash = Math.round(socNum * 2.513); // circumference ~251.3 for r=40
 
   return `<!DOCTYPE html>
 <html lang="vi">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>JK-BMS Monitoring System - ${d.device_id}</title>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>JK-BMS Monitor - ${d.device_id}</title>
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
   *{margin:0;padding:0;box-sizing:border-box;}
-  body{font-family:'Inter',sans-serif;background:#0d1414;color:#e6edf3;min-height:100vh;padding-bottom:70px;}
-  
-  .header-bar{background:#081010;border-bottom:1px solid #162624;padding:8px 14px;display:flex;align-items:center;justify-content:space-between;font-size:0.75rem;color:#8b949e;font-weight:600;}
-  .header-switches{display:flex;gap:12px;color:#3fb950;font-family:monospace;}
-  .header-switches span{display:inline-flex;align-items:center;gap:4px;}
+  body{font-family:'Inter',sans-serif;background:#060e0c;color:#c9d1d9;min-height:100vh;padding-bottom:64px;-webkit-tap-highlight-color:transparent;}
 
-  .hero-panel{background:linear-gradient(180deg,#0a1615 0%,#0d1c1a 100%);padding:18px 16px 14px;border-bottom:1px solid #19332e;text-align:center;}
-  .hero-main{display:flex;justify-content:space-around;align-items:baseline;max-width:380px;margin:0 auto 10px;}
-  .hero-val-v{font-family:'Share Tech Mono',monospace;font-size:2.8rem;font-weight:700;color:#3fb950;letter-spacing:-1px;}
-  .hero-val-v sup{font-size:1.2rem;top:-1em;}
-  .hero-val-a{font-family:'Share Tech Mono',monospace;font-size:2.8rem;font-weight:700;color:#3fb950;letter-spacing:-1px;}
-  .hero-val-a sup{font-size:1.2rem;top:-1em;}
+  /* ── TOP STATUS BAR ── */
+  .top-bar{background:#0a1512;border-bottom:1px solid #122520;padding:8px 14px;display:flex;align-items:center;justify-content:space-between;}
+  .top-bar-id{font-family:'Share Tech Mono',monospace;font-size:0.78rem;color:#38bdf8;letter-spacing:0.08em;}
+  .top-bar-switches{display:flex;gap:10px;font-size:0.72rem;font-weight:700;}
+  .sw{display:inline-flex;align-items:center;gap:3px;color:#8b949e;}
+  .sw-on{color:#3fb950;}  .sw-off{color:#f85149;}
 
-  .nav-tabs{display:flex;background:#060d0d;border-bottom:1px solid #162624;position:sticky;top:0;z-index:100;}
-  .tab-btn{flex:1;padding:12px 0;text-align:center;font-size:0.82rem;font-weight:700;color:#8b949e;border:none;background:none;cursor:pointer;border-bottom:2px solid transparent;transition:all 0.2s;}
-  .tab-btn.active{color:#3fb950;border-bottom-color:#3fb950;background:rgba(63,185,80,0.06);}
+  /* ── SOC HERO PANEL ── */
+  .hero{background:linear-gradient(180deg,#0a1512 0%,#071010 100%);padding:18px 16px 14px;text-align:center;}
+  .soc-ring-wrap{position:relative;width:200px;height:200px;margin:0 auto 8px;}
+  .soc-ring-wrap svg{transform:rotate(-220deg);}
+  .soc-center{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;}
+  .soc-pct{font-family:'Share Tech Mono',monospace;font-size:3.2rem;font-weight:700;color:#3fb950;line-height:1;}
+  .soc-label{font-size:0.65rem;color:#8b949e;font-weight:600;letter-spacing:0.1em;margin-top:2px;}
+  .volt-curr-row{display:flex;justify-content:center;gap:0;margin-top:2px;}
+  .vc-item{flex:1;max-width:160px;padding:8px 10px;background:#081312;border-radius:10px;margin:0 4px;}
+  .vc-val{font-family:'Share Tech Mono',monospace;font-size:1.6rem;font-weight:700;color:#3fb950;}
+  .vc-unit{font-size:0.7rem;color:#3fb950;vertical-align:super;}
+  .vc-label{font-size:0.62rem;color:#8b949e;font-weight:600;margin-top:2px;letter-spacing:0.06em;}
 
-  .tab-content{display:none;max-width:440px;margin:0 auto;padding:14px;}
+  /* ── STATUS BANNER ── */
+  .status-banner{background:#081a14;border:1px solid #1a3d2c;border-radius:8px;margin:10px 12px 0;padding:8px 12px;display:flex;align-items:center;gap:8px;font-size:0.8rem;font-weight:600;color:#3fb950;}
+  .status-banner.offline{border-color:#3d1a1a;color:#f85149;background:#180808;}
+
+  /* ── DATA GRID 4-COL ── */
+  .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:#122520;border:1px solid #122520;border-radius:10px;overflow:hidden;margin:10px 12px;}
+  .g4-item{background:#081312;padding:10px 4px;text-align:center;}
+  .g4-val{font-family:'Share Tech Mono',monospace;font-size:1.05rem;font-weight:700;color:#3fb950;line-height:1.1;}
+  .g4-val.blue{color:#38bdf8;}
+  .g4-val.red{color:#f85149;}
+  .g4-val.yellow{color:#e3b341;}
+  .g4-label{font-size:0.58rem;color:#8b949e;margin-top:3px;line-height:1.2;}
+
+  /* ── NAV TABS ── */
+  .nav-tabs{display:flex;background:#060e0c;border-bottom:2px solid #0f2520;position:sticky;top:0;z-index:100;}
+  .tab-btn{flex:1;padding:11px 0;font-size:0.78rem;font-weight:700;color:#8b949e;border:none;background:none;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-2px;transition:all .2s;}
+  .tab-btn.active{color:#3fb950;border-bottom-color:#3fb950;}
+
+  .tab-content{display:none;padding:12px;}
   .tab-content.active{display:block;}
 
-  .data-list{background:#0a1615;border:1px solid #162a26;border-radius:12px;padding:6px 14px;margin-bottom:14px;}
-  .data-row{display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid rgba(255,255,255,0.04);font-size:0.82rem;}
-  .data-row:last-child{border-bottom:none;}
-  .data-key{color:#94a3b8;font-weight:500;}
-  .data-val{font-family:'Share Tech Mono',monospace;color:#3fb950;font-weight:700;}
+  /* ── REALTIME DATA LIST ── */
+  .rt-label{font-size:0.78rem;font-weight:700;color:#3fb950;margin:6px 0 6px 2px;display:flex;align-items:center;gap:6px;}
+  .rt-label::before{content:'';width:8px;height:8px;border-radius:50%;background:#3fb950;animation:pulse 1.4s infinite;}
+  @keyframes pulse{0%,100%{opacity:1;transform:scale(1);}50%{opacity:.5;transform:scale(1.3);}}
 
-  .section-header{font-size:0.85rem;font-weight:800;color:#38bdf8;text-align:center;margin:16px 0 10px;text-transform:uppercase;letter-spacing:0.05em;}
+  .rt-grid{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:#0d2420;border:1px solid #0d2420;border-radius:8px;overflow:hidden;margin-bottom:12px;}
+  .rt-row{display:flex;justify-content:space-between;align-items:center;background:#060e0c;padding:6px 10px;font-size:0.75rem;}
+  .rt-key{color:#8b949e;font-weight:500;}
+  .rt-val{font-family:'Share Tech Mono',monospace;color:#3fb950;font-weight:700;}
+  .rt-val.blue{color:#38bdf8;} .rt-val.yellow{color:#e3b341;} .rt-val.red{color:#f85149;}
 
-  .cells-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:16px;}
-  .cell-box{background:#081312;border:1px solid #152b27;border-radius:8px;padding:7px 8px;display:flex;align-items:center;justify-content:space-between;}
-  .c-num{font-size:0.75rem;font-weight:700;color:#38bdf8;background:rgba(56,189,248,0.12);padding:2px 6px;border-radius:4px;font-family:monospace;}
-  .c-val{font-family:'Share Tech Mono',monospace;font-size:0.88rem;font-weight:700;}
-  .c-val sup{font-size:0.65rem;}
+  /* ── CURRENT BAR ── */
+  .curr-bar-wrap{background:#081312;border:1px solid #0d2420;border-radius:8px;padding:10px 12px;margin-bottom:12px;}
+  .curr-bar-row{display:flex;justify-content:space-between;font-size:0.8rem;margin-bottom:6px;}
+  .curr-label{color:#8b949e;font-weight:500;}
+  .curr-val-green{font-family:'Share Tech Mono',monospace;color:#3fb950;font-weight:700;}
+  .bar-track{height:6px;background:#122520;border-radius:3px;overflow:hidden;}
+  .bar-fill{height:100%;border-radius:3px;background:linear-gradient(90deg,#3fb950,#38bdf8);transition:width .5s;}
+  .curr-status-row{display:flex;justify-content:space-between;margin-top:6px;font-size:0.72rem;}
 
-  .setting-group-title{font-size:0.8rem;font-weight:800;color:#38bdf8;text-align:center;margin:12px 0 8px;text-transform:uppercase;}
-  .setting-row{display:flex;justify-content:space-between;align-items:center;background:#0a1615;border:1px solid #162a26;border-radius:8px;padding:8px 12px;margin-bottom:6px;font-size:0.8rem;}
-  .setting-key{color:#94a3b8;}
-  .setting-box{display:flex;align-items:center;gap:6px;}
-  .setting-val{background:#060e0d;border:1px solid #1b3833;border-radius:6px;padding:4px 10px;color:#3fb950;font-family:monospace;font-weight:700;min-width:70px;text-align:right;}
-  .setting-ok{font-size:0.68rem;color:#3fb950;border:1px solid rgba(63,185,80,0.4);padding:3px 6px;border-radius:4px;}
+  /* ── CELLS ── */
+  .section-hdr{font-size:0.75rem;font-weight:800;color:#3fb950;margin:10px 0 8px;display:flex;align-items:center;gap:6px;}
+  .section-hdr::after{content:'';flex:1;height:1px;background:#122520;}
+  .cells-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:12px;}
+  .cell-box{background:#081312;border:1px solid #0d2420;border-radius:7px;padding:6px 8px;display:flex;align-items:center;justify-content:space-between;}
+  .c-num{font-size:0.7rem;font-weight:700;color:#38bdf8;background:rgba(56,189,248,.12);padding:2px 5px;border-radius:4px;font-family:monospace;}
+  .c-val{font-family:'Share Tech Mono',monospace;font-size:0.82rem;font-weight:700;}
+  .c-val sup{font-size:0.6rem;}
 
-  .btn-reset{background:rgba(248,81,73,0.15);border:1px solid rgba(248,81,73,0.4);color:#f85149;padding:12px;border-radius:10px;font-size:0.85rem;font-weight:700;cursor:pointer;width:100%;transition:all 0.2s;}
+  /* ── CONTROL TAB ── */
+  .ctrl-card{background:#081312;border:1px solid #0d2420;border-radius:10px;padding:12px;margin-bottom:12px;}
+  .ctrl-title{font-size:0.82rem;font-weight:700;color:#38bdf8;margin-bottom:10px;}
+  .ctrl-row{display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid #0d2420;font-size:0.8rem;}
+  .ctrl-row:last-child{border-bottom:none;}
+  .ctrl-key{color:#8b949e;}
+  .ctrl-val{font-family:'Share Tech Mono',monospace;font-weight:700;}
+  .btn-scan{background:#38bdf8;color:#060e0c;border:none;padding:9px 18px;border-radius:8px;font-size:0.8rem;font-weight:800;cursor:pointer;width:100%;margin-bottom:8px;}
+  .btn-connect{background:rgba(63,185,80,.2);border:1px solid #3fb950;color:#3fb950;padding:5px 12px;border-radius:6px;font-size:0.75rem;font-weight:700;cursor:pointer;}
+  .btn-danger{background:rgba(248,81,73,.15);border:1px solid #f85149;color:#f85149;padding:10px;border-radius:8px;font-size:0.82rem;font-weight:700;cursor:pointer;width:100%;margin-top:8px;}
+  .scan-info{font-size:0.75rem;padding:7px 10px;border-radius:6px;margin-top:8px;display:none;font-weight:600;}
+  .ble-list{margin-top:10px;display:none;}
+  .ble-item{background:#060e0c;border:1px solid #0d2420;border-radius:7px;padding:8px 10px;display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;}
 
-  .footer-nav{position:fixed;bottom:0;left:0;right:0;background:#060d0d;border-top:1px solid #162624;display:flex;justify-content:space-around;padding:8px 0;z-index:200;}
-  .f-btn{display:flex;flex-direction:column;align-items:center;color:#8b949e;font-size:0.68rem;font-weight:600;text-decoration:none;cursor:pointer;border:none;background:none;}
+  /* ── FOOTER NAV ── */
+  .footer-nav{position:fixed;bottom:0;left:0;right:0;background:#060e0c;border-top:1px solid #122520;display:flex;z-index:200;}
+  .f-btn{flex:1;display:flex;flex-direction:column;align-items:center;padding:8px 0;color:#8b949e;font-size:0.65rem;font-weight:700;border:none;background:none;cursor:pointer;gap:2px;}
   .f-btn.active{color:#3fb950;}
-  .f-icon{font-size:1.2rem;margin-bottom:2px;}
+  .f-icon{font-size:1.15rem;}
 </style>
 </head>
 <body>
 
-<div class="header-bar">
-  <div class="header-switches">
-    <span>Charge: <strong style="color:${chargeMos?'#3fb950':'#f85149'}">${chargeMos?'ON':'OFF'}</strong></span>
-    <span>Discharge: <strong style="color:${dischargeMos?'#3fb950':'#f85149'}">${dischargeMos?'ON':'OFF'}</strong></span>
-    <span>Balance: <strong style="color:${balance?'#3fb950':'#f85149'}">${balance?'ON':'OFF'}</strong></span>
+<!-- TOP BAR -->
+<div class="top-bar">
+  <div class="top-bar-switches">
+    <span class="sw">Chg <strong class="${chargeMos?'sw-on':'sw-off'}">${chargeMos?'ON':'OFF'}</strong></span>
+    <span class="sw">Dsg <strong class="${dischargeMos?'sw-on':'sw-off'}">${dischargeMos?'ON':'OFF'}</strong></span>
+    <span class="sw">Bal <strong class="${balance?'sw-on':'sw-off'}">${balance?'ON':'OFF'}</strong></span>
   </div>
-  <div style="font-family:monospace;font-size:0.7rem;color:#38bdf8;">TIME: 1Y229D14H17M</div>
+  <div class="top-bar-id">${d.device_id}</div>
 </div>
 
-<div class="hero-panel">
-  <div class="hero-main">
-    <div class="hero-val-v" id="hero-v">${voltage}<sup>V</sup></div>
-    <div class="hero-val-a" id="hero-a">${current}<sup>A</sup></div>
+<!-- HERO SOC RING -->
+<div class="hero">
+  <div class="soc-ring-wrap">
+    <svg width="200" height="200" viewBox="0 0 100 100">
+      <!-- Background track arc -->
+      <circle cx="50" cy="50" r="40" fill="none" stroke="#122520" stroke-width="7"
+        stroke-dasharray="251.3" stroke-dashoffset="0" stroke-linecap="round"/>
+      <!-- SOC arc -->
+      <circle cx="50" cy="50" r="40" fill="none"
+        stroke="${socNum>50?'#3fb950':socNum>20?'#e3b341':'#f85149'}" stroke-width="7"
+        stroke-dasharray="251.3" stroke-dashoffset="${251.3 - ringDash}" stroke-linecap="round"/>
+    </svg>
+    <div class="soc-center">
+      <div class="soc-pct" id="hero-soc">${socNum}%</div>
+      <div class="soc-label">STATE OF CHARGE</div>
+    </div>
   </div>
-  <div style="font-size:0.75rem;color:#8b949e;display:flex;justify-content:center;gap:14px;font-weight:600;margin-bottom:10px;">
-    <span>📶 WiFi: <strong id="status-wifi-badge" style="color:${statusColor};">${statusText}</strong></span>
-    <span>ID: <strong style="color:#e6edf3;">${d.device_id}</strong></span>
-    <span>RSSI: <strong id="status-rssi-val" style="color:#38bdf8;">${rssiVal}</strong></span>
-  </div>
-  <div style="margin-top:4px;margin-bottom:6px;">
-    <button onclick="scanBle()" style="background:linear-gradient(135deg,#38bdf8,#0284c7);color:#ffffff;border:none;padding:9px 20px;border-radius:20px;font-size:0.85rem;font-weight:800;cursor:pointer;box-shadow:0 0 14px rgba(56,189,248,0.5);display:inline-flex;align-items:center;gap:6px;">
-      <span>🔍</span> TÌM & KẾT NỐI BLUETOOTH BMS
-    </button>
+  <div class="volt-curr-row">
+    <div class="vc-item">
+      <div class="vc-val" id="hero-v">${voltage}<span class="vc-unit">V</span></div>
+      <div class="vc-label">VOLTAGE</div>
+    </div>
+    <div class="vc-item">
+      <div class="vc-val" id="hero-a">${current}<span class="vc-unit">A</span></div>
+      <div class="vc-label">CURRENT</div>
+    </div>
   </div>
 </div>
 
-<!-- TABS NAVIGATION -->
+<!-- STATUS BANNER -->
+<div class="status-banner${bleConnected?'':' offline'}">
+  ${bleConnected
+    ? '<span>🛡️</span><span>The battery is functioning properly</span>'
+    : '<span>📡</span><span>BMS chưa kết nối Bluetooth</span>'}
+  <span style="margin-left:auto;font-size:0.65rem;color:${statusColor};">${statusText}</span>
+</div>
+
+<!-- 4-COL GRID ROW 1: Cell data -->
+<div class="grid4">
+  <div class="g4-item">
+    <div class="g4-val blue" id="g-mincell">${bleConnected && d.min_cell_voltage ? d.min_cell_voltage.toFixed(3) : '—'}</div>
+    <div class="g4-label">Low Cell (V)</div>
+  </div>
+  <div class="g4-item">
+    <div class="g4-val red" id="g-maxcell">${bleConnected && d.max_cell_voltage ? d.max_cell_voltage.toFixed(3) : '—'}</div>
+    <div class="g4-label">High Cell (V)</div>
+  </div>
+  <div class="g4-item">
+    <div class="g4-val yellow" id="g-delta">${cellDelta}</div>
+    <div class="g4-label">Volt-Diff (V)</div>
+  </div>
+  <div class="g4-item">
+    <div class="g4-val" id="g-balcurr">${balCurr}</div>
+    <div class="g4-label">Bal-Curr (A)</div>
+  </div>
+</div>
+
+<!-- 4-COL GRID ROW 2: Capacity & Temp -->
+<div class="grid4">
+  <div class="g4-item">
+    <div class="g4-val" id="g-cap">${capAh}</div>
+    <div class="g4-label">Capacity (Ah)</div>
+  </div>
+  <div class="g4-item">
+    <div class="g4-val" id="g-rem">${remCap}</div>
+    <div class="g4-label">Rem. Cap. (Ah)</div>
+  </div>
+  <div class="g4-item">
+    <div class="g4-val yellow" id="g-mostemp">${mosTemp}</div>
+    <div class="g4-label">High Temp (°C)</div>
+  </div>
+  <div class="g4-item">
+    <div class="g4-val blue">LFP</div>
+    <div class="g4-label">Cell Type</div>
+  </div>
+</div>
+
+<!-- NAV TABS -->
 <div class="nav-tabs">
-  <button class="tab-btn active" onclick="showTab('status')">📊 Status</button>
-  <button class="tab-btn" onclick="showTab('settings')">⚙️ Settings</button>
+  <button class="tab-btn active" onclick="showTab('home')">🏠 Home</button>
+  <button class="tab-btn" onclick="showTab('status')">📊 Status</button>
   <button class="tab-btn" onclick="showTab('control')">🎛️ Control</button>
 </div>
 
-<!-- TAB 1: STATUS -->
-<div id="tab-status" class="tab-content active">
-  <!-- BLE SCAN & CONNECTION MANAGER CARD -->
-  <div class="data-list" style="border:1px solid rgba(56,189,248,0.4);background:rgba(10,22,21,0.95);padding:14px;margin-bottom:16px;">
-    <div style="font-size:0.88rem;font-weight:800;color:#38bdf8;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;">
-      <span>📡 Kết Nối Bluetooth BMS</span>
-      <button onclick="scanBle()" style="background:#38bdf8;color:#0d1117;border:none;padding:7px 14px;border-radius:6px;font-size:0.78rem;font-weight:800;cursor:pointer;box-shadow:0 0 10px rgba(56,189,248,0.4);">🔍 Quét Bluetooth</button>
+<!-- TAB HOME: Current bar + quick info -->
+<div id="tab-home" class="tab-content active">
+  <!-- Current / Power bar -->
+  <div class="curr-bar-wrap">
+    <div class="curr-bar-row">
+      <span class="curr-label">⚡ Current (A):</span>
+      <span class="curr-val-green" id="bar-curr">${current}</span>
     </div>
-    <div class="data-row"><span class="data-key">BMS Đang Kết Nối:</span><span class="data-val" id="bms-connected-status" style="color:${bleConnected?'#3fb950':'#f85149'}">${d.active_bms_name || (bleConnected ? 'JK-BMS' : '🔴 Chưa kết nối')}</span></div>
-    <div class="data-row"><span class="data-key">Địa Chỉ MAC BMS:</span><span class="data-val" id="bms-mac-status">${d.active_bms_mac || '—'}</span></div>
-    
-    <div id="scan-status-status" style="font-size:0.78rem;color:#e3b341;margin-top:8px;display:none;font-weight:600;text-align:center;padding:6px;background:rgba(227,179,65,0.1);border-radius:6px;"></div>
-    
-    <div id="ble-devices-list-status" style="margin-top:12px;display:none;">
-      <div style="font-size:0.75rem;color:#38bdf8;font-weight:700;margin-bottom:8px;text-transform:uppercase;letter-spacing:0.04em;">📋 Danh Sách BMS Quét Thấy:</div>
-      <div id="ble-devices-grid-status" style="display:flex;flex-direction:column;gap:8px;"></div>
+    <div class="curr-bar-row">
+      <span class="curr-label">🔥 Power (W):</span>
+      <span class="curr-val-green" id="bar-power">${power}</span>
+    </div>
+    <div class="bar-track">
+      <div class="bar-fill" id="bar-fill" style="width:${socNum}%;"></div>
+    </div>
+    <div class="curr-status-row">
+      <span style="color:#8b949e;font-size:0.72rem;">Status: <strong style="color:${bleConnected?(current&&parseFloat(current)<0?'#38bdf8':'#3fb950'):'#f85149'};">${bleConnected?(current&&parseFloat(current)<0?'Discharge':(parseFloat(current)>0?'Charge':'Idle')):'Offline'}</strong></span>
+      <span style="color:#8b949e;font-size:0.72rem;">WiFi: <strong style="color:${statusColor};">${statusText}</strong> &nbsp; RSSI: <strong style="color:#38bdf8;">${rssiVal}</strong></span>
     </div>
   </div>
 
-  <div class="data-list">
-    <div class="data-row"><span class="data-key">Battery Power:</span><span class="data-val" id="val-power">${power} W</span></div>
-    <div class="data-row"><span class="data-key">Ave. Cell Volt.:</span><span class="data-val" id="val-avecell">${aveCellVolt} V</span></div>
-    <div class="data-row"><span class="data-key">Battery Capacity:</span><span class="data-val" id="val-capacity">30.0 Ah</span></div>
-    <div class="data-row"><span class="data-key">Cell Volt. Diff.:</span><span class="data-val" id="val-celldelta" style="color:#e3b341;">${cellDelta} V</span></div>
-    <div class="data-row"><span class="data-key">Remain Capacity:</span><span class="data-val" id="val-remaincap">${remainCap} Ah</span></div>
-    <div class="data-row"><span class="data-key">Balance Curr.:</span><span class="data-val" id="val-balcurr">${balanceCurr} A</span></div>
-    <div class="data-row"><span class="data-key">Remain Battery:</span><span class="data-val" id="val-soc" style="color:#3fb950;">${soc} %</span></div>
-    <div class="data-row"><span class="data-key">MOS Temp.:</span><span class="data-val" id="val-mostemp" style="color:#e3b341;">${mosTemp} °C</span></div>
-    <div class="data-row"><span class="data-key">Cycle Count:</span><span class="data-val" id="val-cycles">0</span></div>
-    <div class="data-row"><span class="data-key">Cycle Capacity:</span><span class="data-val" id="val-cyccap">${cycleCap} Ah</span></div>
-    <div class="data-row"><span class="data-key">Battery T1:</span><span class="data-val" id="val-t1" style="color:#38bdf8;">0.0 °C</span></div>
-    <div class="data-row"><span class="data-key">Battery T2:</span><span class="data-val" id="val-t2" style="color:#38bdf8;">31.0 °C</span></div>
-    <div class="data-row"><span class="data-key">Battery T4 / T5:</span><span class="data-val" style="color:#38bdf8;">— °C / — °C</span></div>
-    <div class="data-row"><span class="data-key">Heat Current / Status:</span><span class="data-val">0.000 A / OFF</span></div>
-    <div class="data-row"><span class="data-key">Detail Logs Count:</span><span class="data-val" id="val-detaillogs">${detailLogs}</span></div>
-    <div class="data-row"><span class="data-key">Time Enter Sleep:</span><span class="data-val">86400 s</span></div>
-    <div class="data-row"><span class="data-key">Cell Type:</span><span class="data-val">LFP</span></div>
-    <div class="data-row"><span class="data-key">LCD Buzzer / DRY Alarms:</span><span class="data-val">OFF</span></div>
-  </div>
-
-  <div class="section-header">Cells Voltage</div>
-  <div class="cells-grid">
-    ${cellItemsHtml}
-  </div>
-
-  <div class="section-header">Cells Wire Resistance</div>
-  <div class="cells-grid">
-    ${wireItemsHtml}
+  <!-- Quick telemetry 2-col grid -->
+  <div class="rt-label">● Real-time</div>
+  <div class="rt-grid">
+    <div class="rt-row"><span class="rt-key">Bat. Power:</span><span class="rt-val" id="rt-power">${power} W</span></div>
+    <div class="rt-row"><span class="rt-key">Cell AVG:</span><span class="rt-val" id="rt-avg">${aveCellVolt} V</span></div>
+    <div class="rt-row"><span class="rt-key">Capacity:</span><span class="rt-val" id="rt-cap">${capAh} Ah</span></div>
+    <div class="rt-row"><span class="rt-key">Volt-Diff:</span><span class="rt-val yellow" id="rt-delta">${cellDelta} V</span></div>
+    <div class="rt-row"><span class="rt-key">Remain Cap.:</span><span class="rt-val" id="rt-rem">${remCap} Ah</span></div>
+    <div class="rt-row"><span class="rt-key">Bal. Current:</span><span class="rt-val" id="rt-bal">${balCurr} A</span></div>
+    <div class="rt-row"><span class="rt-key">CMOS Temp.:</span><span class="rt-val yellow" id="rt-mos">${mosTemp} °C</span></div>
+    <div class="rt-row"><span class="rt-key">Cycle Count:</span><span class="rt-val" id="rt-cyc">${cycles}</span></div>
+    ${temp1 ? `<div class="rt-row"><span class="rt-key">Battery T1:</span><span class="rt-val blue">${temp1} °C</span></div>` : ''}
+    ${temp2 ? `<div class="rt-row"><span class="rt-key">Battery T2:</span><span class="rt-val blue">${temp2} °C</span></div>` : ''}
+    <div class="rt-row"><span class="rt-key">Cycle Cap.:</span><span class="rt-val">${cycleCap} Ah</span></div>
+    <div class="rt-row"><span class="rt-key">Detail Logs:</span><span class="rt-val" id="rt-dlogs">${detailLogs}</span></div>
+    <div class="rt-row"><span class="rt-key">Cell Type:</span><span class="rt-val blue">LFP</span></div>
+    <div class="rt-row"><span class="rt-key">Balancer:</span><span class="rt-val ${balance?'':'red'}">${balance?'ON':'OFF'}</span></div>
   </div>
 </div>
 
-<!-- TAB 2: SETTINGS -->
-<div id="tab-settings" class="tab-content">
-  <div class="setting-group-title">Basic Settings</div>
-  <div class="setting-row"><span class="setting-key">Cell Count:</span><div class="setting-box"><span class="setting-val">16</span><span class="setting-ok">OK</span></div></div>
-  <div class="setting-row"><span class="setting-key">Battery Capacity(Ah):</span><div class="setting-box"><span class="setting-val">280</span><span class="setting-ok">OK</span></div></div>
-  <div class="setting-row"><span class="setting-key">Balance Trig. Volt.(V):</span><div class="setting-box"><span class="setting-val">0.003</span><span class="setting-ok">OK</span></div></div>
-  <div class="setting-row"><span class="setting-key">Calibrating Volt.(V):</span><div class="setting-box"><span class="setting-val">${voltage}</span><span class="setting-ok">OK</span></div></div>
-  <div class="setting-row"><span class="setting-key">Calibrating Curr.(A):</span><div class="setting-box"><span class="setting-val">${current}</span><span class="setting-ok">OK</span></div></div>
+<!-- TAB STATUS: Cell voltages -->
+<div id="tab-status" class="tab-content">
+  <div class="section-hdr">● Cell Voltages (V)</div>
+  <div class="cells-grid">${cellItemsHtml}</div>
 
-  <div class="setting-group-title">Advance Settings</div>
-  <div class="setting-row"><span class="setting-key">Start Balance Volt.(V):</span><div class="setting-box"><span class="setting-val">2.80</span><span class="setting-ok">OK</span></div></div>
-  <div class="setting-row"><span class="setting-key">Max Balance Cur.(A):</span><div class="setting-box"><span class="setting-val">1.8</span><span class="setting-ok">OK</span></div></div>
-  <div class="setting-row"><span class="setting-key">Cell OVP(V):</span><div class="setting-box"><span class="setting-val">3.500</span><span class="setting-ok">OK</span></div></div>
-  <div class="setting-row"><span class="setting-key">Vol. Cell RCV(V):</span><div class="setting-box"><span class="setting-val">3.480</span><span class="setting-ok">OK</span></div></div>
-  <div class="setting-row"><span class="setting-key">SOC-100% Volt.(V):</span><div class="setting-box"><span class="setting-val">3.450</span><span class="setting-ok">OK</span></div></div>
-  <div class="setting-row"><span class="setting-key">Cell OVPR(V):</span><div class="setting-box"><span class="setting-val">3.430</span><span class="setting-ok">OK</span></div></div>
-  <div class="setting-row"><span class="setting-key">Power Off Vol.(V):</span><div class="setting-box"><span class="setting-val">2.600</span><span class="setting-ok">OK</span></div></div>
-  <div class="setting-row"><span class="setting-key">Continued Charge Curr.(A):</span><div class="setting-box"><span class="setting-val">90.0</span><span class="setting-ok">OK</span></div></div>
-  <div class="setting-row"><span class="setting-key">Continued Discharge Curr.(A):</span><div class="setting-box"><span class="setting-val">100.0</span><span class="setting-ok">OK</span></div></div>
-  <div class="setting-row"><span class="setting-key">Discharge OTP(°C):</span><div class="setting-box"><span class="setting-val">70.0</span><span class="setting-ok">OK</span></div></div>
-
-  <div class="setting-group-title">Protocol & Inverter Settings</div>
-  <div class="setting-row"><span class="setting-key">User Data 2:</span><div class="setting-box"><span class="setting-val" style="color:#38bdf8;">JK-BMS</span><span class="setting-ok">OK</span></div></div>
-  <div class="setting-row"><span class="setting-key">UART1 Protocol No.:</span><div class="setting-box"><span class="setting-val" style="color:#38bdf8;">001-JK BMS</span><span class="setting-ok">OK</span></div></div>
-  <div class="setting-row"><span class="setting-key">UART2 Protocol No.:</span><div class="setting-box"><span class="setting-val" style="color:#38bdf8;">001-JK BMS</span><span class="setting-ok">OK</span></div></div>
-  <div class="setting-row"><span class="setting-key">CAN Protocol No.:</span><div class="setting-box"><span class="setting-val" style="color:#38bdf8;">011-Luxpower</span><span class="setting-ok">OK</span></div></div>
+  <div class="section-hdr">● Device Info</div>
+  <div class="rt-grid">
+    <div class="rt-row"><span class="rt-key">IP Local:</span><span class="rt-val blue">${d.local_ip||'—'}</span></div>
+    <div class="rt-row"><span class="rt-key">Wi-Fi:</span><span class="rt-val">${d.ssid||'—'}</span></div>
+    <div class="rt-row"><span class="rt-key">Hostname:</span><span class="rt-val">${d.hostname||'—'}</span></div>
+    <div class="rt-row"><span class="rt-key">Firmware:</span><span class="rt-val blue">v${d.firmware_version||'—'}</span></div>
+    <div class="rt-row"><span class="rt-key">BMS MAC:</span><span class="rt-val" style="font-size:0.65rem;">${d.active_bms_mac||'—'}</span></div>
+    <div class="rt-row"><span class="rt-key">Kích Hoạt:</span><span class="rt-val" style="font-size:0.68rem;">${reg}</span></div>
+  </div>
 </div>
 
-<!-- TAB 3: CONTROL -->
+<!-- TAB CONTROL -->
 <div id="tab-control" class="tab-content">
-  <!-- BLE SCAN & CONNECTION MANAGER CARD -->
-  <div class="data-list" style="border:1px solid rgba(56,189,248,0.3);padding:14px;margin-bottom:16px;">
-    <div style="font-size:0.85rem;font-weight:700;color:#38bdf8;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;">
-      <span>📡 Quản Lý Kết Nối Bluetooth (BLE)</span>
-      <button onclick="scanBle()" style="background:#38bdf8;color:#0d1117;border:none;padding:6px 14px;border-radius:6px;font-size:0.75rem;font-weight:700;cursor:pointer;">🔍 Quét Bluetooth</button>
-    </div>
-    <div class="data-row"><span class="data-key">BMS Đang Kết Nối:</span><span class="data-val" style="color:${bleConnected?'#3fb950':'#f85149'}">${d.active_bms_name || (bleConnected ? 'JK-BMS' : 'Chưa kết nối')}</span></div>
-    <div class="data-row"><span class="data-key">Địa Chỉ MAC BMS:</span><span class="data-val">${d.active_bms_mac || '—'}</span></div>
-    
-    <div id="scan-status" style="font-size:0.75rem;color:#8b949e;margin-top:8px;display:none;font-weight:600;"></div>
-    
-    <div id="ble-devices-list" style="margin-top:12px;display:none;">
-      <div style="font-size:0.72rem;color:#38bdf8;font-weight:700;margin-bottom:8px;text-transform:uppercase;letter-spacing:0.04em;">📋 Danh Sách BMS Quét Thấy:</div>
-      <div id="ble-devices-grid" style="display:flex;flex-direction:column;gap:8px;"></div>
-    </div>
+  <!-- BLE Manager -->
+  <div class="ctrl-card" style="border-color:rgba(56,189,248,.3);">
+    <div class="ctrl-title">📡 Kết Nối Bluetooth BMS</div>
+    <div class="ctrl-row"><span class="ctrl-key">BMS đang kết nối:</span><span class="ctrl-val" id="bms-connected-status" style="color:${bleConnected?'#3fb950':'#f85149'};">${d.active_bms_name||(bleConnected?'JK-BMS':'Chưa kết nối')}</span></div>
+    <div class="ctrl-row"><span class="ctrl-key">Địa chỉ MAC:</span><span class="ctrl-val" id="bms-mac-status" style="font-size:0.68rem;">${d.active_bms_mac||'—'}</span></div>
+    <button class="btn-scan" onclick="scanBle()">🔍 Quét Bluetooth BMS Xung Quanh</button>
+    <div class="scan-info" id="scan-status"></div>
+    <div class="ble-list" id="ble-devices-list"><div id="ble-devices-grid"></div></div>
   </div>
 
-  <div class="data-list">
-    <div class="data-row"><span class="data-key">Charge MOSFET Switch:</span><span class="data-val" style="color:${chargeMos?'#3fb950':'#f85149'}">${chargeMos?'ENABLED':'DISABLED'}</span></div>
-    <div class="data-row"><span class="data-key">Discharge MOSFET Switch:</span><span class="data-val" style="color:${dischargeMos?'#3fb950':'#f85149'}">${dischargeMos?'ENABLED':'DISABLED'}</span></div>
-    <div class="data-row"><span class="data-key">Active Balancer Switch:</span><span class="data-val" style="color:${balance?'#3fb950':'#f85149'}">${balance?'ENABLED':'DISABLED'}</span></div>
-    <div class="data-row"><span class="data-key">IP Local:</span><span class="data-val">${d.local_ip || '—'}</span></div>
-    <div class="data-row"><span class="data-key">Wi-Fi SSID:</span><span class="data-val">${d.ssid || '—'}</span></div>
-    <div class="data-row"><span class="data-key">Firmware Version:</span><span class="data-val">v${d.firmware_version || '2.4.0'}</span></div>
-    <div class="data-row"><span class="data-key">Ngày Kích Hoạt Cloud:</span><span class="data-val" style="color:#38bdf8;">${d.activatedAtStr || reg || '—'}</span></div>
+  <!-- MOS Control -->
+  <div class="ctrl-card">
+    <div class="ctrl-title">🎛️ Điều Khiển MOSFET</div>
+    <div class="ctrl-row"><span class="ctrl-key">Charge MOSFET:</span><span class="ctrl-val" style="color:${chargeMos?'#3fb950':'#f85149'}">${chargeMos?'ENABLED':'DISABLED'}</span></div>
+    <div class="ctrl-row"><span class="ctrl-key">Discharge MOSFET:</span><span class="ctrl-val" style="color:${dischargeMos?'#3fb950':'#f85149'}">${dischargeMos?'ENABLED':'DISABLED'}</span></div>
+    <div class="ctrl-row"><span class="ctrl-key">Active Balancer:</span><span class="ctrl-val" style="color:${balance?'#3fb950':'#f85149'}">${balance?'ENABLED':'DISABLED'}</span></div>
   </div>
 
-  <div style="margin-top:20px;text-align:center;">
-    <button class="btn-reset" onclick="resetWifi()">🔄 Reset Cấu Hình Wi-Fi (AP Setup)</button>
-    <div id="reset-msg" style="font-size:0.78rem;margin-top:10px;display:none;font-weight:600;"></div>
+  <!-- Device Info -->
+  <div class="ctrl-card">
+    <div class="ctrl-title">📟 Thông Tin Thiết Bị</div>
+    <div class="ctrl-row"><span class="ctrl-key">Device ID:</span><span class="ctrl-val blue">${d.device_id}</span></div>
+    <div class="ctrl-row"><span class="ctrl-key">IP Local:</span><span class="ctrl-val">${d.local_ip||'—'}</span></div>
+    <div class="ctrl-row"><span class="ctrl-key">Hostname:</span><span class="ctrl-val">${d.hostname||'—'}</span></div>
+    <div class="ctrl-row"><span class="ctrl-key">Firmware:</span><span class="ctrl-val blue">v${d.firmware_version||'—'}</span></div>
+    <div class="ctrl-row"><span class="ctrl-key">Wi-Fi RSSI:</span><span class="ctrl-val">${rssiVal}</span></div>
+    <button class="btn-danger" onclick="resetWifi()">🔄 Reset Cấu Hình Wi-Fi (AP Setup)</button>
+    <div id="reset-msg" style="font-size:0.75rem;margin-top:8px;display:none;font-weight:600;text-align:center;"></div>
   </div>
 </div>
 
-<!-- FOOTER NAVIGATION BAR -->
+<!-- FOOTER NAV -->
 <div class="footer-nav">
-  <button class="f-btn active" id="f-status" onclick="showTab('status')"><span class="f-icon">📈</span>Status</button>
-  <button class="f-btn" id="f-settings" onclick="showTab('settings')"><span class="f-icon">⚙️</span>Settings</button>
+  <button class="f-btn active" id="f-home" onclick="showTab('home')"><span class="f-icon">🏠</span>Home</button>
+  <button class="f-btn" id="f-status" onclick="showTab('status')"><span class="f-icon">📊</span>Status</button>
   <button class="f-btn" id="f-control" onclick="showTab('control')"><span class="f-icon">🎛️</span>Control</button>
 </div>
 
@@ -872,130 +959,81 @@ function CUSTOMER_DEVICE_HTML(d) {
     document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
     document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
     document.querySelectorAll('.f-btn').forEach(el => el.classList.remove('active'));
-
     document.getElementById('tab-' + name).classList.add('active');
-    if (name === 'status') {
-      document.querySelectorAll('.tab-btn')[0].classList.add('active');
-      document.getElementById('f-status').classList.add('active');
-    } else if (name === 'settings') {
-      document.querySelectorAll('.tab-btn')[1].classList.add('active');
-      document.getElementById('f-settings').classList.add('active');
-    } else if (name === 'control') {
-      document.querySelectorAll('.tab-btn')[2].classList.add('active');
-      document.getElementById('f-control').classList.add('active');
-    }
+    const idx = {home:0,status:1,control:2}[name] || 0;
+    document.querySelectorAll('.tab-btn')[idx].classList.add('active');
+    document.getElementById('f-' + name).classList.add('active');
+  }
+
+  function updateSocRing(socVal) {
+    const ring = document.querySelector('circle:last-of-type');
+    if (!ring) return;
+    const dash = Math.round(socVal * 2.513);
+    ring.setAttribute('stroke-dashoffset', 251.3 - dash);
+    ring.setAttribute('stroke', socVal > 50 ? '#3fb950' : socVal > 20 ? '#e3b341' : '#f85149');
+    const socEl = document.getElementById('hero-soc');
+    if (socEl) socEl.textContent = socVal + '%';
+    const bar = document.getElementById('bar-fill');
+    if (bar) bar.style.width = socVal + '%';
   }
 
   function updateScanStatus(msg, color, devices) {
-    ['scan-status', 'scan-status-status'].forEach(id => {
-      const el = document.getElementById(id);
-      if (el) {
-        el.style.display = 'block';
-        el.style.color = color || '#e3b341';
-        el.textContent = msg;
-      }
-    });
-
+    const el = document.getElementById('scan-status');
+    if (el) { el.style.display='block'; el.style.color=color||'#e3b341'; el.textContent=msg; }
     if (devices && devices.length > 0) {
-      ['ble-devices-list', 'ble-devices-list-status'].forEach((listId, idx) => {
-        const gridId = idx === 0 ? 'ble-devices-grid' : 'ble-devices-grid-status';
-        const listEl = document.getElementById(listId);
-        const gridEl = document.getElementById(gridId);
-        if (listEl && gridEl) {
-          listEl.style.display = 'block';
-          gridEl.innerHTML = devices.map(dev => {
-            const macAddr = dev.mac || dev.address || '—';
-            const devName = dev.name || 'JK-BMS';
-            const devRssi = dev.rssi ? dev.rssi + ' dBm' : '';
-            return '<div style="background:#081312;border:1px solid #152b27;padding:8px 10px;border-radius:8px;display:flex;justify-content:space-between;align-items:center;">' +
-              '<div>' +
-                '<div style="font-size:0.82rem;font-weight:700;color:#e6edf3;">📟 ' + devName + '</div>' +
-                '<div style="font-size:0.7rem;color:#8b949e;font-family:monospace;">' + macAddr + ' • 📶 ' + devRssi + '</div>' +
-              '</div>' +
-              '<button onclick="connectBms(\'' + macAddr + '\', \'' + devName + '\')" style="background:rgba(63,185,80,0.2);border:1px solid #3fb950;color:#3fb950;padding:5px 12px;border-radius:6px;font-size:0.75rem;font-weight:700;cursor:pointer;">🔌 Kết Nối</button>' +
-            '</div>';
-          }).join('');
-        }
-      });
+      const listEl = document.getElementById('ble-devices-list');
+      const gridEl = document.getElementById('ble-devices-grid');
+      if (listEl && gridEl) {
+        listEl.style.display = 'block';
+        gridEl.innerHTML = devices.map(dev => {
+          const mac = dev.mac||dev.address||'—';
+          const name = dev.name||'JK-BMS';
+          const rssi = dev.rssi ? dev.rssi + ' dBm' : '';
+          return '<div class="ble-item"><div><div style="font-size:0.8rem;font-weight:700;color:#e6edf3;">📟 '+name+'</div><div style="font-size:0.68rem;color:#8b949e;font-family:monospace;">'+mac+' • 📶 '+rssi+'</div></div><button class="btn-connect" onclick="connectBms(\''+mac+'\',\''+name+'\')">🔌 Kết Nối</button></div>';
+        }).join('');
+      }
     }
   }
 
   async function scanBle() {
     updateScanStatus('⏳ Đang gửi lệnh quét Bluetooth tới ESP32...', '#e3b341');
-
     try {
-      await fetch('/api/send-command', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ device_id: '${d.device_id}', cmd: { cmd: 'scan_ble' } })
-      });
-      
+      await fetch('/api/send-command', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({device_id:'${d.device_id}', cmd:{cmd:'scan_ble'}}) });
       let attempts = 0;
       const timer = setInterval(async () => {
         attempts++;
-        updateScanStatus('⏳ Đang quét sóng Bluetooth xung quanh... (' + (attempts * 2) + 's)', '#e3b341');
+        updateScanStatus('⏳ Đang quét... (' + (attempts*2) + 's)', '#e3b341');
         try {
           const res = await fetch('/api/scanned-ble?device_id=${d.device_id}');
           const data = await res.json();
-          if (data.devices && data.devices.length > 0) {
-            clearInterval(timer);
-            updateScanStatus('✅ Tìm thấy ' + data.devices.length + ' thiết bị Bluetooth!', '#3fb950', data.devices);
-          } else if (attempts >= 6) {
-            clearInterval(timer);
-            updateScanStatus('❌ Chưa quét thấy thiết bị JK-BMS nào xung quanh.', '#f85149');
-          }
+          if (data.devices && data.devices.length > 0) { clearInterval(timer); updateScanStatus('✅ Tìm thấy '+data.devices.length+' thiết bị!', '#3fb950', data.devices); }
+          else if (attempts >= 6) { clearInterval(timer); updateScanStatus('❌ Không tìm thấy JK-BMS nào.', '#f85149'); }
         } catch(e){}
       }, 2000);
-    } catch(e) {
-      updateScanStatus('❌ Lỗi gửi lệnh máy chủ!', '#f85149');
-    }
+    } catch(e) { updateScanStatus('❌ Lỗi gửi lệnh!', '#f85149'); }
   }
 
   async function connectBms(mac, name) {
-    if (!confirm('Bạn có muốn chuyển kết nối ESP32 sang thiết bị BMS ' + name + ' (' + mac + ')?')) return;
-    const statusEl = document.getElementById('scan-status');
-    statusEl.style.display = 'block';
-    statusEl.style.color = '#e3b341';
-    statusEl.textContent = '⏳ Đang gửi lệnh kết nối tới ' + name + '...';
+    if (!confirm('Kết nối ESP32 tới BMS '+name+' ('+mac+')?')) return;
+    const el = document.getElementById('scan-status');
+    if (el) { el.style.display='block'; el.style.color='#e3b341'; el.textContent='⏳ Đang gửi lệnh kết nối...'; }
     try {
-      await fetch('/api/send-command', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ device_id: '${d.device_id}', cmd: { cmd: 'connect_bms', mac: mac, name: name, pin: '1234' } })
-      });
-      statusEl.style.color = '#3fb950';
-      statusEl.textContent = '✅ Đã gửi lệnh! ESP32 đang kết nối Bluetooth...';
+      await fetch('/api/send-command', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({device_id:'${d.device_id}', cmd:{cmd:'connect_bms', mac:mac, name:name, pin:'1234'}}) });
+      if (el) { el.style.color='#3fb950'; el.textContent='✅ Đã gửi lệnh! ESP32 đang kết nối...'; }
       setTimeout(() => location.reload(), 4000);
-    } catch(e) {
-      statusEl.style.color = '#f85149';
-      statusEl.textContent = '❌ Lỗi khi gửi lệnh kết nối!';
-    }
+    } catch(e) { if (el) { el.style.color='#f85149'; el.textContent='❌ Lỗi gửi lệnh!'; } }
   }
 
   async function resetWifi() {
-    if (!confirm('Bạn có chắc chắn muốn Reset Cấu Hình Wi-Fi của thiết bị ${d.device_id}? ESP32 sẽ xóa Wi-Fi và phát lại điểm truy cập cài đặt.')) return;
+    if (!confirm('Xác nhận Reset Wi-Fi thiết bị ${d.device_id}?')) return;
     const msgEl = document.getElementById('reset-msg');
-    msgEl.style.display = 'block';
-    msgEl.style.color = '#e3b341';
-    msgEl.textContent = '⏳ Đang gửi lệnh Reset Wi-Fi tới thiết bị...';
+    msgEl.style.display='block'; msgEl.style.color='#e3b341'; msgEl.textContent='⏳ Đang gửi lệnh Reset...';
     try {
-      const res = await fetch('/api/send-command', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ device_id: '${d.device_id}', cmd: { cmd: 'reset_wifi' } })
-      });
+      const res = await fetch('/api/send-command', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({device_id:'${d.device_id}', cmd:{cmd:'reset_wifi'}}) });
       const data = await res.json();
-      if (data.status === 'ok') {
-        msgEl.style.color = '#3fb950';
-        msgEl.textContent = '✅ Đã gửi lệnh! ESP32 đang xóa Wi-Fi và khởi động lại...';
-      } else {
-        msgEl.style.color = '#f85149';
-        msgEl.textContent = '❌ Lỗi khi gửi lệnh reset!';
-      }
-    } catch(e) {
-      msgEl.style.color = '#f85149';
-      msgEl.textContent = '❌ Lỗi kết nối máy chủ!';
-    }
+      msgEl.style.color = data.status==='ok' ? '#3fb950' : '#f85149';
+      msgEl.textContent = data.status==='ok' ? '✅ Đã gửi lệnh reset thành công!' : '❌ Lỗi gửi lệnh!';
+    } catch(e) { msgEl.style.color='#f85149'; msgEl.textContent='❌ Lỗi kết nối máy chủ!'; }
   }
 
   async function refreshLiveData() {
@@ -1005,44 +1043,33 @@ function CUSTOMER_DEVICE_HTML(d) {
       const devices = await res.json();
       const dev = devices.find(item => item.device_id === '${d.device_id}');
       if (!dev) return;
+      const bc = dev.connected && dev.voltage > 0;
 
-      const online = dev.online;
-      const bleConnected = dev.connected && dev.voltage > 0;
+      const heroV = document.getElementById('hero-v');
+      if (heroV) heroV.innerHTML = (bc && dev.voltage ? dev.voltage.toFixed(2) : '—') + '<span class="vc-unit">V</span>';
+      const heroA = document.getElementById('hero-a');
+      if (heroA) heroA.innerHTML = (bc && dev.current !== undefined ? dev.current.toFixed(2) : '—') + '<span class="vc-unit">A</span>';
+      if (bc && dev.soc !== undefined) updateSocRing(dev.soc);
 
-      const wifiBadge = document.getElementById('status-wifi-badge');
-      if (wifiBadge) {
-        wifiBadge.innerHTML = online ? '🟢 WiFi Online' : '🔴 WiFi Offline';
-        wifiBadge.style.color = online ? '#3fb950' : '#f85149';
+      const setEl = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+      if (bc) {
+        const pow = dev.power !== undefined ? Math.abs(dev.power).toFixed(1) : '—';
+        setEl('bar-curr', dev.current !== undefined ? dev.current.toFixed(2) : '—');
+        setEl('bar-power', pow);
+        setEl('rt-power', pow + ' W');
+        setEl('rt-rem', (dev.remain_capacity_ah !== undefined ? dev.remain_capacity_ah.toFixed(1) : '—') + ' Ah');
+        setEl('rt-mos', (dev.mos_temp !== undefined ? dev.mos_temp.toFixed(1) : '—') + ' °C');
+        setEl('rt-cyc', dev.cycle_count !== undefined ? dev.cycle_count : '—');
+        setEl('g-mostemp', dev.mos_temp !== undefined ? dev.mos_temp.toFixed(1) : '—');
+        setEl('g-rem', dev.remain_capacity_ah !== undefined ? dev.remain_capacity_ah.toFixed(1) : '—');
+        setEl('rt-cap', (dev.capacity_ah !== undefined ? dev.capacity_ah.toFixed(1) : '—') + ' Ah');
+        setEl('rt-bal', (dev.balance_current !== undefined ? dev.balance_current.toFixed(3) : '—') + ' A');
       }
 
-      const bleStatusVal = document.getElementById('bms-connected-status');
-      if (bleStatusVal) {
-        bleStatusVal.innerHTML = bleConnected ? '🟢 ' + (dev.active_bms_name || 'JK-BMS Đã Kết Nối') : '🔴 Chưa kết nối với BMS';
-        bleStatusVal.style.color = bleConnected ? '#3fb950' : '#f85149';
-      }
-
-      const bmsMacVal = document.getElementById('bms-mac-status');
-      if (bmsMacVal) {
-        bmsMacVal.textContent = dev.active_bms_mac || '—';
-      }
-
-      if (bleConnected) {
-        const heroV = document.getElementById('hero-v');
-        if (heroV) heroV.innerHTML = (dev.voltage ? dev.voltage.toFixed(2) : '—') + '<sup>V</sup>';
-        const heroA = document.getElementById('hero-a');
-        if (heroA) heroA.innerHTML = (dev.current !== undefined ? dev.current.toFixed(2) : '—') + '<sup>A</sup>';
-
-        const p = document.getElementById('val-power');
-        if (p) p.textContent = (dev.power !== undefined ? Math.abs(dev.power).toFixed(1) : '—') + ' W';
-        const soc = document.getElementById('val-soc');
-        if (soc) soc.textContent = (dev.soc !== undefined ? dev.soc : '—') + ' %';
-        const mt = document.getElementById('val-mostemp');
-        if (mt) mt.textContent = (dev.mos_temp !== undefined ? dev.mos_temp.toFixed(1) : '—') + ' °C';
-        const cap = document.getElementById('val-capacity');
-        if (cap) cap.textContent = (dev.capacity_ah !== undefined ? dev.capacity_ah.toFixed(1) : '—') + ' Ah';
-        const cyc = document.getElementById('val-cycles');
-        if (cyc) cyc.textContent = (dev.cycle_count !== undefined ? dev.cycle_count : '—');
-      }
+      const bleEl = document.getElementById('bms-connected-status');
+      if (bleEl) { bleEl.textContent = bc ? (dev.active_bms_name||'JK-BMS') : 'Chưa kết nối'; bleEl.style.color = bc ? '#3fb950' : '#f85149'; }
+      const macEl = document.getElementById('bms-mac-status');
+      if (macEl) macEl.textContent = dev.active_bms_mac || '—';
     } catch(e){}
   }
 
@@ -1052,6 +1079,7 @@ function CUSTOMER_DEVICE_HTML(d) {
 </body>
 </html>`;
 }
+
 
 function DEVICE_NOT_FOUND_HTML(deviceId) {
   return `<!DOCTYPE html>
