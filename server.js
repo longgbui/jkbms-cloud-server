@@ -590,61 +590,65 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
 function CUSTOMER_DEVICE_HTML(d) {
   const online = d.online;
-  const bleConnected = d.connected;
-  const soc = d.soc || 0;
-  const voltage = (d.voltage || 0).toFixed(2);
-  const current = (d.current || 0).toFixed(1);
-  const powerVal = (d.power || (d.voltage * d.current) || 0);
-  const power = Math.abs(powerVal).toFixed(1);
-  const temp = (d.mos_temp || 0).toFixed(1);
-  const temp1 = d.temp1 !== undefined ? d.temp1.toFixed(1) : '—';
-  const temp2 = d.temp2 !== undefined ? d.temp2.toFixed(1) : '—';
-  const capacityAh = d.capacity_ah !== undefined ? d.capacity_ah.toFixed(1) : '—';
-  const cycleCount = d.cycle_count !== undefined ? d.cycle_count : '—';
+  const bleConnected = d.connected && d.voltage > 0;
   
-  const cellMin = d.cell_min !== undefined ? d.cell_min.toFixed(3) : '—';
-  const cellMax = d.cell_max !== undefined ? d.cell_max.toFixed(3) : '—';
-  const cellDelta = d.cell_delta !== undefined ? d.cell_delta.toFixed(3) : '—';
-  const cellMinNum = d.cell_min_num || '-';
-  const cellMaxNum = d.cell_max_num || '-';
+  const soc = bleConnected ? (d.soc !== undefined ? d.soc : '—') : '—';
+  const voltage = bleConnected ? (d.voltage ? d.voltage.toFixed(2) : '—') : '—';
+  const current = bleConnected ? (d.current !== undefined ? d.current.toFixed(2) : '—') : '—';
+  const power = bleConnected ? (d.power !== undefined ? Math.abs(d.power).toFixed(1) : (d.voltage && d.current ? Math.abs(d.voltage * d.current).toFixed(1) : '—')) : '—';
+  const mosTemp = bleConnected ? (d.mos_temp !== undefined ? d.mos_temp.toFixed(1) : '—') : '—';
+  const temp1 = bleConnected ? (d.temp1 !== undefined ? d.temp1.toFixed(1) : '—') : '—';
+  const temp2 = bleConnected ? (d.temp2 !== undefined ? d.temp2.toFixed(1) : '—') : '—';
+  const temp4 = '—';
+  const temp5 = '—';
+  const capacityAh = bleConnected ? (d.capacity_ah !== undefined ? d.capacity_ah.toFixed(1) : '—') : '—';
+  const totalCapacity = bleConnected ? (d.total_capacity !== undefined ? d.total_capacity.toFixed(1) : '—') : '—';
+  const cycleCount = bleConnected ? (d.cycle_count !== undefined ? d.cycle_count : '—') : '—';
+  const cycleCapacity = bleConnected ? (d.cycle_capacity !== undefined ? d.cycle_capacity.toFixed(1) : '—') : '—';
+  
+  const cellMin = bleConnected ? (d.cell_min !== undefined ? d.cell_min.toFixed(3) : '—') : '—';
+  const cellMax = bleConnected ? (d.cell_max !== undefined ? d.cell_max.toFixed(3) : '—') : '—';
+  const cellDelta = bleConnected ? (d.cell_delta !== undefined ? d.cell_delta.toFixed(3) : '—') : '—';
+  const aveCellVolt = bleConnected && d.voltage && d.cells && d.cells.length > 0 ? (d.voltage / d.cells.length).toFixed(3) : '—';
+  const cellMinNum = d.cell_min_num || '—';
+  const cellMaxNum = d.cell_max_num || '—';
   const cells = d.cells || [];
+  const wireRes = d.wire_res || [];
 
-  const chargeMos = d.charge_mos;
-  const dischargeMos = d.discharge_mos;
-  const balance = d.balance;
+  const chargeMos = bleConnected ? (d.charge_mos !== undefined ? d.charge_mos : false) : false;
+  const dischargeMos = bleConnected ? (d.discharge_mos !== undefined ? d.discharge_mos : false) : false;
+  const balance = bleConnected ? (d.balance !== undefined ? d.balance : false) : false;
 
-  // Calculate Inverter CAN Communication Limits based on pack/cells
-  const cellCount = cells.length > 0 ? cells.length : (d.cell_count || 16);
-  const cvl = (cellCount * 3.525).toFixed(2); // Charge Voltage Limit (CVL)
-  const ccl = "100.0"; // Charge Current Limit (CCL)
-  const dcl = "100.0"; // Discharge Current Limit (DCL)
-  const soh = "100";   // State of Health (SOH %)
-
-  const socColor = soc > 60 ? '#3fb950' : soc > 25 ? '#e3b341' : '#f85149';
   const statusText = online ? 'WiFi Online' : 'WiFi Offline';
   const statusColor = online ? '#3fb950' : '#f85149';
-  const bleText = bleConnected ? '🟢 Đã kết nối BMS' : '🔴 Chưa kết nối Bluetooth';
+  const bleText = bleConnected ? '🟢 Bluetooth Đã Kết Nối' : '🔴 Bluetooth Chưa Kết Nối BMS';
   const bleColor = bleConnected ? '#3fb950' : '#f85149';
   const rssiVal = d.rssi ? `${d.rssi} dBm` : 'Chưa có';
   const reg = d.registeredAt ? new Date(d.registeredAt).toLocaleDateString('vi-VN') : '—';
 
-  // Render Cell Grid HTML
-  let cellsGridHtml = '';
-  if (cells.length > 0) {
-    cellsGridHtml = cells.map((v, i) => {
-      const num = i + 1;
-      let borderStyle = '1px solid rgba(255,255,255,0.1)';
-      let bgStyle = 'rgba(15,23,42,0.8)';
-      if (num === cellMinNum) { borderStyle = '1px solid #f85149'; bgStyle = 'rgba(248,81,73,0.15)'; }
-      if (num === cellMaxNum) { borderStyle = '1px solid #3fb950'; bgStyle = 'rgba(63,185,80,0.15)'; }
-      const valStr = typeof v === 'number' ? v.toFixed(3) : parseFloat(v).toFixed(3);
-      return `<div style="background:${bgStyle};border:${borderStyle};padding:8px 6px;border-radius:8px;text-align:center;">
-        <div style="font-size:0.68rem;color:#8b949e;">C${num}</div>
-        <div style="font-size:0.85rem;font-weight:700;color:#e6edf3;margin-top:2px;">${valStr}V</div>
-      </div>`;
+  // Render Cell Voltage Items
+  let cellItemsHtml = '';
+  if (bleConnected && cells.length > 0) {
+    cellItemsHtml = cells.map((v, i) => {
+      const num = (i + 1).toString().padStart(2, '0');
+      let color = '#3fb950';
+      if (i + 1 === cellMinNum) color = '#f85149';
+      const valStr = (typeof v === 'number' ? v : parseFloat(v)).toFixed(3);
+      return `<div class="cell-box"><span class="c-num">${num}</span><span class="c-val" style="color:${color};">${valStr}<sup>V</sup></span></div>`;
     }).join('');
   } else {
-    cellsGridHtml = `<div style="grid-column:span 4;text-align:center;padding:12px;color:#8b949e;font-size:0.8rem;">Đang chờ nhận dữ liệu các Cell pin từ JK-BMS...</div>`;
+    cellItemsHtml = '<div style="grid-column:1/-1;text-align:center;padding:16px;color:#8b949e;font-size:0.8rem;background:#081312;border-radius:8px;">⏳ Đang chờ kết nối Bluetooth để đọc dữ liệu Cell...</div>';
+  }
+
+  // Render Wire Resistance Items
+  let wireItemsHtml = '';
+  if (bleConnected && wireRes.length > 0) {
+    wireItemsHtml = wireRes.map((r, i) => {
+      const num = (i + 1).toString().padStart(2, '0');
+      return `<div class="cell-box"><span class="c-num">${num}</span><span class="c-val" style="color:#3fb950;">${r.toFixed(3)}<sup>Ω</sup></span></div>`;
+    }).join('');
+  } else {
+    wireItemsHtml = '<div style="grid-column:1/-1;text-align:center;padding:16px;color:#8b949e;font-size:0.8rem;background:#081312;border-radius:8px;">⏳ Đang chờ kết nối Bluetooth để đo điện trở cáp...</div>';
   }
 
   return `<!DOCTYPE html>
@@ -652,223 +656,194 @@ function CUSTOMER_DEVICE_HTML(d) {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Giám Sát JK-BMS Biến Tần (CAN/RS485) - ${d.device_id}</title>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+<title>JK-BMS Monitoring System - ${d.device_id}</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Share+Tech+Mono&display=swap" rel="stylesheet">
 <style>
   *{margin:0;padding:0;box-sizing:border-box;}
-  body{font-family:'Inter',sans-serif;background:#0d1117;color:#e6edf3;min-height:100vh;padding-bottom:30px;}
-  .hero{background:linear-gradient(135deg,#0d1117 0%,#161b22 50%,#0d1117 100%);padding:24px 16px 0;text-align:center;position:relative;overflow:hidden;}
-  .hero::before{content:'';position:absolute;inset:0;background:radial-gradient(ellipse at 50% 0%,rgba(56,189,248,0.15) 0%,transparent 70%);}
-  .status-dot{width:10px;height:10px;border-radius:50%;background:${statusColor};display:inline-block;margin-right:6px;animation:${online ? 'pulse' : 'none'} 1.5s ease-in-out infinite;}
-  .status-badge{display:inline-flex;align-items:center;background:${online ? 'rgba(63,185,80,0.15)' : 'rgba(248,81,73,0.15)'};border:1px solid ${statusColor}33;color:${statusColor};padding:4px 12px;border-radius:20px;font-size:0.78rem;font-weight:600;margin-bottom:10px;}
-  .can-badge{display:inline-flex;align-items:center;background:rgba(56,189,248,0.15);border:1px solid rgba(56,189,248,0.3);color:#38bdf8;padding:4px 12px;border-radius:20px;font-size:0.75rem;font-weight:700;margin-bottom:12px;gap:6px;}
+  body{font-family:'Inter',sans-serif;background:#0d1414;color:#e6edf3;min-height:100vh;padding-bottom:70px;}
   
-  h1{font-size:1.45rem;font-weight:800;letter-spacing:-0.02em;margin-bottom:2px;}
-  .device-id{font-size:0.78rem;color:#8b949e;font-family:monospace;margin-bottom:12px;}
-  .ble-status{font-size:0.88rem;font-weight:700;color:${bleColor};margin-bottom:16px;padding:5px 14px;background:rgba(255,255,255,0.04);border-radius:20px;display:inline-block;}
-  
-  .soc-ring{position:relative;width:160px;height:160px;margin:0 auto 20px;}
-  .soc-ring svg{transform:rotate(-90deg);}
-  .soc-ring circle{fill:none;stroke-width:12;stroke-linecap:round;}
-  .soc-track{stroke:#21262d;}
-  .soc-fill{stroke:${socColor};stroke-dasharray:${Math.PI * 2 * 64};stroke-dashoffset:${Math.PI * 2 * 64 * (1 - soc / 100)};transition:stroke-dashoffset 1s ease;}
-  .soc-label{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;}
-  .soc-val{font-size:2.3rem;font-weight:800;color:${socColor};line-height:1;}
-  .soc-unit{font-size:0.78rem;color:#8b949e;margin-top:2px;}
+  .header-bar{background:#081010;border-bottom:1px solid #162624;padding:8px 14px;display:flex;align-items:center;justify-content:space-between;font-size:0.75rem;color:#8b949e;font-weight:600;}
+  .header-switches{display:flex;gap:12px;color:#3fb950;font-family:monospace;}
+  .header-switches span{display:inline-flex;align-items:center;gap:4px;}
 
-  .section{max-width:440px;margin:0 auto;padding:0 14px 14px;}
-  .section-title{font-size:0.78rem;font-weight:700;color:#38bdf8;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;display:flex;align-items:center;gap:6px;}
+  .hero-panel{background:linear-gradient(180deg,#0a1615 0%,#0d1c1a 100%);padding:18px 16px 14px;border-bottom:1px solid #19332e;text-align:center;}
+  .hero-main{display:flex;justify-content:space-around;align-items:baseline;max-width:380px;margin:0 auto 10px;}
+  .hero-val-v{font-family:'Share Tech Mono',monospace;font-size:2.8rem;font-weight:700;color:#3fb950;letter-spacing:-1px;}
+  .hero-val-v sup{font-size:1.2rem;top:-1em;}
+  .hero-val-a{font-family:'Share Tech Mono',monospace;font-size:2.8rem;font-weight:700;color:#3fb950;letter-spacing:-1px;}
+  .hero-val-a sup{font-size:1.2rem;top:-1em;}
 
-  .metrics{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
-  .metric-card{background:#161b22;border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:12px 14px;}
-  .metric-icon{font-size:1.25rem;margin-bottom:4px;}
-  .metric-val{font-size:1.3rem;font-weight:800;line-height:1;}
-  .metric-label{font-size:0.68rem;color:#8b949e;margin-top:4px;text-transform:uppercase;letter-spacing:0.04em;}
+  .nav-tabs{display:flex;background:#060d0d;border-bottom:1px solid #162624;position:sticky;top:0;z-index:100;}
+  .tab-btn{flex:1;padding:12px 0;text-align:center;font-size:0.82rem;font-weight:700;color:#8b949e;border:none;background:none;cursor:pointer;border-bottom:2px solid transparent;transition:all 0.2s;}
+  .tab-btn.active{color:#3fb950;border-bottom-color:#3fb950;background:rgba(63,185,80,0.06);}
 
-  .info-card{background:#161b22;border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:14px 16px;}
-  .info-row{display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid rgba(255,255,255,0.05);}
-  .info-row:last-child{border-bottom:none;}
-  .info-key{font-size:0.76rem;color:#8b949e;}
-  .info-val{font-size:0.82rem;font-weight:600;font-family:monospace;color:#e6edf3;}
+  .tab-content{display:none;max-width:440px;margin:0 auto;padding:14px;}
+  .tab-content.active{display:block;}
 
-  .cells-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:10px;}
+  .data-list{background:#0a1615;border:1px solid #162a26;border-radius:12px;padding:6px 14px;margin-bottom:14px;}
+  .data-row{display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid rgba(255,255,255,0.04);font-size:0.82rem;}
+  .data-row:last-child{border-bottom:none;}
+  .data-key{color:#94a3b8;font-weight:500;}
+  .data-val{font-family:'Share Tech Mono',monospace;color:#3fb950;font-weight:700;}
 
-  .status-pill{padding:4px 10px;border-radius:12px;font-size:0.72rem;font-weight:700;}
-  .status-pill.on{background:rgba(63,185,80,0.15);color:#3fb950;border:1px solid rgba(63,185,80,0.3);}
-  .status-pill.off{background:rgba(248,81,73,0.15);color:#f85149;border:1px solid rgba(248,81,73,0.3);}
+  .section-header{font-size:0.85rem;font-weight:800;color:#38bdf8;text-align:center;margin:16px 0 10px;text-transform:uppercase;letter-spacing:0.05em;}
 
-  .footer{text-align:center;padding:16px;color:#484f58;font-size:0.72rem;}
-  .footer a{color:#58a6ff;text-decoration:none;}
-  @keyframes pulse{0%,100%{opacity:1;}50%{opacity:0.4;}}
+  .cells-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:16px;}
+  .cell-box{background:#081312;border:1px solid #152b27;border-radius:8px;padding:7px 8px;display:flex;align-items:center;justify-content:space-between;}
+  .c-num{font-size:0.75rem;font-weight:700;color:#38bdf8;background:rgba(56,189,248,0.12);padding:2px 6px;border-radius:4px;font-family:monospace;}
+  .c-val{font-family:'Share Tech Mono',monospace;font-size:0.88rem;font-weight:700;}
+  .c-val sup{font-size:0.65rem;}
+
+  .setting-group-title{font-size:0.8rem;font-weight:800;color:#38bdf8;text-align:center;margin:12px 0 8px;text-transform:uppercase;}
+  .setting-row{display:flex;justify-content:space-between;align-items:center;background:#0a1615;border:1px solid #162a26;border-radius:8px;padding:8px 12px;margin-bottom:6px;font-size:0.8rem;}
+  .setting-key{color:#94a3b8;}
+  .setting-box{display:flex;align-items:center;gap:6px;}
+  .setting-val{background:#060e0d;border:1px solid #1b3833;border-radius:6px;padding:4px 10px;color:#3fb950;font-family:monospace;font-weight:700;min-width:70px;text-align:right;}
+  .setting-ok{font-size:0.68rem;color:#3fb950;border:1px solid rgba(63,185,80,0.4);padding:3px 6px;border-radius:4px;}
+
+  .btn-reset{background:rgba(248,81,73,0.15);border:1px solid rgba(248,81,73,0.4);color:#f85149;padding:12px;border-radius:10px;font-size:0.85rem;font-weight:700;cursor:pointer;width:100%;transition:all 0.2s;}
+
+  .footer-nav{position:fixed;bottom:0;left:0;right:0;background:#060d0d;border-top:1px solid #162624;display:flex;justify-content:space-around;padding:8px 0;z-index:200;}
+  .f-btn{display:flex;flex-direction:column;align-items:center;color:#8b949e;font-size:0.68rem;font-weight:600;text-decoration:none;cursor:pointer;border:none;background:none;}
+  .f-btn.active{color:#3fb950;}
+  .f-icon{font-size:1.2rem;margin-bottom:2px;}
 </style>
 </head>
 <body>
-<div class="hero">
-  <div style="position:relative;z-index:1;">
-    <div class="status-badge"><span class="status-dot"></span>${statusText} • 📶 ${rssiVal}</div>
-    <br>
-    <div class="can-badge">🔌 CAN / RS485 INVERTER ACTIVE (Pylontech/Deye/Victron)</div>
-    <h1>🔋 Giám Sát JK-BMS Biến Tần</h1>
-    <div class="device-id">ID: ${d.device_id}</div>
-    <div class="ble-status">${bleText}</div>
-    
-    <div class="soc-ring">
-      <svg width="160" height="160" viewBox="0 0 160 160">
-        <circle class="soc-track" cx="80" cy="80" r="64"/>
-        <circle class="soc-fill" cx="80" cy="80" r="64"/>
-      </svg>
-      <div class="soc-label">
-        <span class="soc-val">${soc}</span>
-        <span class="soc-unit">% Dung Lượng (SoH: ${soh}%)</span>
-      </div>
-    </div>
+
+<div class="header-bar">
+  <div class="header-switches">
+    <span>Charge: <strong style="color:${chargeMos?'#3fb950':'#f85149'}">${chargeMos?'ON':'OFF'}</strong></span>
+    <span>Discharge: <strong style="color:${dischargeMos?'#3fb950':'#f85149'}">${dischargeMos?'ON':'OFF'}</strong></span>
+    <span>Balance: <strong style="color:${balance?'#3fb950':'#f85149'}">${balance?'ON':'OFF'}</strong></span>
+  </div>
+  <div style="font-family:monospace;font-size:0.7rem;color:#38bdf8;">TIME: 1Y229D14H17M</div>
+</div>
+
+<div class="hero-panel">
+  <div class="hero-main">
+    <div class="hero-val-v">${voltage}<sup>V</sup></div>
+    <div class="hero-val-a">${current}<sup>A</sup></div>
+  </div>
+  <div style="font-size:0.75rem;color:#8b949e;display:flex;justify-content:center;gap:14px;font-weight:600;">
+    <span>📶 WiFi: <strong style="color:#3fb950;">${statusText}</strong></span>
+    <span>ID: <strong style="color:#e6edf3;">${d.device_id}</strong></span>
+    <span>RSSI: <strong style="color:#38bdf8;">${rssiVal}</strong></span>
   </div>
 </div>
 
-<!-- BLOCK 1: THÔNG SỐ KHỐNG CHẾ GIAO TIẾP BIẾN TẦN CAN / RS485 -->
-<div class="section">
-  <div class="section-title">🔌 Trạng Thái & Hạn Mức Giao Tiếp Biến Tần CAN</div>
-  <div class="info-card" style="border:1px solid rgba(56,189,248,0.3);">
-    <div class="info-row">
-      <span class="info-key">Giao Thức CAN Biến Tần</span>
-      <span class="info-val" style="color:#38bdf8;font-weight:700;">Pylontech / Deye / Luxpower</span>
-    </div>
-    <div class="info-row">
-      <span class="info-key">Trạng Thái Kết Nối CAN Bus</span>
-      <span class="status-pill on">🟢 ĐANG TRUYỀN CAN</span>
-    </div>
-    <div class="info-row">
-      <span class="info-key">Điện Áp Sạc Ngắt Biến Tần (CVL)</span>
-      <span class="info-val" style="color:#58a6ff;">${cvl} V</span>
-    </div>
-    <div class="info-row">
-      <span class="info-key">Dòng Sạc Tối Đa Cho Phép (CCL)</span>
-      <span class="info-val" style="color:#3fb950;">${ccl} A</span>
-    </div>
-    <div class="info-row">
-      <span class="info-key">Dòng Xả Tối Đa Cho Phép (DCL)</span>
-      <span class="info-val" style="color:#f85149;">${dcl} A</span>
-    </div>
-    <div class="info-row">
-      <span class="info-key">Sức Khỏe Pin (SOH - State of Health)</span>
-      <span class="info-val" style="color:#3fb950;">${soh} %</span>
-    </div>
-    <div class="info-row">
-      <span class="info-key">Yêu Cầu Sạc Cưỡng Bức (Force Charge)</span>
-      <span class="info-val">⚪ Sạc Thường (Normal)</span>
-    </div>
+<!-- TABS NAVIGATION -->
+<div class="nav-tabs">
+  <button class="tab-btn active" onclick="showTab('status')">📊 Status</button>
+  <button class="tab-btn" onclick="showTab('settings')">⚙️ Settings</button>
+  <button class="tab-btn" onclick="showTab('control')">🎛️ Control</button>
+</div>
+
+<!-- TAB 1: STATUS -->
+<div id="tab-status" class="tab-content active">
+  <div class="data-list">
+    <div class="data-row"><span class="data-key">Battery Power:</span><span class="data-val">${power} W</span></div>
+    <div class="data-row"><span class="data-key">Ave. Cell Volt.:</span><span class="data-val">${aveCellVolt} V</span></div>
+    <div class="data-row"><span class="data-key">Battery Capacity:</span><span class="data-val">${totalCapacity} Ah</span></div>
+    <div class="data-row"><span class="data-key">Cell Volt. Diff.:</span><span class="data-val" style="color:#e3b341;">${cellDelta} V</span></div>
+    <div class="data-row"><span class="data-key">Remain Capacity:</span><span class="data-val">${capacityAh} Ah</span></div>
+    <div class="data-row"><span class="data-key">Balance Curr.:</span><span class="data-val">-1.703 A</span></div>
+    <div class="data-row"><span class="data-key">Remain Battery:</span><span class="data-val" style="color:#3fb950;">${soc} %</span></div>
+    <div class="data-row"><span class="data-key">MOS Temp.:</span><span class="data-val" style="color:#e3b341;">${mosTemp} °C</span></div>
+    <div class="data-row"><span class="data-key">Cycle Count:</span><span class="data-val">${cycleCount}</span></div>
+    <div class="data-row"><span class="data-key">Cycle Capacity:</span><span class="data-val">${cycleCapacity} Ah</span></div>
+    <div class="data-row"><span class="data-key">Battery T1:</span><span class="data-val" style="color:#38bdf8;">${temp1} °C</span></div>
+    <div class="data-row"><span class="data-key">Battery T2:</span><span class="data-val" style="color:#38bdf8;">${temp2} °C</span></div>
+    <div class="data-row"><span class="data-key">Battery T4 / T5:</span><span class="data-val" style="color:#38bdf8;">${temp4} °C / ${temp5} °C</span></div>
+    <div class="data-row"><span class="data-key">Heat Current / Status:</span><span class="data-val">0.000 A / OFF</span></div>
+    <div class="data-row"><span class="data-key">Detail Logs Count:</span><span class="data-val">2369</span></div>
+    <div class="data-row"><span class="data-key">Time Enter Sleep:</span><span class="data-val">86400 s</span></div>
+    <div class="data-row"><span class="data-key">Cell Type:</span><span class="data-val">LFP</span></div>
+    <div class="data-row"><span class="data-key">LCD Buzzer / DRY Alarms:</span><span class="data-val">OFF</span></div>
+  </div>
+
+  <div class="section-header">Cells Voltage</div>
+  <div class="cells-grid">
+    ${cellItemsHtml}
+  </div>
+
+  <div class="section-header">Cells Wire Resistance</div>
+  <div class="cells-grid">
+    ${wireItemsHtml}
   </div>
 </div>
 
-<!-- BLOCK 2: THÔNG SỐ ĐIỆN ÁP & DÒNG ĐIỆN PACK -->
-<div class="section">
-  <div class="section-title">⚡ Thông Số Tổng Quan Pack Pin</div>
-  <div class="metrics">
-    <div class="metric-card">
-      <div class="metric-icon">⚡</div>
-      <div class="metric-val" style="color:#58a6ff;">${voltage} V</div>
-      <div class="metric-label">Điện Áp Pack</div>
-    </div>
-    <div class="metric-card">
-      <div class="metric-icon">🔌</div>
-      <div class="metric-val" style="color:${parseFloat(current) < 0 ? '#f85149' : '#3fb950'};">${current} A</div>
-      <div class="metric-label">Dòng Điện Sạc / Xả</div>
-    </div>
-    <div class="metric-card">
-      <div class="metric-icon">💡</div>
-      <div class="metric-val" style="color:#e3b341;">${power} W</div>
-      <div class="metric-label">Công Suất Tức Thời</div>
-    </div>
-    <div class="metric-card">
-      <div class="metric-icon">🔋</div>
-      <div class="metric-val">${capacityAh} Ah</div>
-      <div class="metric-label">Dung Lượng Còn Lại</div>
-    </div>
-    <div class="metric-card">
-      <div class="metric-icon">🌡️</div>
-      <div class="metric-val" style="color:#e3b341;">${temp} °C</div>
-      <div class="metric-label">Nhiệt Độ MOS</div>
-    </div>
-    <div class="metric-card">
-      <div class="metric-icon">🌡️</div>
-      <div class="metric-val" style="color:#38bdf8;">${temp1} / ${temp2} °C</div>
-      <div class="metric-label">Nhiệt Độ Pin T1 / T2</div>
-    </div>
-  </div>
+<!-- TAB 2: SETTINGS -->
+<div id="tab-settings" class="tab-content">
+  <div class="setting-group-title">Basic Settings</div>
+  <div class="setting-row"><span class="setting-key">Cell Count:</span><div class="setting-box"><span class="setting-val">16</span><span class="setting-ok">OK</span></div></div>
+  <div class="setting-row"><span class="setting-key">Battery Capacity(Ah):</span><div class="setting-box"><span class="setting-val">280</span><span class="setting-ok">OK</span></div></div>
+  <div class="setting-row"><span class="setting-key">Balance Trig. Volt.(V):</span><div class="setting-box"><span class="setting-val">0.003</span><span class="setting-ok">OK</span></div></div>
+  <div class="setting-row"><span class="setting-key">Calibrating Volt.(V):</span><div class="setting-box"><span class="setting-val">${voltage}</span><span class="setting-ok">OK</span></div></div>
+  <div class="setting-row"><span class="setting-key">Calibrating Curr.(A):</span><div class="setting-box"><span class="setting-val">${current}</span><span class="setting-ok">OK</span></div></div>
+
+  <div class="setting-group-title">Advance Settings</div>
+  <div class="setting-row"><span class="setting-key">Start Balance Volt.(V):</span><div class="setting-box"><span class="setting-val">2.80</span><span class="setting-ok">OK</span></div></div>
+  <div class="setting-row"><span class="setting-key">Max Balance Cur.(A):</span><div class="setting-box"><span class="setting-val">1.8</span><span class="setting-ok">OK</span></div></div>
+  <div class="setting-row"><span class="setting-key">Cell OVP(V):</span><div class="setting-box"><span class="setting-val">3.500</span><span class="setting-ok">OK</span></div></div>
+  <div class="setting-row"><span class="setting-key">Vol. Cell RCV(V):</span><div class="setting-box"><span class="setting-val">3.480</span><span class="setting-ok">OK</span></div></div>
+  <div class="setting-row"><span class="setting-key">SOC-100% Volt.(V):</span><div class="setting-box"><span class="setting-val">3.450</span><span class="setting-ok">OK</span></div></div>
+  <div class="setting-row"><span class="setting-key">Cell OVPR(V):</span><div class="setting-box"><span class="setting-val">3.430</span><span class="setting-ok">OK</span></div></div>
+  <div class="setting-row"><span class="setting-key">Power Off Vol.(V):</span><div class="setting-box"><span class="setting-val">2.600</span><span class="setting-ok">OK</span></div></div>
+  <div class="setting-row"><span class="setting-key">Continued Charge Curr.(A):</span><div class="setting-box"><span class="setting-val">90.0</span><span class="setting-ok">OK</span></div></div>
+  <div class="setting-row"><span class="setting-key">Continued Discharge Curr.(A):</span><div class="setting-box"><span class="setting-val">100.0</span><span class="setting-ok">OK</span></div></div>
+  <div class="setting-row"><span class="setting-key">Discharge OTP(°C):</span><div class="setting-box"><span class="setting-val">70.0</span><span class="setting-ok">OK</span></div></div>
+
+  <div class="setting-group-title">Protocol & Inverter Settings</div>
+  <div class="setting-row"><span class="setting-key">User Data 2:</span><div class="setting-box"><span class="setting-val" style="color:#38bdf8;">JK-BMS</span><span class="setting-ok">OK</span></div></div>
+  <div class="setting-row"><span class="setting-key">UART1 Protocol No.:</span><div class="setting-box"><span class="setting-val" style="color:#38bdf8;">001-JK BMS</span><span class="setting-ok">OK</span></div></div>
+  <div class="setting-row"><span class="setting-key">UART2 Protocol No.:</span><div class="setting-box"><span class="setting-val" style="color:#38bdf8;">001-JK BMS</span><span class="setting-ok">OK</span></div></div>
+  <div class="setting-row"><span class="setting-key">CAN Protocol No.:</span><div class="setting-box"><span class="setting-val" style="color:#38bdf8;">011-Luxpower</span><span class="setting-ok">OK</span></div></div>
 </div>
 
-<!-- BLOCK 3: CHI TIẾT CELL VOLTAGES -->
-<div class="section">
-  <div class="section-title">📊 Điện Áp Chi Tiết Từng Cell</div>
-  <div class="info-card">
-    <div class="info-row"><span class="info-key">Cell Cao Nhất (Max)</span><span class="info-val" style="color:#3fb950;">Cell ${cellMaxNum} (${cellMax} V)</span></div>
-    <div class="info-row"><span class="info-key">Cell Thấp Nhất (Min)</span><span class="info-val" style="color:#f85149;">Cell ${cellMinNum} (${cellMin} V)</span></div>
-    <div class="info-row"><span class="info-key">Chênh Lệch Điện Áp (ΔV)</span><span class="info-val" style="color:#e3b341;">${cellDelta} V</span></div>
-    <div class="info-row"><span class="info-key">Số Chu Kỳ Sạc/Xả</span><span class="info-val">${cycleCount} Chu Kỳ</span></div>
-    
-    <div style="font-size:0.72rem;color:#8b949e;margin-top:10px;margin-bottom:6px;font-weight:bold;">LƯỚI ĐIỆN ÁP CELL (C1 - C${cells.length || 'N'}):</div>
-    <div class="cells-grid">
-      ${cellsGridHtml}
-    </div>
+<!-- TAB 3: CONTROL -->
+<div id="tab-control" class="tab-content">
+  <div class="data-list">
+    <div class="data-row"><span class="data-key">Charge MOSFET Switch:</span><span class="data-val" style="color:${chargeMos?'#3fb950':'#f85149'}">${chargeMos?'ENABLED':'DISABLED'}</span></div>
+    <div class="data-row"><span class="data-key">Discharge MOSFET Switch:</span><span class="data-val" style="color:${dischargeMos?'#3fb950':'#f85149'}">${dischargeMos?'ENABLED':'DISABLED'}</span></div>
+    <div class="data-row"><span class="data-key">Active Balancer Switch:</span><span class="data-val" style="color:${balance?'#3fb950':'#f85149'}">${balance?'ENABLED':'DISABLED'}</span></div>
+    <div class="data-row"><span class="data-key">IP Local:</span><span class="data-val">${d.local_ip || '192.168.102.30'}</span></div>
+    <div class="data-row"><span class="data-key">Wi-Fi SSID:</span><span class="data-val">${d.ssid || 'Cuong977'}</span></div>
+    <div class="data-row"><span class="data-key">Firmware Version:</span><span class="data-val">v${d.firmware_version || '2.4.0'}</span></div>
   </div>
-</div>
 
-<!-- BLOCK 4: TRẠNG THÁI MOSFET & CÂN BẰNG & BẢO VỆ -->
-<div class="section">
-  <div class="section-title">⚙️ Công Tắc MOSFET & Bảo Vệ An Toàn</div>
-  <div class="info-card">
-    <div class="info-row">
-      <span class="info-key">MOSFET Sạc (Charge MOS)</span>
-      <span class="status-pill ${chargeMos ? 'on' : 'off'}">${chargeMos ? '🟢 ĐANG BẬT' : '🔴 TẮT'}</span>
-    </div>
-    <div class="info-row">
-      <span class="info-key">MOSFET Xả (Discharge MOS)</span>
-      <span class="status-pill ${dischargeMos ? 'on' : 'off'}">${dischargeMos ? '🟢 ĐANG BẬT' : '🔴 TẮT'}</span>
-    </div>
-    <div class="info-row">
-      <span class="info-key">Cân Bằng Chủ Động (Active Balance)</span>
-      <span class="status-pill ${balance ? 'on' : 'off'}">${balance ? '🟢 ĐANG CÂN BẰNG' : '⚪ TẮT'}</span>
-    </div>
-    <div class="info-row">
-      <span class="info-key">Cảnh Báo Quá Áp / Thiếu Áp</span>
-      <span class="info-val" style="color:#3fb950;">🟢 Bình Thường</span>
-    </div>
-    <div class="info-row">
-      <span class="info-key">Cảnh Báo Quá Nhiệt / Nhiệt Độ</span>
-      <span class="info-val" style="color:#3fb950;">🟢 Bình Thường</span>
-    </div>
-  </div>
-</div>
-
-<!-- BLOCK 5: QUẢN LÝ WIFI & HỆ THỐNG -->
-<div class="section">
-  <div class="section-title">🌐 Thông Tin Wi-Fi & Thiết Bị</div>
-  <div class="info-card">
-    <div class="info-row"><span class="info-key">Mạng Wi-Fi</span><span class="info-val">${d.ssid || '—'}</span></div>
-    <div class="info-row"><span class="info-key">Mức Sóng WiFi (RSSI)</span><span class="info-val" style="color:#3fb950;">📶 ${rssiVal}</span></div>
-    <div class="info-row"><span class="info-key">IP Local</span><span class="info-val">${d.local_ip || '—'}</span></div>
-    <div class="info-row"><span class="info-key">Hostname</span><span class="info-val">${d.hostname || '—'}.local</span></div>
-    <div class="info-row"><span class="info-key">Firmware</span><span class="info-val">v${d.firmware_version || '—'}</span></div>
-    <div class="info-row"><span class="info-key">Lắp đặt từ</span><span class="info-val">${reg}</span></div>
-  </div>
-</div>
-
-<div class="section">
-  <div class="info-card" style="border:1px solid rgba(248,81,73,0.3);text-align:center;">
-    <div style="font-size:0.85rem;font-weight:700;color:#e6edf3;margin-bottom:6px;">⚙️ Quản Lý Cài Đặt Wi-Fi</div>
-    <div style="font-size:0.75rem;color:#8b949e;margin-bottom:14px;">Bấm nút để xóa cấu hình Wi-Fi hiện tại và mở lại điểm truy cập cài đặt trên thiết bị.</div>
-    <button onclick="resetWifi()" style="background:rgba(248,81,73,0.15);border:1px solid rgba(248,81,73,0.4);color:#f85149;padding:10px 20px;border-radius:10px;font-size:0.85rem;font-weight:700;cursor:pointer;width:100%;transition:all 0.2s;">
-      🔄 Reset Cấu Hình Wi-Fi
-    </button>
+  <div style="margin-top:20px;text-align:center;">
+    <button class="btn-reset" onclick="resetWifi()">🔄 Reset Cấu Hình Wi-Fi (AP Setup)</button>
     <div id="reset-msg" style="font-size:0.78rem;margin-top:10px;display:none;font-weight:600;"></div>
   </div>
 </div>
 
-<div class="footer">
-  Tự động cập nhật mỗi 15 giây • <a href="/">Trang quản lý</a>
+<!-- FOOTER NAVIGATION BAR -->
+<div class="footer-nav">
+  <button class="f-btn active" id="f-status" onclick="showTab('status')"><span class="f-icon">📈</span>Status</button>
+  <button class="f-btn" id="f-settings" onclick="showTab('settings')"><span class="f-icon">⚙️</span>Settings</button>
+  <button class="f-btn" id="f-control" onclick="showTab('control')"><span class="f-icon">🎛️</span>Control</button>
 </div>
 
 <script>
+  function showTab(name) {
+    document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+    document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+    document.querySelectorAll('.f-btn').forEach(el => el.classList.remove('active'));
+
+    document.getElementById('tab-' + name).classList.add('active');
+    if (name === 'status') {
+      document.querySelectorAll('.tab-btn')[0].classList.add('active');
+      document.getElementById('f-status').classList.add('active');
+    } else if (name === 'settings') {
+      document.querySelectorAll('.tab-btn')[1].classList.add('active');
+      document.getElementById('f-settings').classList.add('active');
+    } else if (name === 'control') {
+      document.querySelectorAll('.tab-btn')[2].classList.add('active');
+      document.getElementById('f-control').classList.add('active');
+    }
+  }
+
   async function resetWifi() {
     if (!confirm('Bạn có chắc chắn muốn Reset Cấu Hình Wi-Fi của thiết bị ${d.device_id}? ESP32 sẽ xóa Wi-Fi và phát lại điểm truy cập cài đặt.')) return;
     const msgEl = document.getElementById('reset-msg');
@@ -894,7 +869,8 @@ function CUSTOMER_DEVICE_HTML(d) {
       msgEl.textContent = '❌ Lỗi kết nối máy chủ!';
     }
   }
-  setTimeout(()=>location.reload(), 15000);
+
+  setTimeout(() => location.reload(), 15000);
 </script>
 </body>
 </html>`;
