@@ -81,24 +81,50 @@ app.post('/api/device-heartbeat', (req, res) => {
 
 // Command Queue Store
 const commandQueue = new Map();
+const bleScanResults = new Map();
 
 // POST /api/send-command — Queue command for device
 app.post('/api/send-command', (req, res) => {
     const { device_id, cmd } = req.body;
     if (!device_id || !cmd) return res.status(400).json({ error: 'device_id and cmd required' });
     if (!commandQueue.has(device_id)) commandQueue.set(device_id, []);
-    commandQueue.get(device_id).push(cmd);
+    const cmdArr = Array.isArray(cmd) ? cmd : [cmd];
+    for (const c of cmdArr) {
+        commandQueue.get(device_id).push(c);
+        if (c && c.cmd === 'scan_ble') {
+            bleScanResults.delete(device_id);
+        }
+    }
     console.log(`[Command] Queued command for ${device_id}:`, cmd);
     res.json({ status: 'ok', message: 'Command queued' });
 });
 
-// GET /api/device-commands — ESP32 polling endpoint
-app.get('/api/device-commands', (req, res) => {
-    const deviceId = req.query.device_id;
+// GET & POST /api/device-commands — ESP32 polling endpoint
+const handleDeviceCommands = (req, res) => {
+    const deviceId = req.query.device_id || (req.body && req.body.device_id);
     if (!deviceId) return res.json([]);
     const cmds = commandQueue.get(deviceId) || [];
     commandQueue.set(deviceId, []);
     res.json(cmds);
+};
+app.get('/api/device-commands', handleDeviceCommands);
+app.post('/api/device-commands', handleDeviceCommands);
+
+// POST /api/ble-result — ESP32 pushes BLE scan results
+app.post('/api/ble-result', (req, res) => {
+    const { device_id, devices } = req.body;
+    if (!device_id) return res.status(400).json({ error: 'device_id required' });
+    bleScanResults.set(device_id, { devices: devices || [], updatedAt: Date.now() });
+    console.log(`[BLE Scan] Received ${(devices || []).length} devices from ${device_id}`);
+    res.json({ status: 'ok', count: (devices || []).length });
+});
+
+// GET /api/scanned-ble — Web queries scan results
+app.get('/api/scanned-ble', (req, res) => {
+    const deviceId = req.query.device_id;
+    if (!deviceId) return res.status(400).json({ error: 'device_id required' });
+    const r = bleScanResults.get(deviceId) || { devices: [], updatedAt: 0 };
+    res.json(r);
 });
 
 // GET /api/devices — return all devices (for dashboard)
@@ -803,6 +829,16 @@ function CUSTOMER_DEVICE_HTML(d) {
 
 <!-- TAB 3: CONTROL -->
 <div id="tab-control" class="tab-content">
+  <!-- BLE Manager Card -->
+  <div style="background:rgba(15,23,42,0.6);border:1px solid rgba(56,189,248,0.25);border-radius:12px;padding:14px;margin-bottom:14px;">
+    <div style="font-size:0.85rem;font-weight:700;color:#38bdf8;margin-bottom:10px;">📡 Kết Nối Bluetooth BMS</div>
+    <div style="display:flex;justify-content:space-between;padding:8px 0;font-size:0.78rem;border-bottom:1px solid rgba(56,189,248,0.1);"><span style="color:#94a3b8;">BMS đang kết nối:</span><span id="bms-connected-status" style="font-weight:700;color:${bleConnected?'#3fb950':'#f85149'};">${bleConnected ? (d.active_bms_name||'JK-BMS') : 'Chưa kết nối BMS'}</span></div>
+    <div style="display:flex;justify-content:space-between;padding:8px 0;font-size:0.78rem;border-bottom:1px solid rgba(56,189,248,0.1);"><span style="color:#94a3b8;">Địa chỉ MAC:</span><span id="bms-mac-status" style="font-family:monospace;font-size:0.72rem;">${d.active_bms_mac||'—'}</span></div>
+    <button onclick="scanBle()" id="btn-server-scan" style="background:linear-gradient(135deg,#38bdf8,#0284c7);color:#070d14;border:none;padding:11px 18px;border-radius:10px;font-size:0.82rem;font-weight:800;cursor:pointer;width:100%;margin-top:10px;box-shadow:0 4px 14px rgba(56,189,248,0.3);">🔍 Quét Bluetooth BMS Xung Quanh</button>
+    <div id="scan-status" style="font-size:0.74rem;padding:8px 10px;border-radius:6px;margin-top:8px;display:none;font-weight:600;"></div>
+    <div id="ble-devices-list" style="margin-top:10px;display:none;"><div id="ble-devices-grid"></div></div>
+  </div>
+
   <div class="data-list">
     <div class="data-row"><span class="data-key">Charge MOSFET Switch:</span><span class="data-val" style="color:${chargeMos?'#3fb950':'#f85149'}">${chargeMos?'ENABLED':'DISABLED'}</span></div>
     <div class="data-row"><span class="data-key">Discharge MOSFET Switch:</span><span class="data-val" style="color:${dischargeMos?'#3fb950':'#f85149'}">${dischargeMos?'ENABLED':'DISABLED'}</span></div>
@@ -868,6 +904,77 @@ function CUSTOMER_DEVICE_HTML(d) {
       msgEl.style.color = '#f85149';
       msgEl.textContent = '❌ Lỗi kết nối máy chủ!';
     }
+  }
+
+  function updateScanStatus(msg, color, devices) {
+    const el = document.getElementById('scan-status');
+    if (el) { el.style.display='block'; el.style.color=color||'#e3b341'; el.textContent=msg; }
+    if (devices && devices.length > 0) {
+      const listEl = document.getElementById('ble-devices-list');
+      const gridEl = document.getElementById('ble-devices-grid');
+      if (listEl && gridEl) {
+        listEl.style.display = 'block';
+        gridEl.innerHTML = devices.map(dev => {
+          const mac = dev.mac||dev.address||'—';
+          const name = dev.name||'JK-BMS';
+          const rssi = dev.rssi ? dev.rssi + ' dBm' : '';
+          return '<div style="background:rgba(15,23,42,0.7);border:1px solid rgba(56,189,248,0.2);border-radius:8px;padding:9px 12px;display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;"><div><div style="font-size:0.82rem;font-weight:800;color:#00ffaa;">📟 '+name+'</div><div style="font-size:0.7rem;color:#94a3b8;font-family:monospace;margin-top:2px;">MAC: '+mac+' • 📶 '+rssi+'</div></div><button onclick="connectBms(\''+mac+'\',\''+name+'\')" style="background:rgba(16,185,129,.2);border:1px solid #10b981;color:#10b981;padding:6px 14px;border-radius:6px;font-size:0.75rem;font-weight:700;cursor:pointer;">⚡ Kết Nối</button></div>';
+        }).join('');
+      }
+    }
+  }
+
+  async function scanBle() {
+    updateScanStatus('⏳ Đang gửi lệnh quét Bluetooth tới ESP32...', '#38bdf8');
+    const listEl = document.getElementById('ble-devices-list');
+    if (listEl) listEl.style.display = 'none';
+    try {
+      await fetch('/api/send-command', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({device_id:'${d.device_id}', cmd:{cmd:'scan_ble'}})
+      });
+      let attempts = 0;
+      const timer = setInterval(async () => {
+        attempts++;
+        updateScanStatus('⏳ ESP32 đang bật Bluetooth & quét xung quanh... (' + (attempts*2) + 's / max 30s)', '#e3b341');
+        try {
+          const res = await fetch('/api/scanned-ble?device_id=${d.device_id}');
+          const data = await res.json();
+          if (data.devices && data.devices.length > 0) {
+            clearInterval(timer);
+            updateScanStatus('✅ Đã tìm thấy '+data.devices.length+' thiết bị Bluetooth JK-BMS!', '#3fb950', data.devices);
+          } else if (attempts >= 15) {
+            clearInterval(timer);
+            updateScanStatus('❌ Không tìm thấy JK-BMS nào ở gần hoặc BMS chưa bật nguồn.', '#f85149');
+          }
+        } catch(e){}
+      }, 2000);
+    } catch(e) { updateScanStatus('❌ Lỗi kết nối máy chủ!', '#f85149'); }
+  }
+
+  async function connectBms(mac, name) {
+    if (!confirm('Kết nối ESP32 tới BMS '+name+' ('+mac+')?')) return;
+    const el = document.getElementById('scan-status');
+    if (el) { el.style.display='block'; el.style.color='#e3b341'; el.textContent='⏳ Đang gửi lệnh kết nối tới ESP32...'; }
+    try {
+      await fetch('/api/send-command', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({
+          device_id:'${d.device_id}',
+          cmd:[
+            {cmd:'connect_bms', mac:mac, name:name, pin:'1234'},
+            {cmd:'send_heartbeat_now'}
+          ]
+        })
+      });
+      if (el) { el.style.color='#3fb950'; el.textContent='✅ Đã gửi lệnh! ESP32 đang kết nối và đọc dữ liệu...'; }
+      setTimeout(() => {
+        showTab('status');
+        location.reload();
+      }, 3000);
+    } catch(e) { if (el) { el.style.color='#f85149'; el.textContent='❌ Lỗi gửi lệnh!'; } }
   }
 
   setTimeout(() => location.reload(), 15000);

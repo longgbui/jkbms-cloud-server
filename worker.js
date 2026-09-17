@@ -12,7 +12,7 @@ const KV_DEVICE_THROTTLE_MS  = 24 * 60 * 60 * 1000; // Write device snapshot to 
 const KV_HISTORY_THROTTLE_MS = 24 * 60 * 60 * 1000; // Write history to KV once per 24 HOURS
 const IDLE_INTERVAL_MS       = 30 * 60 * 1000; // ESP uploads telemetry every 30 min when no user viewing
 const ACTIVE_INTERVAL_MS     = 3 * 1000;        // ESP uploads telemetry & pings every 3s when user is viewing
-const SESSION_TIMEOUT_MS     = 60 * 1000;       // User session active for 60s after last API call
+const SESSION_TIMEOUT_MS     = 10 * 1000;       // User session active for 10s after last API call
 // ──────────────────────────────────────────────────────────────────────────────
 
 const MEMORY_DEVICE_INDEX    = new Set();
@@ -259,6 +259,15 @@ export default {
       }
 
       return new Response('{"devices":[],"updatedAt":0}', { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+    }
+
+    // ── POST /api/session-end (Tab Closed / Navigated Away) ──
+    if (path === '/api/session-end') {
+      const devId = url.searchParams.get('device_id');
+      if (devId) {
+        MEMORY_ACTIVE_SESSIONS.delete(devId);
+      }
+      return jsonResponse({ status: 'ok' }, 200, corsHeaders);
     }
 
     // ── POST /api/telemetry & /api/device-heartbeat (RAM First + Throttled KV Writes) ──
@@ -554,8 +563,15 @@ export default {
       }
     }
 
-    // ── GET /admin (Admin Management Dashboard for All Devices) ──
+    // ── GET /admin (Admin Management Dashboard for All Devices - Protected) ──
     if (method === 'GET' && (path === '/admin' || path === '/admin/' || path === '/dashboard')) {
+      const key = url.searchParams.get('key');
+      if (key !== 'namka_admin') {
+        return new Response('403 Forbidden: Khách hàng không có quyền truy cập trang Quản Trị Admin.', {
+          status: 403,
+          headers: { 'Content-Type': 'text/plain; charset=utf-8', ...corsHeaders }
+        });
+      }
       return new Response(DASHBOARD_HTML, {
         headers: { 'Content-Type': 'text/html; charset=utf-8', ...corsHeaders }
       });
@@ -900,7 +916,7 @@ function CUSTOMER_DEVICE_HTML(d) {
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <script>
   function showTab(name) {
-    const tabNames = ['home', 'status', 'control'];
+    const tabNames = ['home', 'status', 'settings'];
     for (var i = 0; i < tabNames.length; i++) {
       var t = tabNames[i];
       var el = document.getElementById('tab-' + t);
@@ -1111,11 +1127,27 @@ function CUSTOMER_DEVICE_HTML(d) {
   </div>
 
   <!-- STATUS BANNER -->
-  <div class="status-banner${bmsConnected?'':' offline'}">
-    ${bmsConnected
-      ? '<span>🛡️</span><span>The battery is functioning properly</span>'
-      : '<span>📡</span><span>BMS chưa kết nối Bluetooth</span>'}
-    <span style="margin-left:auto;font-size:0.65rem;color:${statusColor};">${statusText}</span>
+  <div class="status-banner${bmsConnected?'':' offline'}" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+    <div style="display:flex;align-items:center;gap:6px;">
+      <span>${bmsConnected ? '🛡️' : '📡'}</span>
+      <span id="banner-txt">${bmsConnected ? 'Khối pin đang hoạt động bình thường' : 'BMS chưa kết nối Bluetooth'}</span>
+      <span style="font-size:0.65rem;color:${statusColor};margin-left:4px;">(${statusText})</span>
+    </div>
+  </div>
+
+  <!-- BLE BLUETOOTH SCAN CARD (PROMINENT ON HOME SCREEN) -->
+  <div class="ctrl-card" style="margin-top:10px;margin-bottom:12px;border:1px solid rgba(56,189,248,0.3);background:rgba(15,23,42,0.75);">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+      <span style="font-size:0.82rem;font-weight:800;color:#38bdf8;">📡 KẾT NỐI BLUETOOTH BMS</span>
+      <span style="font-size:0.75rem;font-weight:700;color:${bmsConnected?'#3fb950':'#f85149'};" id="bms-connected-badge">${bmsConnected ? '● ĐÃ KẾT NỐI' : '● CHƯA KẾT NỐI'}</span>
+    </div>
+    <div style="font-size:0.75rem;color:#94a3b8;margin-bottom:10px;display:flex;justify-content:space-between;">
+      <span>BMS: <strong style="color:#fff;" id="bms-connected-name">${d.active_bms_name || 'JK-BMS'}</strong></span>
+      <span style="font-family:monospace;font-size:0.7rem;color:#64748b;" id="bms-connected-mac">${d.active_bms_mac ? `(${d.active_bms_mac})` : '—'}</span>
+    </div>
+    <button class="btn-scan" onclick="scanBle()" id="btn-scan-main" style="width:100%;padding:10px;font-size:0.82rem;font-weight:800;border-radius:8px;background:linear-gradient(135deg,#38bdf8,#0284c7);color:#070d14;border:none;cursor:pointer;box-shadow:0 4px 12px rgba(56,189,248,0.25);">🔍 Quét & Tìm Kiếm BMS Xung Quanh</button>
+    <div class="scan-info" id="scan-status" style="font-size:0.74rem;padding:8px 10px;border-radius:6px;margin-top:8px;display:none;font-weight:600;"></div>
+    <div class="ble-list" id="ble-devices-list" style="margin-top:10px;display:none;"><div id="ble-devices-grid"></div></div>
   </div>
 
   <!-- 4-COL GRID ROW 1: Cell data -->
@@ -1223,16 +1255,14 @@ function CUSTOMER_DEVICE_HTML(d) {
   </div>
 </div>
 
-<!-- TAB CONTROL -->
-<div id="tab-control" class="tab-content">
+<!-- TAB SETTINGS -->
+<div id="tab-settings" class="tab-content">
   <!-- BLE Manager -->
   <div class="ctrl-card" style="border-color:rgba(56,189,248,.3);">
-    <div class="ctrl-title">📡 Kết Nối Bluetooth BMS</div>
+    <div class="ctrl-title">📡 Quản Lý Bluetooth BMS</div>
     <div class="ctrl-row"><span class="ctrl-key">BMS đang kết nối:</span><span class="ctrl-val" id="bms-connected-status" style="color:${bmsConnected?'#3fb950':'#f85149'};">${bmsConnected ? (d.active_bms_name||'JK-BMS') : 'Chưa kết nối BMS'}</span></div>
     <div class="ctrl-row"><span class="ctrl-key">Địa chỉ MAC:</span><span class="ctrl-val" id="bms-mac-status" style="font-size:0.68rem;">${d.active_bms_mac||'—'}</span></div>
     <button class="btn-scan" onclick="scanBle()">🔍 Quét Bluetooth BMS Xung Quanh</button>
-    <div class="scan-info" id="scan-status"></div>
-    <div class="ble-list" id="ble-devices-list"><div id="ble-devices-grid"></div></div>
   </div>
 
   <!-- MOS Control -->
@@ -1248,6 +1278,7 @@ function CUSTOMER_DEVICE_HTML(d) {
     <div class="ctrl-title">📟 Thông Tin Thiết Bị</div>
     <div class="ctrl-row"><span class="ctrl-key">Device ID:</span><span class="ctrl-val blue">${d.device_id}</span></div>
     <div class="ctrl-row"><span class="ctrl-key">IP Local:</span><span class="ctrl-val">${d.local_ip||'—'}</span></div>
+    <div class="ctrl-row"><span class="ctrl-key">Wi-Fi SSID:</span><span class="ctrl-val">${d.ssid||'—'}</span></div>
     <div class="ctrl-row"><span class="ctrl-key">Hostname:</span><span class="ctrl-val">${d.hostname||'—'}</span></div>
     <div class="ctrl-row"><span class="ctrl-key">Firmware:</span><span class="ctrl-val blue">v${d.firmware_version||'—'}</span></div>
     <div class="ctrl-row"><span class="ctrl-key">Wi-Fi RSSI:</span><span class="ctrl-val">${rssiVal}</span></div>
@@ -1260,7 +1291,7 @@ function CUSTOMER_DEVICE_HTML(d) {
 <div class="footer-nav">
   <div class="f-btn active" role="button" id="f-home" onclick="showTab('home')"><span class="f-icon">🏠</span>Home</div>
   <div class="f-btn" role="button" id="f-status" onclick="showTab('status')"><span class="f-icon">📊</span>Status</div>
-  <div class="f-btn" role="button" id="f-control" onclick="showTab('control')"><span class="f-icon">🎛️</span>Control</div>
+  <div class="f-btn" role="button" id="f-settings" onclick="showTab('settings')"><span class="f-icon">⚙️</span>Settings</div>
 </div>
 
 <script>
@@ -1338,11 +1369,24 @@ function CUSTOMER_DEVICE_HTML(d) {
     if (!confirm('Kết nối ESP32 tới BMS '+name+' ('+mac+')?')) return;
     triggerTxFlash();
     const el = document.getElementById('scan-status');
-    if (el) { el.style.display='block'; el.style.color='#e3b341'; el.textContent='⏳ Đang gửi lệnh kết nối...'; }
+    if (el) { el.style.display='block'; el.style.color='#e3b341'; el.textContent='⏳ Đang gửi lệnh kết nối tới ESP32...'; }
     try {
-      await fetch('/api/send-command', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({device_id:'${d.device_id}', cmd:{cmd:'connect_bms', mac:mac, name:name, pin:'1234'}}) });
-      if (el) { el.style.color='#3fb950'; el.textContent='✅ Đã gửi lệnh! ESP32 đang kết nối...'; }
-      setTimeout(() => location.reload(), 4000);
+      await fetch('/api/send-command', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({
+          device_id:'${d.device_id}',
+          cmd:[
+            {cmd:'connect_bms', mac:mac, name:name, pin:'1234'},
+            {cmd:'send_heartbeat_now'}
+          ]
+        })
+      });
+      if (el) { el.style.color='#3fb950'; el.textContent='✅ Đã gửi lệnh! ESP32 đang kết nối và đọc dữ liệu BMS...'; }
+      setTimeout(() => {
+        showTab('home');
+        refreshLiveData();
+      }, 2500);
     } catch(e) { if (el) { el.style.color='#f85149'; el.textContent='❌ Lỗi gửi lệnh!'; } }
   }
 
@@ -1481,6 +1525,16 @@ function CUSTOMER_DEVICE_HTML(d) {
       if (macEl) macEl.textContent = dev.active_bms_mac || '—';
       const topBmsEl = document.getElementById('top-bms-name');
       if (topBmsEl && dev.active_bms_name) topBmsEl.textContent = dev.active_bms_name;
+
+      const badgeEl = document.getElementById('bms-connected-badge');
+      if (badgeEl) {
+        badgeEl.textContent = bc ? '● ĐÃ KẾT NỐI' : '● CHƯA KẾT NỐI';
+        badgeEl.style.color = bc ? '#3fb950' : '#f85149';
+      }
+      const bmsNameEl = document.getElementById('bms-connected-name');
+      if (bmsNameEl) bmsNameEl.textContent = bc ? (dev.active_bms_name || 'JK-BMS') : '—';
+      const bmsMacEl = document.getElementById('bms-connected-mac');
+      if (bmsMacEl) bmsMacEl.textContent = dev.active_bms_mac ? `(${dev.active_bms_mac})` : '—';
     } catch(e){}
   }
 
@@ -1589,6 +1643,17 @@ function CUSTOMER_DEVICE_HTML(d) {
 
   setInterval(refreshLiveData, 1500);
   refreshLiveData();
+
+  window.addEventListener('pagehide', function() {
+    if (navigator.sendBeacon) {
+      navigator.sendBeacon('/api/session-end?device_id=' + encodeURIComponent('${d.device_id}'));
+    }
+  });
+  window.addEventListener('beforeunload', function() {
+    if (navigator.sendBeacon) {
+      navigator.sendBeacon('/api/session-end?device_id=' + encodeURIComponent('${d.device_id}'));
+    }
+  });
 </script>
 </div>
 </body>
