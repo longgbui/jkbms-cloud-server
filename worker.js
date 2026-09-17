@@ -563,15 +563,8 @@ export default {
       }
     }
 
-    // ── GET /admin (Admin Management Dashboard for All Devices - Protected) ──
+    // ── GET /admin (Admin Management Dashboard for All Devices) ──
     if (method === 'GET' && (path === '/admin' || path === '/admin/' || path === '/dashboard')) {
-      const key = url.searchParams.get('key');
-      if (key !== 'namka_admin') {
-        return new Response('403 Forbidden: Khách hàng không có quyền truy cập trang Quản Trị Admin.', {
-          status: 403,
-          headers: { 'Content-Type': 'text/plain; charset=utf-8', ...corsHeaders }
-        });
-      }
       return new Response(DASHBOARD_HTML, {
         headers: { 'Content-Type': 'text/html; charset=utf-8', ...corsHeaders }
       });
@@ -675,13 +668,13 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   </div>
 
   <!-- QUICK LINK GENERATOR & PERMANENT DEVICE SAVER -->
-  <div style="background:var(--surface);border:1px solid rgba(88,166,255,0.3);border-radius:12px;padding:16px;margin-bottom:24px;">
+  <div style="background:var(--surface);border:1px solid rgba(88,166,255,0.3);border-radius:12px;padding:16px;margin-bottom:18px;">
     <div style="font-weight:700;font-size:0.9rem;color:var(--accent);margin-bottom:10px;display:flex;align-items:center;gap:6px;">
       <span>💾 Quản Lý & Lưu Vĩnh Viễn Danh Sách Thiết Bị</span>
       <span style="font-size:0.75rem;color:var(--subtext);font-weight:400;">(Nhập Device ID để lưu vĩnh viễn vào Cloud)</span>
     </div>
     <div style="display:flex;gap:10px;flex-wrap:wrap;">
-      <input type="text" id="quick-dev-id" placeholder="Nhập ID bo mạch (Ví dụ: JKBMS-F89C)" value="JKBMS-F89C" style="flex:1;min-width:200px;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:9px 14px;border-radius:8px;font-family:monospace;font-size:0.88rem;outline:none;">
+      <input type="text" id="quick-dev-id" placeholder="Nhập ID bo mạch (Ví dụ: JKBMS-F89C)" value="JKBMS-18DE" style="flex:1;min-width:200px;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:9px 14px;border-radius:8px;font-family:monospace;font-size:0.88rem;outline:none;">
       <button onclick="registerDevice()" style="background:rgba(63,185,80,0.2);border:1px solid #3fb950;color:#3fb950;padding:9px 16px;border-radius:8px;font-size:0.8rem;font-weight:700;cursor:pointer;">💾 Lưu Vĩnh Viễn</button>
       <button onclick="openQuickLink()" style="background:var(--accent);color:#0d1117;border:none;padding:9px 16px;border-radius:8px;font-size:0.8rem;font-weight:700;cursor:pointer;">🔗 Mở Giao Diện</button>
       <button onclick="copyQuickLink()" style="background:var(--primary-dim);border:1px solid var(--primary);color:var(--primary);padding:9px 16px;border-radius:8px;font-size:0.8rem;font-weight:700;cursor:pointer;">📋 Copy Link</button>
@@ -689,11 +682,170 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     <div id="quick-msg" style="font-size:0.78rem;color:var(--primary);margin-top:8px;display:none;font-weight:600;"></div>
   </div>
 
+  <!-- OTA FIRMWARE MANAGEMENT PANEL -->
+  <div style="background:var(--surface);border:1px solid rgba(63,185,80,0.3);border-radius:12px;padding:16px;margin-bottom:24px;">
+    <div style="font-weight:700;font-size:0.95rem;color:var(--primary);margin-bottom:12px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+      <div style="display:flex;align-items:center;gap:6px;">
+        <span>🚀 Nạp & Cập Nhật Firmware Từ Xa (Remote Cloud OTA)</span>
+      </div>
+      <div id="ota-fw-badge" style="font-size:0.75rem;color:var(--subtext);font-family:monospace;background:var(--surface2);padding:4px 10px;border-radius:6px;border:1px solid var(--border);">
+        Đang kiểm tra Cloud Firmware...
+      </div>
+    </div>
+    
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;align-items:center;">
+      <div style="display:flex;gap:8px;">
+        <input type="file" id="ota-file-input" accept=".bin" style="display:none;" onchange="handleFileSelected(this)">
+        <button onclick="document.getElementById('ota-file-input').click()" style="flex:1;background:var(--surface2);border:1px dashed #3fb950;color:var(--text);padding:10px 14px;border-radius:8px;font-size:0.8rem;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;">
+          📁 <span id="ota-file-name">Chọn file firmware (.bin)</span>
+        </button>
+        <button onclick="uploadFirmware()" id="btn-upload-fw" style="background:#238636;color:#fff;border:none;padding:10px 18px;border-radius:8px;font-size:0.8rem;font-weight:700;cursor:pointer;white-space:nowrap;">
+          ⬆️ Upload Lên Cloud
+        </button>
+      </div>
+
+      <div style="display:flex;gap:8px;">
+        <select id="ota-target-select" style="flex:1;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:10px 12px;border-radius:8px;font-size:0.82rem;font-family:monospace;outline:none;">
+          <option value="all">⚡ Tất cả thiết bị (Broadcast All)</option>
+        </select>
+        <button onclick="triggerOtaUpdate()" id="btn-trigger-ota" style="background:linear-gradient(135deg,#38bdf8,#0284c7);color:#070d14;border:none;padding:10px 18px;border-radius:8px;font-size:0.8rem;font-weight:800;cursor:pointer;white-space:nowrap;box-shadow:0 2px 8px rgba(56,189,248,0.3);">
+          ⚡ Phát Lệnh Nạp OTA
+        </button>
+      </div>
+    </div>
+    <div id="ota-status-msg" style="font-size:0.8rem;margin-top:10px;padding:8px 12px;border-radius:6px;display:none;font-weight:600;"></div>
+  </div>
+
   <div class="device-grid" id="device-grid"><div class="no-devices"><div class="icon">⏳</div><h3>Đang tải danh sách...</h3></div></div>
 </div>
 <script>
   function timeSince(s){if(s===null||s===undefined)return'Chưa rõ';if(s<4)return'vừa xong (Ping ⚡)';if(s<60)return s+'s trước';if(s<3600)return Math.floor(s/60)+' phút trước';return Math.floor(s/3600)+' giờ trước';}
   
+  let selectedFwFile = null;
+  function handleFileSelected(input) {
+    if (input.files && input.files[0]) {
+      selectedFwFile = input.files[0];
+      document.getElementById('ota-file-name').textContent = selectedFwFile.name + ' (' + (selectedFwFile.size / 1024).toFixed(0) + ' KB)';
+    }
+  }
+
+  async function fetchFirmwareInfo() {
+    try {
+      const res = await fetch('/api/firmware-info');
+      const data = await res.json();
+      const badge = document.getElementById('ota-fw-badge');
+      if (data && data.version && data.version !== 'none') {
+        badge.innerHTML = '📦 Cloud FW: <b>' + data.version + '</b> (' + (data.size / 1024).toFixed(0) + ' KB)';
+        badge.style.color = '#3fb950';
+      } else {
+        badge.textContent = '📦 Chưa có Firmware trên Cloud';
+        badge.style.color = '#8b949e';
+      }
+    } catch(e) {}
+  }
+
+  async function uploadFirmware() {
+    if (!selectedFwFile) return alert('Vui lòng bấm chọn file .bin trước!');
+    const msg = document.getElementById('ota-status-msg');
+    const btn = document.getElementById('btn-upload-fw');
+    btn.disabled = true;
+    btn.textContent = '⏳ Đang upload...';
+    msg.style.display = 'block';
+    msg.style.background = 'rgba(227,179,65,0.15)';
+    msg.style.color = '#e3b341';
+    msg.textContent = '⏳ Đang tải firmware lên Cloud Server...';
+    try {
+      const res = await fetch('/api/upload-firmware', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream', 'X-Firmware-Version': 'v' + Date.now() },
+        body: selectedFwFile
+      });
+      const data = await res.json();
+      if (data.status === 'ok') {
+        msg.style.background = 'rgba(63,185,80,0.15)';
+        msg.style.color = '#3fb950';
+        msg.textContent = '✅ Đã tải lên Cloud thành công! Version: ' + data.version + ' (' + (data.size/1024).toFixed(0) + ' KB)';
+        fetchFirmwareInfo();
+      } else {
+        throw new Error(data.error || 'Lỗi');
+      }
+    } catch(e) {
+      msg.style.background = 'rgba(248,81,73,0.15)';
+      msg.style.color = '#f85149';
+      msg.textContent = '❌ Lỗi upload: ' + e.message;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '⬆️ Upload Lên Cloud';
+    }
+  }
+
+  async function triggerOtaUpdate() {
+    const target = document.getElementById('ota-target-select').value;
+    const msg = document.getElementById('ota-status-msg');
+    if (!confirm('Gửi lệnh nạp OTA khẩn cấp tới: ' + (target === 'all' ? 'TẤT CẢ THIẾT BỊ' : target) + '?')) return;
+    msg.style.display = 'block';
+    msg.style.background = 'rgba(56,189,248,0.15)';
+    msg.style.color = '#38bdf8';
+    msg.textContent = '⏳ Đang phát lệnh OTA Update...';
+    try {
+      const res = await fetch('/api/send-command', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          device_id: target,
+          cmd: {
+            cmd: 'ota_update',
+            url: window.location.origin + '/firmware/latest.bin',
+            version: 'v' + Date.now()
+          }
+        })
+      });
+      const data = await res.json();
+      if (data.status === 'ok') {
+        msg.style.background = 'rgba(63,185,80,0.15)';
+        msg.style.color = '#3fb950';
+        msg.textContent = '✅ ĐÃ PHÁT LỆNH OTA THÀNH CÔNG! Thiết bị sẽ tự nạp và khởi động lại trong 10-15s.';
+      }
+    } catch(e) {
+      msg.style.background = 'rgba(248,81,73,0.15)';
+      msg.style.color = '#f85149';
+      msg.textContent = '❌ Lỗi phát lệnh: ' + e.message;
+    }
+  }
+
+  async function triggerDeviceOta(id) {
+    if (!confirm('Nạp OTA từ xa cho thiết bị ' + id + '?')) return;
+    try {
+      await fetch('/api/send-command', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          device_id: id,
+          cmd: {
+            cmd: 'ota_update',
+            url: window.location.origin + '/firmware/latest.bin',
+            version: 'v' + Date.now()
+          }
+        })
+      });
+      alert('✅ Đã phát lệnh OTA cho ' + id + '! Thiết bị đang nạp...');
+    } catch(e) { alert('Lỗi phát lệnh!'); }
+  }
+
+  async function triggerDeviceBleScan(id) {
+    try {
+      await fetch('/api/send-command', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          device_id: id,
+          cmd: { cmd: 'scan_ble' }
+        })
+      });
+      alert('🔍 Đã phát lệnh Quét BLE cho ' + id + '! Vui lòng mở giao diện để xem kết quả quét.');
+    } catch(e) { alert('Lỗi phát lệnh quét!'); }
+  }
+
   async function registerDevice() {
     const id = document.getElementById('quick-dev-id').value.trim();
     if (!id) return alert('Vui lòng nhập Device ID!');
@@ -765,6 +917,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
   async function fetchDevices(){
     const grid = document.getElementById('device-grid');
+    const sel = document.getElementById('ota-target-select');
     try{
       const res = await fetch('/api/devices');
       if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -774,6 +927,16 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       document.getElementById('stat-offline').textContent = devices.filter(function(d){ return !d.online; }).length;
       document.getElementById('stat-total').textContent = devices.length;
       document.getElementById('refresh-label').textContent = 'Cập nhật: ' + new Date().toLocaleTimeString('vi-VN');
+
+      if (sel) {
+        const curVal = sel.value;
+        let optHtml = '<option value="all">⚡ Tất cả thiết bị (Broadcast All)</option>';
+        for(let d of devices) {
+          optHtml += '<option value="' + d.device_id + '">' + (d.online ? '🟢 ' : '🔴 ') + d.device_id + (d.ssid ? ' (' + d.ssid + ')' : '') + '</option>';
+        }
+        sel.innerHTML = optHtml;
+        sel.value = curVal;
+      }
       
       if(!devices || !devices.length){
         grid.innerHTML = '<div class="no-devices"><div class="icon">📡</div><h3>Chưa có thiết bị</h3><p>Nhập ID ở trên để lưu hoặc bật bo ESP32 kết nối Wi-Fi.</p></div>';
@@ -812,17 +975,21 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
               '<div class="info-row"><span class="info-key">Hostname</span><span class="info-val">' + hostName + '</span></div>' +
               '<div class="info-row"><span class="info-key">Firmware</span><span class="info-val">v' + fwVer + '</span></div>' +
             '</div>' +
-            '<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);display:flex;gap:6px;align-items:center;">' +
-              '<a href="/d/' + d.device_id + '" target="_blank" style="flex:1;background:var(--surface2);border:1px solid var(--accent);color:var(--accent);padding:7px 8px;border-radius:6px;font-size:0.75rem;font-weight:600;text-decoration:none;text-align:center;">' +
+            '<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);display:grid;grid-template-columns:1fr 1fr;gap:6px;">' +
+              '<a href="/d/' + d.device_id + '" target="_blank" style="background:var(--surface2);border:1px solid var(--accent);color:var(--accent);padding:7px 8px;border-radius:6px;font-size:0.75rem;font-weight:600;text-decoration:none;text-align:center;">' +
                 '🔗 Mở Link' +
               '</a>' +
+              '<button data-id="' + d.device_id + '" onclick="triggerDeviceOta(this.getAttribute(\\'data-id\\'))" style="background:rgba(56,189,248,0.15);border:1px solid #38bdf8;color:#38bdf8;padding:7px 8px;border-radius:6px;font-size:0.75rem;font-weight:700;cursor:pointer;">' +
+                '⚡ Nạp OTA' +
+              '</button>' +
+              '<button data-id="' + d.device_id + '" onclick="triggerDeviceBleScan(this.getAttribute(\\'data-id\\'))" style="background:rgba(227,179,65,0.15);border:1px solid #e3b341;color:#e3b341;padding:7px 8px;border-radius:6px;font-size:0.75rem;font-weight:700;cursor:pointer;">' +
+                '🔍 Quét BLE' +
+              '</button>' +
               '<button data-id="' + d.device_id + '" onclick="copyMonitorLink(this.getAttribute(\\'data-id\\'), this)" style="background:var(--primary-dim);border:1px solid var(--primary);color:var(--primary);padding:7px 8px;border-radius:6px;font-size:0.75rem;font-weight:600;cursor:pointer;">' +
                 '📋 Copy' +
               '</button>' +
-              '<button data-id="' + d.device_id + '" onclick="deleteDevice(this.getAttribute(\\'data-id\\'))" style="background:rgba(248,81,73,0.15);border:1px solid #f85149;color:#f85149;padding:7px 8px;border-radius:6px;font-size:0.75rem;font-weight:600;cursor:pointer;">' +
-                '🗑️ Xóa' +
-              '</button>' +
             '</div>' +
+            '<div style="margin-top:6px;text-align:right;"><button data-id="' + d.device_id + '" onclick="deleteDevice(this.getAttribute(\\'data-id\\'))" style="background:transparent;border:none;color:#f85149;font-size:0.72rem;cursor:pointer;opacity:0.7;">🗑️ Xóa</button></div>' +
             '<div class="last-seen">🕐 ' + statusText + timeSince(d.lastSeenAgo) + '</div>' +
           '</div>'
         );
@@ -835,6 +1002,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     }
   }
 
+  fetchFirmwareInfo();
   fetchDevices();
   setInterval(fetchDevices, 3000);
 </script>
@@ -1534,7 +1702,7 @@ function CUSTOMER_DEVICE_HTML(d) {
       const bmsNameEl = document.getElementById('bms-connected-name');
       if (bmsNameEl) bmsNameEl.textContent = bc ? (dev.active_bms_name || 'JK-BMS') : '—';
       const bmsMacEl = document.getElementById('bms-connected-mac');
-      if (bmsMacEl) bmsMacEl.textContent = dev.active_bms_mac ? `(${dev.active_bms_mac})` : '—';
+      if (bmsMacEl) bmsMacEl.textContent = dev.active_bms_mac ? ('(' + dev.active_bms_mac + ')') : '—';
     } catch(e){}
   }
 
