@@ -12,7 +12,7 @@ const KV_DEVICE_THROTTLE_MS  = 24 * 60 * 60 * 1000; // Write device snapshot to 
 const KV_HISTORY_THROTTLE_MS = 24 * 60 * 60 * 1000; // Write history to KV once per 24 HOURS
 const IDLE_INTERVAL_MS       = 10 * 1000;      // ESP polls every 10s when no user viewing (instant wake-up in 3-5s)
 const ACTIVE_INTERVAL_MS     = 1500;           // ESP uploads telemetry every 1.5s when user is viewing (real-time stream)
-const SESSION_TIMEOUT_MS     = 25 * 1000;      // 25 seconds user session active timeout (releases BMS quickly when user leaves)
+const SESSION_TIMEOUT_MS     = 5 * 60 * 1000;  // 5 minutes user session active timeout (stable continuous BLE streaming)
 // ──────────────────────────────────────────────────────────────────────────────
 
 const MEMORY_DEVICE_INDEX    = new Set();
@@ -632,6 +632,33 @@ export default {
           activationSsid: firstActivationSsid,
           activationFirmware: existing.activationFirmware || body.firmware_version || 'v2.4.0'
         };
+
+        // NEVER overwrite valid battery readings with 0/empty when ESP is reconnecting or in standby!
+        if ((!body.voltage || body.voltage === 0) && existing.voltage && existing.voltage > 0) {
+          updated.voltage = existing.voltage;
+          updated.soc = existing.soc;
+          updated.current = existing.current;
+          updated.power = existing.power;
+          updated.capacity_ah = existing.capacity_ah;
+          updated.remain_capacity_ah = existing.remain_capacity_ah;
+          updated.cycle_count = existing.cycle_count;
+          updated.mos_temp = existing.mos_temp;
+          updated.temp1 = existing.temp1;
+          updated.temp2 = existing.temp2;
+          updated.temp4 = existing.temp4;
+          updated.temp5 = existing.temp5;
+          if (existing.cell_voltages && existing.cell_voltages.length > 0) updated.cell_voltages = existing.cell_voltages;
+          if (existing.cells && existing.cells.length > 0) updated.cells = existing.cells;
+          if (existing.cell_resistances && existing.cell_resistances.length > 0) updated.cell_resistances = existing.cell_resistances;
+          if (existing.min_cell_voltage) updated.min_cell_voltage = existing.min_cell_voltage;
+          if (existing.max_cell_voltage) updated.max_cell_voltage = existing.max_cell_voltage;
+          if (existing.delta_cell_voltage !== undefined) updated.delta_cell_voltage = existing.delta_cell_voltage;
+          if (existing.min_cell_num) updated.min_cell_num = existing.min_cell_num;
+          if (existing.max_cell_num) updated.max_cell_num = existing.max_cell_num;
+          if (existing.cell_count) updated.cell_count = existing.cell_count;
+          if (existing.active_bms_name) updated.active_bms_name = existing.active_bms_name;
+          if (existing.active_bms_mac) updated.active_bms_mac = existing.active_bms_mac;
+        }
 
         if (body.settings && typeof body.settings === 'object') {
           updated.settings = body.settings;
@@ -1641,28 +1668,29 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 function CUSTOMER_DEVICE_HTML(d) {
   const online = d.online;
   const bmsConnected = online && (d.connected === true);
+  const hasData = (d.voltage !== undefined && d.voltage > 0);
 
-  const soc      = bmsConnected ? (d.soc !== undefined ? d.soc : 0) : 0;
-  const voltage  = bmsConnected ? (d.voltage ? d.voltage.toFixed(2) : '—') : '—';
-  const current  = bmsConnected ? (d.current !== undefined ? d.current.toFixed(2) : '0.00') : '—';
-  const power    = bmsConnected ? (d.power !== undefined ? Math.abs(d.power).toFixed(1) : '0.0') : '—';
-  const mosTemp  = bmsConnected ? (d.mos_temp !== undefined ? d.mos_temp.toFixed(1) : '—') : '—';
-  const temp1    = bmsConnected && d.temp1 && d.temp1 > 0 ? d.temp1.toFixed(1) : null;
-  const temp2    = bmsConnected && d.temp2 && d.temp2 > 0 ? d.temp2.toFixed(1) : null;
-  const capAh    = bmsConnected ? (d.capacity_ah !== undefined ? d.capacity_ah.toFixed(1) : '—') : '—';
-  const remCap   = bmsConnected ? (d.remain_capacity_ah !== undefined ? d.remain_capacity_ah.toFixed(1) : '—') : '—';
-  const balCurr  = bmsConnected ? (d.balance_current !== undefined ? d.balance_current.toFixed(3) : '0.000') : '—';
-  const cycleCap = bmsConnected ? (d.cycle_capacity_ah !== undefined ? d.cycle_capacity_ah.toFixed(1) : '—') : '—';
-  const cycles   = bmsConnected ? (d.cycle_count !== undefined ? d.cycle_count : '—') : '—';
-  const detailLogs = bmsConnected ? (d.detail_logs_count !== undefined ? d.detail_logs_count : '—') : '—';
-  const chargeMos   = bmsConnected ? d.charge_mos : false;
-  const dischargeMos= bmsConnected ? d.discharge_mos : false;
-  const balance     = bmsConnected ? d.balance_active : false;
-  const aveCellVolt = bmsConnected && d.min_cell_voltage && d.max_cell_voltage
+  const soc      = (bmsConnected || hasData) ? (d.soc !== undefined ? d.soc : 0) : 0;
+  const voltage  = (bmsConnected || hasData) ? (d.voltage ? d.voltage.toFixed(2) : '—') : '—';
+  const current  = (bmsConnected || hasData) ? (d.current !== undefined ? d.current.toFixed(2) : '0.00') : '—';
+  const power    = (bmsConnected || hasData) ? (d.power !== undefined ? Math.abs(d.power).toFixed(1) : '0.0') : '—';
+  const mosTemp  = (bmsConnected || hasData) ? (d.mos_temp !== undefined ? d.mos_temp.toFixed(1) : '—') : '—';
+  const temp1    = (bmsConnected || hasData) && d.temp1 && d.temp1 > 0 ? d.temp1.toFixed(1) : null;
+  const temp2    = (bmsConnected || hasData) && d.temp2 && d.temp2 > 0 ? d.temp2.toFixed(1) : null;
+  const capAh    = (bmsConnected || hasData) ? (d.capacity_ah !== undefined ? d.capacity_ah.toFixed(1) : '—') : '—';
+  const remCap   = (bmsConnected || hasData) ? (d.remain_capacity_ah !== undefined ? d.remain_capacity_ah.toFixed(1) : '—') : '—';
+  const balCurr  = (bmsConnected || hasData) ? (d.balance_current !== undefined ? d.balance_current.toFixed(3) : '0.000') : '—';
+  const cycleCap = (bmsConnected || hasData) ? (d.cycle_capacity_ah !== undefined ? d.cycle_capacity_ah.toFixed(1) : '—') : '—';
+  const cycles   = (bmsConnected || hasData) ? (d.cycle_count !== undefined ? d.cycle_count : '—') : '—';
+  const detailLogs = (bmsConnected || hasData) ? (d.detail_logs_count !== undefined ? d.detail_logs_count : '—') : '—';
+  const chargeMos   = d.charge_mos !== undefined ? d.charge_mos : false;
+  const dischargeMos= d.discharge_mos !== undefined ? d.discharge_mos : false;
+  const balance     = d.balance_active !== undefined ? d.balance_active : false;
+  const aveCellVolt = (bmsConnected || hasData) && d.min_cell_voltage && d.max_cell_voltage
     ? (((d.min_cell_voltage||0) + (d.max_cell_voltage||0)) / 2).toFixed(3) : '—';
-  const cellDelta = bmsConnected ? (d.delta_cell_voltage !== undefined ? d.delta_cell_voltage.toFixed(3) : '—') : '—';
-  const statusColor = online ? '#3fb950' : '#f85149';
-  const statusText  = online ? (bmsConnected ? 'Online' : 'ESP Online (Chưa kết nối BMS)') : 'Offline';
+  const cellDelta = (bmsConnected || hasData) ? (d.delta_cell_voltage !== undefined ? d.delta_cell_voltage.toFixed(3) : '—') : '—';
+  const statusColor = online ? (bmsConnected ? '#3fb950' : '#f59e0b') : '#f85149';
+  const statusText  = online ? (bmsConnected ? 'Online' : 'Đang kết nối lại...') : 'Offline';
   const rssiVal     = d.rssi ? d.rssi + ' dBm' : '—';
   const reg = d.activatedAtStr || '—';
   const bmsDisplayName = (d.active_bms_name && d.active_bms_name !== 'JK_PB2A16S15P' && !d.active_bms_name.startsWith('JK-BMS [') ? d.active_bms_name : null) || d.active_pack_name || d.active_pack_alias || d.active_bms_name || 'JK-BMS';
@@ -1718,7 +1746,7 @@ function CUSTOMER_DEVICE_HTML(d) {
 
   for (let i = 0; i < activeCount; i++) {
     const num = (i + 1).toString().padStart(2, '0');
-    if (bmsConnected && i < cells.length) {
+    if ((bmsConnected || hasData) && i < cells.length) {
       const v = cells[i];
       let color = '#3fb950';
       let tagHtml = '';
@@ -2065,10 +2093,10 @@ function CUSTOMER_DEVICE_HTML(d) {
                     <!-- Dotted Guide Ring -->
                     <circle cx="100" cy="76" r="54" fill="none" stroke="#222f38" stroke-width="1" stroke-dasharray="2 4"/>
                     <!-- Active SOC Arc (Length = 284.8) -->
-                    <path id="gauge-arc" d="M 41.1,110 A 68,68 0 1,1 158.9,110" fill="none" stroke="${bmsConnected && socNum > 50 ? 'url(#gaugeGrad)' : (bmsConnected ? '#00ff2b' : '#556570')}" stroke-width="12" stroke-linecap="round" stroke-dasharray="284.8 350" stroke-dashoffset="${bmsConnected ? initialOffset : '284.8'}" style="transition: stroke-dashoffset 0.6s ease;" filter="url(#neonGlow)"/>
+                    <path id="gauge-arc" d="M 41.1,110 A 68,68 0 1,1 158.9,110" fill="none" stroke="${(bmsConnected || hasData) && socNum > 50 ? 'url(#gaugeGrad)' : ((bmsConnected || hasData) ? '#00ff2b' : '#556570')}" stroke-width="12" stroke-linecap="round" stroke-dasharray="284.8 350" stroke-dashoffset="${(bmsConnected || hasData) ? initialOffset : '284.8'}" style="transition: stroke-dashoffset 0.6s ease;" filter="url(#neonGlow)"/>
 
                     <!-- Center SOC % Text -->
-                    <text id="home-soc-txt" x="100" y="68" text-anchor="middle" dominant-baseline="central" fill="${bmsConnected ? '#00ff2b' : '#556570'}" font-size="38" font-weight="900" font-family="-apple-system, sans-serif" filter="url(#neonGlow)">${bmsConnected ? socNum + '%' : '0%'}</text>
+                    <text id="home-soc-txt" x="100" y="68" text-anchor="middle" dominant-baseline="central" fill="${(bmsConnected || hasData) ? '#00ff2b' : '#556570'}" font-size="38" font-weight="900" font-family="-apple-system, sans-serif" filter="url(#neonGlow)">${(bmsConnected || hasData) ? socNum + '%' : '0%'}</text>
 
                     <!-- Pill 1: Voltage Badge -->
                     <g transform="translate(100, 126)">
@@ -3090,6 +3118,7 @@ function CUSTOMER_DEVICE_HTML(d) {
 
             const isOnline = !!(dev.online || (dev.lastSeen && (Date.now() - dev.lastSeen < 60000)));
             const isConn = isOnline && (dev.connected === true);
+            const hasData = dev.voltage !== undefined && dev.voltage > 0;
 
             if (isConn && !isScanning) {
                 const homeList = document.getElementById('home-ble-list');
@@ -3104,17 +3133,18 @@ function CUSTOMER_DEVICE_HTML(d) {
             const txt = _c('esp-online-txt');
             const badge = _c('esp-online-badge');
             if (dot && txt && badge) {
-                dot.style.background = isOnline ? '#00ff2b' : '#ff3b30';
-                dot.style.boxShadow = isOnline ? '0 0 5px #00ff2b' : '0 0 5px #ff3b30';
-                txt.textContent = isOnline ? 'ESP Online' : 'ESP Offline';
-                badge.style.color = isOnline ? '#00ff2b' : '#ff3b30';
+                const badgeColor = isOnline ? (isConn ? '#00ff2b' : '#f59e0b') : '#ff3b30';
+                dot.style.background = badgeColor;
+                dot.style.boxShadow = '0 0 5px ' + badgeColor;
+                txt.textContent = isOnline ? (isConn ? 'ESP Online • BMS Đang kết nối' : 'ESP Online • Đang đợi BMS') : 'ESP Offline';
+                badge.style.color = badgeColor;
             }
 
             // BT Icon
             const btIcon = _c('bt-icon-head');
             if (btIcon) {
-                if (isConn) btIcon.classList.add('active');
-                else btIcon.classList.remove('active');
+                if (isConn) btIcon.className = 'bt-status active';
+                else btIcon.className = 'bt-status';
             }
 
             // Runtime Display (match Local Web)
@@ -3129,25 +3159,25 @@ function CUSTOMER_DEVICE_HTML(d) {
 
             // Name
             const bmsName = (dev.active_bms_name && dev.active_bms_name !== 'JK_PB2A16S15P' && !dev.active_bms_name.startsWith('JK-BMS [') ? dev.active_bms_name : null) || dev.active_pack_name || dev.active_pack_alias || dev.active_bms_name || 'JK-BMS';
-            _set('head-bms-name', isConn ? bmsName : (dev.active_bms_mac ? bmsName : 'Chưa kết nối BMS'));
+            _set('head-bms-name', (isConn || hasData) ? bmsName : (dev.active_bms_mac ? bmsName : 'Chưa kết nối BMS'));
             _set('head-sn', dev.active_bms_mac ? ('MAC: ' + dev.active_bms_mac) : 'Chưa chọn Pack');
 
-            // Gauge
-            const socVal = isConn ? (dev.soc !== undefined ? dev.soc : 0) : 0;
+            // Gauge: ALWAYS preserve valid battery reading, NEVER drop to 0!
+            const socVal = (isConn || hasData) ? (dev.soc !== undefined ? dev.soc : 0) : 0;
             _set('home-soc-txt', socVal + '%');
             const arc = _c('gauge-arc');
             if (arc) {
                 const offset = (284.8 - (socVal / 100.0) * 284.8).toFixed(1);
                 arc.style.strokeDashoffset = offset;
-                const socColor = (!isConn || socVal <= 0) ? '#556570' : (socVal > 50 ? '#00ff2b' : (socVal > 20 ? '#ffb800' : '#ff3b30'));
+                const socColor = ((!isConn && !hasData) || socVal <= 0) ? '#556570' : (socVal > 50 ? '#00ff2b' : (socVal > 20 ? '#ffb800' : '#ff3b30'));
                 arc.setAttribute('stroke', (isConn && socVal > 50) ? 'url(#gaugeGrad)' : socColor);
                 const socTxt = _c('home-soc-txt');
                 if (socTxt) socTxt.setAttribute('fill', socColor);
             }
 
-            const vStr = isConn && dev.voltage !== undefined ? dev.voltage.toFixed(2) + 'V' : '0.00V';
+            const vStr = (isConn || hasData) && dev.voltage !== undefined ? dev.voltage.toFixed(2) + 'V' : '0.00V';
             _set('home-v-pill', vStr);
-            const aStr = isConn && dev.current !== undefined ? dev.current.toFixed(2) + 'A' : '0.00A';
+            const aStr = (isConn || hasData) && dev.current !== undefined ? dev.current.toFixed(2) + 'A' : '0.00A';
             _set('home-a-pill', aStr);
 
             // Banner
@@ -3159,9 +3189,14 @@ function CUSTOMER_DEVICE_HTML(d) {
                     bMsg.innerText = 'Đang kết nối với ' + bmsName + ' • Pin hoạt động bình thường';
                     bIcon.innerText = '✔'; bIcon.style.color = 'var(--green)';
                     sBanner.style.borderColor = '#008b99'; sBanner.style.background = 'rgba(5,35,41,0.85)';
+                } else if (hasData) {
+                    const statusDetail = dev.ble_status_msg ? (' • ' + dev.ble_status_msg) : '';
+                    bMsg.innerText = 'Đang kết nối lại Bluetooth với ' + bmsName + statusDetail;
+                    bIcon.innerText = '📡'; bIcon.style.color = 'var(--yellow)';
+                    sBanner.style.borderColor = 'rgba(245,158,11,0.5)'; sBanner.style.background = 'rgba(40,30,5,0.85)';
                 } else if (dev.active_bms_mac) {
                     const statusDetail = dev.ble_status_msg ? (' • ' + dev.ble_status_msg) : '';
-                    bMsg.innerText = 'Đang kết nối BLE tới ' + bmsName + statusDetail;
+                    bMsg.innerText = 'Đang tìm & kết nối BLE tới ' + bmsName + statusDetail;
                     bIcon.innerText = '📡'; bIcon.style.color = 'var(--yellow)';
                     sBanner.style.borderColor = 'rgba(245,158,11,0.5)'; sBanner.style.background = 'rgba(40,30,5,0.85)';
                 } else {
@@ -3176,29 +3211,30 @@ function CUSTOMER_DEVICE_HTML(d) {
             const hBleMac = _c('home-ble-mac');
             if (hBleName) {
                 if (isConn) hBleName.innerHTML = '<span style="color:var(--green);">🟢</span> ' + bmsName + ' <span style="font-size:0.75rem; color:var(--green);">(Đang kết nối)</span>';
+                else if (hasData) hBleName.innerHTML = '<span style="color:var(--yellow);">🟡</span> ' + bmsName + ' <span style="font-size:0.75rem; color:var(--yellow);">(Đang kết nối lại...)</span>';
                 else if (dev.active_bms_mac) hBleName.innerHTML = '<span style="color:var(--yellow);">🟡</span> ' + bmsName + ' <span style="font-size:0.75rem; color:var(--yellow);">(Đang tìm kiếm...)</span>';
                 else hBleName.innerHTML = '<span style="color:var(--text-sub);">⚪</span> Chưa kết nối BMS';
             }
             if (hBleMac) hBleMac.innerText = dev.active_bms_mac ? ('MAC: ' + dev.active_bms_mac) : 'Chưa có MAC • Hãy bấm Quét Bluetooth';
 
-            // Metrics
-            _set('m-high-v', isConn && dev.max_cell_voltage ? dev.max_cell_voltage.toFixed(3) : '0.000');
-            _set('m-low-v', isConn && dev.min_cell_voltage ? dev.min_cell_voltage.toFixed(3) : '0.000');
-            _set('m-diff-v', isConn && dev.delta_cell_voltage !== undefined ? dev.delta_cell_voltage.toFixed(3) : '0.000');
-            _set('m-bal-a', isConn && dev.balance_current !== undefined ? dev.balance_current.toFixed(3) : '0.000');
-            _set('m-cap-ah', isConn && dev.capacity_ah !== undefined ? Math.round(dev.capacity_ah) : '0');
-            _set('m-rem-ah', isConn && dev.remain_capacity_ah !== undefined ? dev.remain_capacity_ah.toFixed(1) : '0.0');
-            const avgV = (isConn && dev.min_cell_voltage && dev.max_cell_voltage) ? (((dev.min_cell_voltage||0) + (dev.max_cell_voltage||0)) / 2).toFixed(3) : '0.000';
+            // Metrics: ALWAYS show valid numbers, NEVER reset to 0!
+            _set('m-high-v', (isConn || hasData) && dev.max_cell_voltage ? dev.max_cell_voltage.toFixed(3) : '0.000');
+            _set('m-low-v', (isConn || hasData) && dev.min_cell_voltage ? dev.min_cell_voltage.toFixed(3) : '0.000');
+            _set('m-diff-v', (isConn || hasData) && dev.delta_cell_voltage !== undefined ? dev.delta_cell_voltage.toFixed(3) : '0.000');
+            _set('m-bal-a', (isConn || hasData) && dev.balance_current !== undefined ? dev.balance_current.toFixed(3) : '0.000');
+            _set('m-cap-ah', (isConn || hasData) && dev.capacity_ah !== undefined ? Math.round(dev.capacity_ah) : '0');
+            _set('m-rem-ah', (isConn || hasData) && dev.remain_capacity_ah !== undefined ? dev.remain_capacity_ah.toFixed(1) : '0.0');
+            const avgV = ((isConn || hasData) && dev.min_cell_voltage && dev.max_cell_voltage) ? (((dev.min_cell_voltage||0) + (dev.max_cell_voltage||0)) / 2).toFixed(3) : '0.000';
             _set('m-cell-avg', avgV);
-            _set('m-soh', isConn && dev.soh ? (dev.soh + '%') : '100%');
+            _set('m-soh', (isConn || hasData) && dev.soh ? (dev.soh + '%') : '100%');
 
             const isChg = dev.current > 0.1;
             const isDsg = dev.current < -0.1;
-            _set('card-curr-val', isConn && dev.current !== undefined ? ((dev.current > 0 ? '+' : '') + dev.current.toFixed(2) + ' A') : '0.00 A');
-            _set('card-power-val', isConn && dev.power !== undefined ? (Math.abs(dev.power).toFixed(1) + ' W') : '0.0 W');
-            _set('card-mos-temp', isConn && dev.mos_temp !== undefined ? (dev.mos_temp.toFixed(1) + ' °C') : '0.0 °C');
-            _set('card-probes', (isConn && dev.temp1 ? dev.temp1.toFixed(1) : '0.0') + ' / ' + (isConn && dev.temp2 ? dev.temp2.toFixed(1) : '0.0') + ' °C');
-            _set('card-status-txt', isConn ? (isChg ? 'Charging (Đang sạc)' : (isDsg ? 'Discharging (Đang xả)' : 'Standby (Chờ)')) : 'Disconnected');
+            _set('card-curr-val', (isConn || hasData) && dev.current !== undefined ? ((dev.current > 0 ? '+' : '') + dev.current.toFixed(2) + ' A') : '0.00 A');
+            _set('card-power-val', (isConn || hasData) && dev.power !== undefined ? (Math.abs(dev.power).toFixed(1) + ' W') : '0.0 W');
+            _set('card-mos-temp', (isConn || hasData) && dev.mos_temp !== undefined ? (dev.mos_temp.toFixed(1) + ' °C') : '0.0 °C');
+            _set('card-probes', ((isConn || hasData) && dev.temp1 ? dev.temp1.toFixed(1) : '0.0') + ' / ' + ((isConn || hasData) && dev.temp2 ? dev.temp2.toFixed(1) : '0.0') + ' °C');
+            _set('card-status-txt', isConn ? (isChg ? 'Charging (Đang sạc)' : (isDsg ? 'Discharging (Đang xả)' : 'Standby (Chờ)')) : (hasData ? 'Reconnecting (Đang kết nối lại)' : 'Disconnected'));
 
             // MOS indicators
             if (dev.charge_mos !== undefined) updateMosDot('charge_mos', dev.charge_mos);
@@ -3206,22 +3242,22 @@ function CUSTOMER_DEVICE_HTML(d) {
             if (dev.balance_active !== undefined) updateMosDot('balance', dev.balance_active);
 
             // Real-time tab
-            _set('rt-power', isConn && dev.power !== undefined ? Math.abs(dev.power).toFixed(1) : '0.0');
+            _set('rt-power', (isConn || hasData) && dev.power !== undefined ? Math.abs(dev.power).toFixed(1) : '0.0');
             _set('rt-avg', avgV);
-            _set('rt-cap', isConn && dev.capacity_ah ? Math.round(dev.capacity_ah) : '0');
-            _set('rt-diff', isConn && dev.delta_cell_voltage ? dev.delta_cell_voltage.toFixed(3) : '0.000');
-            _set('rt-rem', isConn && dev.remain_capacity_ah ? dev.remain_capacity_ah.toFixed(1) : '0.0');
-            _set('rt-balcurr', isConn && dev.balance_current ? dev.balance_current.toFixed(3) : '0.000');
-            _set('rt-mos', isConn && dev.mos_temp ? dev.mos_temp.toFixed(1) : '0.0');
-            _set('rt-cyc', isConn && dev.cycle_count !== undefined ? dev.cycle_count : '0');
-            _set('rt-t1', isConn && dev.temp1 ? dev.temp1.toFixed(1) : '0.0');
-            _set('rt-t2', isConn && dev.temp2 ? dev.temp2.toFixed(1) : '0.0');
-            _set('rt-t4', isConn && dev.temp4 ? dev.temp4.toFixed(1) : '0.0');
-            _set('rt-t5', isConn && dev.temp5 ? dev.temp5.toFixed(1) : '0.0');
-            _set('rt-heatcurr', isConn && dev.heat_curr ? dev.heat_curr.toFixed(1) : '0.0');
+            _set('rt-cap', (isConn || hasData) && dev.capacity_ah ? Math.round(dev.capacity_ah) : '0');
+            _set('rt-diff', (isConn || hasData) && dev.delta_cell_voltage ? dev.delta_cell_voltage.toFixed(3) : '0.000');
+            _set('rt-rem', (isConn || hasData) && dev.remain_capacity_ah ? dev.remain_capacity_ah.toFixed(1) : '0.0');
+            _set('rt-balcurr', (isConn || hasData) && dev.balance_current ? dev.balance_current.toFixed(3) : '0.000');
+            _set('rt-mos', (isConn || hasData) && dev.mos_temp ? dev.mos_temp.toFixed(1) : '0.0');
+            _set('rt-cyc', (isConn || hasData) && dev.cycle_count !== undefined ? dev.cycle_count : '0');
+            _set('rt-t1', (isConn || hasData) && dev.temp1 ? dev.temp1.toFixed(1) : '0.0');
+            _set('rt-t2', (isConn || hasData) && dev.temp2 ? dev.temp2.toFixed(1) : '0.0');
+            _set('rt-t4', (isConn || hasData) && dev.temp4 ? dev.temp4.toFixed(1) : '0.0');
+            _set('rt-t5', (isConn || hasData) && dev.temp5 ? dev.temp5.toFixed(1) : '0.0');
+            _set('rt-heatcurr', (isConn || hasData) && dev.heat_curr ? dev.heat_curr.toFixed(1) : '0.0');
             _set('rt-heater', dev.heating_active ? 'ON' : 'OFF');
             _set('rt-logs', dev.detail_logs_count || 0);
-            _set('rt-soh', isConn && dev.soh ? dev.soh : 100);
+            _set('rt-soh', (isConn || hasData) && dev.soh ? dev.soh : 100);
             _set('rt-balancer', (dev.balance_active) ? 'ON' : 'OFF');
 
             // Cells Grid (3 columns)
