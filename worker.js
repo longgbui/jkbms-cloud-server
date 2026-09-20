@@ -428,6 +428,18 @@ export default {
         rssi: body.rssi !== undefined ? body.rssi : (devObj.rssi || 0)
       };
 
+      if (body.connected === true) {
+        devObj.lastBmsConnected = nowMs;
+      } else if (!devObj.lastBmsConnected && body.voltage && body.voltage > 0) {
+        devObj.lastBmsConnected = nowMs;
+      }
+      // 90s BMS Reconnection Grace Period: Giữ trạng thái connected = true nếu vừa mất kết nối trong 90s
+      const timeSinceBms1 = devObj.lastBmsConnected ? (nowMs - devObj.lastBmsConnected) : 999999;
+      if (body.connected === false && timeSinceBms1 < 90000 && (devObj.voltage > 0 || (body.voltage && body.voltage > 0))) {
+        devObj.connected = true;
+        devObj.ble_reconnecting = true;
+      }
+
       if (body.scanned_devices && Array.isArray(body.scanned_devices)) {
         const resultObj = { status: 'done', devices: body.scanned_devices, updatedAt: nowMs };
         MEMORY_BLE_RESULTS_MAP.set(deviceId, resultObj);
@@ -690,6 +702,20 @@ export default {
           if (existing.cell_count) updated.cell_count = existing.cell_count;
           if (existing.active_bms_name) updated.active_bms_name = existing.active_bms_name;
           if (existing.active_bms_mac) updated.active_bms_mac = existing.active_bms_mac;
+        }
+
+        if (body.connected === true) {
+          updated.lastBmsConnected = nowMs;
+        } else if (existing.lastBmsConnected) {
+          updated.lastBmsConnected = existing.lastBmsConnected;
+        } else if (updated.voltage && updated.voltage > 0) {
+          updated.lastBmsConnected = nowMs;
+        }
+        // 90s BMS Reconnection Grace Period: Giữ trạng thái connected = true nếu vừa mất kết nối trong 90s
+        const timeSinceBms2 = updated.lastBmsConnected ? (nowMs - updated.lastBmsConnected) : 999999;
+        if (body.connected === false && timeSinceBms2 < 90000 && updated.voltage > 0) {
+          updated.connected = true;
+          updated.ble_reconnecting = true;
         }
 
         if (body.settings && typeof body.settings === 'object') {
@@ -1699,8 +1725,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
 function CUSTOMER_DEVICE_HTML(d) {
   const online = d.online;
-  const bmsConnected = online && (d.connected === true);
   const hasData = (d.voltage !== undefined && d.voltage > 0);
+  const nowMs = Date.now();
+  const timeSinceBms = d.lastBmsConnected ? (nowMs - d.lastBmsConnected) : 999999;
+  // 90s Grace Period: Cho phép ESP kết nối lại trong 90s mà không làm gián đoạn trạng thái Xanh
+  const bmsConnected = online && (d.connected === true || (hasData && timeSinceBms < 90000));
 
   const soc      = (bmsConnected || hasData) ? (d.soc !== undefined ? d.soc : 0) : 0;
   const voltage  = (bmsConnected || hasData) ? (d.voltage ? d.voltage.toFixed(2) : '—') : '—';
@@ -3278,8 +3307,18 @@ function CUSTOMER_DEVICE_HTML(d) {
             if (curAddr !== undefined && curAddr !== null && curAddr !== '') _set('dev-info-addr', curAddr);
 
             const isOnline = !!(dev.online || (dev.lastSeen && (Date.now() - dev.lastSeen < 60000)));
-            const isConn = isOnline && (dev.connected === true);
             const hasData = dev.voltage !== undefined && dev.voltage > 0;
+
+            // ── 90s BMS Reconnection Grace Period ─────────────────────────────
+            // Khi ESP đang kết nối lại Bluetooth (hoặc mất tạm thời do sóng yếu/quét/round-robin),
+            // giữ nguyên trạng thái kết nối Xanh trong 90 giây để khách hàng xem không bị khó chịu!
+            if (dev.connected === true) {
+                window._lastBmsConnOkTime = Date.now();
+            } else if (hasData && !window._lastBmsConnOkTime) {
+                window._lastBmsConnOkTime = dev.lastBmsConnected || Date.now();
+            }
+            const bmsGraceElapsed = window._lastBmsConnOkTime ? (Date.now() - window._lastBmsConnOkTime) : 999999;
+            const isConn = isOnline && (dev.connected === true || (hasData && bmsGraceElapsed < 90000));
 
             if (isConn && !isScanning) {
                 const homeList = document.getElementById('home-ble-list');
