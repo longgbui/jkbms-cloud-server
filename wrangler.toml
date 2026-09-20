@@ -6,3 +6,8 @@ compatibility_date = "2024-01-01"
 binding = "DEVICES"
 id = "8008ca076b924768aa29505bfba8c7f9"
 preview_id = "8008ca076b924768aa29505bfba8c7f9"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "jkbms-db"
+database_id = "b1ee8b85-07cb-4d2e-8b0a-bd6554ada0e1"

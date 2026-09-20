@@ -843,8 +843,8 @@ function CUSTOMER_DEVICE_HTML(d) {
     <div class="data-row"><span class="data-key">Charge MOSFET Switch:</span><span class="data-val" style="color:${chargeMos?'#3fb950':'#f85149'}">${chargeMos?'ENABLED':'DISABLED'}</span></div>
     <div class="data-row"><span class="data-key">Discharge MOSFET Switch:</span><span class="data-val" style="color:${dischargeMos?'#3fb950':'#f85149'}">${dischargeMos?'ENABLED':'DISABLED'}</span></div>
     <div class="data-row"><span class="data-key">Active Balancer Switch:</span><span class="data-val" style="color:${balance?'#3fb950':'#f85149'}">${balance?'ENABLED':'DISABLED'}</span></div>
-    <div class="data-row"><span class="data-key">IP Local:</span><span class="data-val">${d.local_ip || '192.168.102.30'}</span></div>
-    <div class="data-row"><span class="data-key">Wi-Fi SSID:</span><span class="data-val">${d.ssid || 'Cuong977'}</span></div>
+    <div class="data-row"><span class="data-key">IP Local:</span><span class="data-val">${d.local_ip || '—'}</span></div>
+    <div class="data-row"><span class="data-key">Wi-Fi SSID:</span><span class="data-val">${d.ssid || '—'}</span></div>
     <div class="data-row"><span class="data-key">Firmware Version:</span><span class="data-val">v${d.firmware_version || '2.4.0'}</span></div>
   </div>
 
