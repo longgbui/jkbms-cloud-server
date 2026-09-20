@@ -461,6 +461,12 @@ export default {
         if (body.settings.bal_start_v !== undefined) devObj.params['38'] = body.settings.bal_start_v;
       }
 
+      // Lưu packs_summary (tóm tắt data tất cả pack từ ESP)
+      if (body.packs_summary && Array.isArray(body.packs_summary)) {
+        devObj.packs_summary = body.packs_summary;
+        devObj.active_pack_idx = body.active_pack_idx !== undefined ? body.active_pack_idx : (devObj.active_pack_idx || 0);
+      }
+
       MEMORY_DEVICE_INDEX.add(deviceId);
       MEMORY_DEVICE_CACHE.set(deviceId, devObj);
       ctx.waitUntil(d1SaveDevice(env, devObj));
@@ -524,6 +530,32 @@ export default {
         interval_ms: targetIntervalMs,
         commands: cmdArr
       }, 200, corsHeaders);
+    }
+
+    // ── POST /api/set-active-pack — Cloud chọn pack để stream ────────────────
+    if (method === 'POST' && path === '/api/set-active-pack') {
+      let body = {};
+      try { body = await request.json(); } catch(e){}
+      const deviceId = body.device_id;
+      const packIdx  = body.idx !== undefined ? parseInt(body.idx) : null;
+      const packMac  = body.mac || null;
+      if (!deviceId || (packIdx === null && !packMac)) {
+        return jsonResponse({ error: 'Missing device_id and idx/mac' }, 400, corsHeaders);
+      }
+      // Enqueue set_active_pack command → ESP sẽ nhận và chuyển pack
+      const cmd = { cmd: 'set_active_pack', idx: packIdx !== null ? packIdx : 0, mac: packMac || '' };
+      let existing = MEMORY_COMMANDS_MAP.get(deviceId) || [];
+      // Xóa set_active_pack cũ nếu có (chỉ giữ lệnh mới nhất)
+      existing = existing.filter(c => c.cmd !== 'set_active_pack');
+      existing.push(cmd);
+      MEMORY_COMMANDS_MAP.set(deviceId, existing);
+      // Cập nhật active_pack_idx trong RAM cache ngay
+      const devObj = MEMORY_DEVICE_CACHE.get(deviceId);
+      if (devObj) {
+        devObj.active_pack_idx = packIdx !== null ? packIdx : devObj.active_pack_idx;
+        MEMORY_DEVICE_CACHE.set(deviceId, devObj);
+      }
+      return jsonResponse({ status: 'queued', cmd }, 200, corsHeaders);
     }
 
     // ── POST /api/ble-result (D1 + Fast RAM) ────────────────────
@@ -1695,6 +1727,11 @@ function CUSTOMER_DEVICE_HTML(d) {
   const reg = d.activatedAtStr || '—';
   const bmsDisplayName = (d.active_bms_name && d.active_bms_name !== 'JK_PB2A16S15P' && !d.active_bms_name.startsWith('JK-BMS [') ? d.active_bms_name : null) || d.active_pack_name || d.active_pack_alias || d.active_bms_name || 'JK-BMS';
 
+  // Pack Selector data
+  const packsSummary = (d.packs_summary && Array.isArray(d.packs_summary) && d.packs_summary.length > 1) ? d.packs_summary : null;
+  const activePackIdx = d.active_pack_idx !== undefined ? d.active_pack_idx : 0;
+  const packsSummaryJs = packsSummary ? JSON.stringify(packsSummary) : 'null';
+
   const initSec = (d.total_runtime_s && d.total_runtime_s > 0) ? d.total_runtime_s : ((d.totalRuntimeSec && d.totalRuntimeSec > 0) ? d.totalRuntimeSec : ((d.uptime_s && d.uptime_s > 0) ? d.uptime_s : (d.uptimeSec || 0)));
   const initDays = Math.floor(initSec / 86400);
   const initHours = Math.floor((initSec % 86400) / 3600);
@@ -2069,6 +2106,30 @@ function CUSTOMER_DEVICE_HTML(d) {
                 </div>
             </div>
         </header>
+
+        <!-- ================== PACK SELECTOR TABS (Multi-Pack) ================== -->
+        <div id="pack-selector" style="${packsSummary ? 'display:flex;' : 'display:none;'} gap:6px; padding:8px 12px 4px; overflow-x:auto; background:var(--bg-card); border-bottom:1px solid #1e2d3a; scrollbar-width:none; -webkit-overflow-scrolling:touch;">
+          <span style="font-size:0.72rem; color:var(--text-sub); align-self:center; white-space:nowrap; padding-right:2px;">Pack:</span>
+          <div id="pack-tabs-container" style="display:flex; gap:6px;">
+          ${packsSummary ? packsSummary.map((p, i) => {
+            const pName = (p.name && p.name.length > 0) ? p.name : `Pack ${i+1}`;
+            const pVolt = p.voltage > 0 ? p.voltage.toFixed(1)+'V' : '?V';
+            const pSoc  = p.soc > 0 ? p.soc+'%' : '?%';
+            const isAct = p.idx === activePackIdx;
+            return `<button id="pack-tab-${p.idx}" onclick="switchPack(${p.idx})" style="
+              display:flex; flex-direction:column; align-items:center; padding:5px 10px; border-radius:8px; border:none; cursor:pointer; white-space:nowrap; min-width:70px; transition:all 0.2s;
+              background:${isAct ? 'linear-gradient(135deg,#0ea5e9,#22d3ee)' : '#1a2a35'};
+              color:${isAct ? '#fff' : 'var(--text-sub)'};
+              box-shadow:${isAct ? '0 0 8px rgba(14,165,233,0.5)' : 'none'};
+              font-weight:${isAct ? '700' : '400'};
+            ">
+              <span style="font-size:0.75rem; font-weight:700;">${pName.length > 10 ? pName.slice(0,10)+'..' : pName}</span>
+              <span style="font-size:0.68rem; opacity:0.85;">${pVolt} · ${pSoc}</span>
+              <span style="font-size:0.6rem; margin-top:1px;">${p.connected ? '● Online' : '○ Cached'}</span>
+            </button>`;
+          }).join('') : ''}
+          </div>
+        </div>
 
         <!-- ==================== TAB 1: HOME (DASHBOARD) ==================== -->
         <div id="tab-home" class="tab-content active">
@@ -2687,6 +2748,102 @@ function CUSTOMER_DEVICE_HTML(d) {
         }
     }
 
+    // ── Pack Selector: chuyển pack đang stream ──────────────────────────────
+    let isSwitchingPack = false;
+    let PACKS_DATA = ${packsSummaryJs};
+
+    async function switchPack(idx) {
+        if (isSwitchingPack) return;
+        isSwitchingPack = true;
+        // Highlight tab đang chọn ngay lập tức
+        const packs = window.PACKS_DATA || PACKS_DATA;
+        if (packs && Array.isArray(packs)) {
+            packs.forEach(p => {
+                const tab = document.getElementById('pack-tab-' + p.idx);
+                if (!tab) return;
+                const isNew = (p.idx === idx);
+                tab.style.background = isNew ? 'linear-gradient(135deg,#0ea5e9,#22d3ee)' : '#1a2a35';
+                tab.style.color = isNew ? '#fff' : 'var(--text-sub)';
+                tab.style.boxShadow = isNew ? '0 0 8px rgba(14,165,233,0.5)' : 'none';
+                tab.style.fontWeight = isNew ? '700' : '400';
+            });
+        }
+        try {
+            const res = await fetch('/api/set-active-pack', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ device_id: '${d.device_id}', idx: idx })
+            });
+            if (res.ok) {
+                // Đợi ESP chuyển xong rồi refresh data
+                setTimeout(() => { refreshLiveData(); }, 2500);
+            }
+        } catch(e) {}
+        setTimeout(() => { isSwitchingPack = false; }, 4000);
+    }
+
+    function updatePackTabs(packsSummary, activeIdx) {
+        if (!packsSummary || !Array.isArray(packsSummary) || packsSummary.length <= 1) {
+            const container = document.getElementById('pack-selector');
+            if (container) container.style.display = 'none';
+            return;
+        }
+        window.PACKS_DATA = packsSummary;
+        PACKS_DATA = packsSummary;
+        const container = document.getElementById('pack-selector');
+        if (!container) return;
+        container.style.display = 'flex';
+
+        // Kiểm tra xem đã có đủ tabs chưa
+        let needsRebuild = false;
+        packsSummary.forEach(p => {
+            if (!document.getElementById('pack-tab-' + p.idx)) needsRebuild = true;
+        });
+
+        if (needsRebuild) {
+            let html = '';
+            packsSummary.forEach((p, i) => {
+                const pName = (p.name && p.name.length > 0) ? p.name : ('Pack ' + (i + 1));
+                const pVolt = p.voltage > 0 ? (p.voltage.toFixed(1) + 'V') : '?V';
+                const pSoc  = p.soc > 0 ? (p.soc + '%') : '?%';
+                const isAct = (p.idx === activeIdx);
+                const bg = isAct ? 'linear-gradient(135deg,#0ea5e9,#22d3ee)' : '#1a2a35';
+                const color = isAct ? '#fff' : 'var(--text-sub)';
+                const shadow = isAct ? '0 0 8px rgba(14,165,233,0.5)' : 'none';
+                const fw = isAct ? '700' : '400';
+                const displayName = pName.length > 10 ? (pName.slice(0, 10) + '..') : pName;
+                const statusTxt = p.connected ? '● Online' : '○ Cached';
+
+                html += '<button id="pack-tab-' + p.idx + '" onclick="switchPack(' + p.idx + ')" style="' +
+                  'display:flex; flex-direction:column; align-items:center; padding:5px 10px; border-radius:8px; border:none; cursor:pointer; white-space:nowrap; min-width:70px; transition:all 0.2s;' +
+                  'background:' + bg + '; color:' + color + '; box-shadow:' + shadow + '; font-weight:' + fw + ';">' +
+                  '<span style="font-size:0.75rem; font-weight:700;">' + displayName + '</span>' +
+                  '<span style="font-size:0.68rem; opacity:0.85;">' + pVolt + ' · ' + pSoc + '</span>' +
+                  '<span style="font-size:0.6rem; margin-top:1px;">' + statusTxt + '</span>' +
+                '</button>';
+            });
+            const spanLabel = '<span style="font-size:0.72rem; color:var(--text-sub); align-self:center; white-space:nowrap; padding-right:2px;">Pack:</span>';
+            container.innerHTML = spanLabel + '<div id="pack-tabs-container" style="display:flex; gap:6px;">' + html + '</div>';
+            return;
+        }
+
+        // Cập nhật tabs hiện có
+        packsSummary.forEach(p => {
+            const tab = document.getElementById('pack-tab-' + p.idx);
+            if (!tab) return;
+            const isAct = (p.idx === activeIdx);
+            tab.style.background = isAct ? 'linear-gradient(135deg,#0ea5e9,#22d3ee)' : '#1a2a35';
+            tab.style.color = isAct ? '#fff' : 'var(--text-sub)';
+            tab.style.boxShadow = isAct ? '0 0 8px rgba(14,165,233,0.5)' : 'none';
+            tab.style.fontWeight = isAct ? '700' : '400';
+            const spans = tab.querySelectorAll('span');
+            if (spans.length >= 2 && p.voltage > 0) {
+                spans[1].innerText = p.voltage.toFixed(1) + 'V · ' + (p.soc || 0) + '%';
+                if (spans[2]) spans[2].innerText = p.connected ? '● Online' : '○ Cached';
+            }
+        });
+    }
+
     async function toggleMos(type) {
         const key = type === 'charge_mos' ? 'charge_mos' : (type === 'discharge_mos' ? 'discharge_mos' : 'balance');
         const newState = !mosStates[key];
@@ -3110,6 +3267,10 @@ function CUSTOMER_DEVICE_HTML(d) {
 
             window._lastDevData = dev;
             updateSettingsForm(dev);
+
+            if (dev.packs_summary && Array.isArray(dev.packs_summary)) {
+                updatePackTabs(dev.packs_summary, dev.active_pack_idx !== undefined ? dev.active_pack_idx : 0);
+            }
 
             const curCan = dev.can_protocol !== undefined ? dev.can_protocol : dev.canProtocol;
             const curAddr = dev.address_id !== undefined ? dev.address_id : (dev.rs485DeviceId !== undefined ? dev.rs485DeviceId : dev.rs485_device_id);
