@@ -1,7 +1,7 @@
 {
   "name": "jkbms-cloud-server",
   "version": "1.0.0",
-  "description": "JK BMS Cloud Device Management Server - NamKa.vn Edition",
+  "description": "JK BMS WiFi Monitor Cloud Server",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

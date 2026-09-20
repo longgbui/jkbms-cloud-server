@@ -1749,7 +1749,7 @@ function CUSTOMER_DEVICE_HTML(d) {
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="theme-color" content="#000000">
-    <title>JK BMS Monitor - ${d.device_id}</title>
+    <title>JK BMS WiFi Monitor - ${d.device_id}</title>
     <style>
         :root {
             --sat: env(safe-area-inset-top, 0px);
