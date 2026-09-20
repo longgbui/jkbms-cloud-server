@@ -3320,14 +3320,6 @@ function CUSTOMER_DEVICE_HTML(d) {
             const bmsGraceElapsed = window._lastBmsConnOkTime ? (Date.now() - window._lastBmsConnOkTime) : 999999;
             const isConn = isOnline && (dev.connected === true || (hasData && bmsGraceElapsed < 90000));
 
-            if (isConn && !isScanning) {
-                const homeList = document.getElementById('home-ble-list');
-                const settList = document.getElementById('ble-list');
-                if ((homeList && homeList.children.length > 0) || (settList && settList.children.length > 0)) {
-                    closeScannedList();
-                }
-            }
-
             // Online Badge
             const dot = _c('esp-online-dot');
             const txt = _c('esp-online-txt');
