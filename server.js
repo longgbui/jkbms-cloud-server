@@ -1,134 +1,101 @@
 const express = require('express');
 const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
 app.use(cors());
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '16mb' }));
+app.use(express.raw({ type: 'application/octet-stream', limit: '16mb' }));
 
-// In-memory device store: { device_id -> deviceInfo }
+// Persistent storage file
+const DB_FILE = path.join(__dirname, 'devices.json');
+const FIRMWARE_DIR = path.join(__dirname, 'firmware_bin');
+if (!fs.existsSync(FIRMWARE_DIR)) {
+    try { fs.mkdirSync(FIRMWARE_DIR, { recursive: true }); } catch (e) {}
+}
+
+// Log buffer for diagnostics
+const recentLogs = [];
+const origLog = console.log;
+const origErr = console.error;
+console.log = function(...args) {
+    const line = `[${new Date().toLocaleTimeString('vi-VN')}] ` + args.map(a => typeof a === 'object' ? JSON.stringify(a) : a).join(' ');
+    recentLogs.push(line);
+    if (recentLogs.length > 300) recentLogs.shift();
+    origLog.apply(console, args);
+};
+console.error = function(...args) {
+    const line = `[${new Date().toLocaleTimeString('vi-VN')} ERR] ` + args.map(a => typeof a === 'object' ? JSON.stringify(a) : a).join(' ');
+    recentLogs.push(line);
+    if (recentLogs.length > 300) recentLogs.shift();
+    origErr.apply(console, args);
+};
+
+// In-memory stores
 const devices = new Map();
+const commandQueue = new Map();
+const bleScanResults = new Map();
+const activeSessions = new Map();
 
-// Mark device offline if no heartbeat for 3 minutes
+// Load persistent data
+function loadDatabase() {
+    if (fs.existsSync(DB_FILE)) {
+        try {
+            const raw = fs.readFileSync(DB_FILE, 'utf8');
+            const data = JSON.parse(raw);
+            if (Array.isArray(data)) {
+                for (const d of data) {
+                    if (d && d.device_id) devices.set(d.device_id, d);
+                }
+            }
+            console.log(`[Storage] Loaded ${devices.size} devices from devices.json`);
+        } catch (e) {
+            console.error('[Storage Error] Failed to load devices.json:', e.message);
+        }
+    }
+}
+
+let saveTimeout = null;
+function scheduleSave() {
+    if (saveTimeout) return;
+    saveTimeout = setTimeout(() => {
+        saveTimeout = null;
+        try {
+            const arr = Array.from(devices.values());
+            fs.writeFileSync(DB_FILE, JSON.stringify(arr, null, 2), 'utf8');
+        } catch (e) {
+            console.error('[Storage Error] Failed to save devices.json:', e.message);
+        }
+    }, 2000);
+}
+
+loadDatabase();
+
+// Offline threshold (3 minutes)
 const OFFLINE_THRESHOLD_MS = 3 * 60 * 1000;
-
 function isOnline(device) {
     return device.lastSeen && (Date.now() - device.lastSeen) < OFFLINE_THRESHOLD_MS;
 }
 
 // ─── API ROUTES ──────────────────────────────────────────────────────────────
 
-// POST /api/register-device — called by ESP32 on first WiFi connect
-app.post('/api/register-device', (req, res) => {
-    const body = req.body;
-    const deviceId = body.device_id;
-    if (!deviceId) return res.status(400).json({ error: 'device_id required' });
-
-    const existing = devices.get(deviceId) || {};
-    const now = Date.now();
-
-    devices.set(deviceId, {
-        ...existing,
-        device_id: deviceId,
-        mac: body.mac || existing.mac || '',
-        local_ip: body.local_ip || existing.local_ip || '',
-        ssid: body.ssid || existing.ssid || '',
-        rssi: body.rssi || existing.rssi || 0,
-        hostname: body.hostname || existing.hostname || '',
-        firmware_version: body.firmware_version || existing.firmware_version || '',
-        active_bms_mac: body.active_bms_mac || existing.active_bms_mac || '',
-        active_bms_name: body.active_bms_name || existing.active_bms_name || '',
-        registeredAt: existing.registeredAt || now,
-        lastSeen: now,
-        firstConnectedSsid: existing.firstConnectedSsid || body.ssid || '',
-        // BMS data (empty until heartbeat)
-        connected: existing.connected || false,
-        voltage: existing.voltage || 0,
-        current: existing.current || 0,
-        soc: existing.soc || 0,
-        mos_temp: existing.mos_temp || 0,
-    });
-
-    console.log(`[REGISTER] Device: ${deviceId} | IP: ${body.local_ip} | WiFi: ${body.ssid} (${body.rssi}dBm) | FW: ${body.firmware_version}`);
-    res.json({ status: 'ok', message: 'Device registered successfully', device_id: deviceId });
-});
-
-// POST /api/device-heartbeat — called by ESP32
-app.post('/api/device-heartbeat', (req, res) => {
-    const body = req.body;
-    const deviceId = body.device_id;
-    if (!deviceId) return res.status(400).json({ error: 'device_id required' });
-
-    const existing = devices.get(deviceId) || { device_id: deviceId, registeredAt: Date.now() };
-
-    devices.set(deviceId, {
-        ...existing,
-        device_id: deviceId,
-        local_ip: body.local_ip || existing.local_ip || '',
-        ssid: body.ssid || existing.ssid || '',
-        rssi: body.rssi || existing.rssi || 0,
-        connected: body.connected !== undefined ? Boolean(body.connected) : false,
-        voltage: body.voltage !== undefined ? parseFloat(body.voltage) : 0,
-        current: body.current !== undefined ? parseFloat(body.current) : 0,
-        soc: body.soc !== undefined ? parseInt(body.soc) : 0,
-        mos_temp: body.mos_temp !== undefined ? parseFloat(body.mos_temp) : 0,
-        lastSeen: Date.now(),
-    });
-
-    res.json({ status: 'ok' });
-});
-
-// Command Queue Store
-const commandQueue = new Map();
-const bleScanResults = new Map();
-
-// POST /api/send-command — Queue command for device
-app.post('/api/send-command', (req, res) => {
-    const { device_id, cmd } = req.body;
-    if (!device_id || !cmd) return res.status(400).json({ error: 'device_id and cmd required' });
-    if (!commandQueue.has(device_id)) commandQueue.set(device_id, []);
-    const cmdArr = Array.isArray(cmd) ? cmd : [cmd];
-    for (const c of cmdArr) {
-        commandQueue.get(device_id).push(c);
-        if (c && c.cmd === 'scan_ble') {
-            bleScanResults.delete(device_id);
-        }
-    }
-    console.log(`[Command] Queued command for ${device_id}:`, cmd);
-    res.json({ status: 'ok', message: 'Command queued' });
-});
-
-// GET & POST /api/device-commands — ESP32 polling endpoint
-const handleDeviceCommands = (req, res) => {
-    const deviceId = req.query.device_id || (req.body && req.body.device_id);
-    if (!deviceId) return res.json([]);
-    const cmds = commandQueue.get(deviceId) || [];
-    commandQueue.set(deviceId, []);
-    res.json(cmds);
-};
-app.get('/api/device-commands', handleDeviceCommands);
-app.post('/api/device-commands', handleDeviceCommands);
-
-// POST /api/ble-result — ESP32 pushes BLE scan results
-app.post('/api/ble-result', (req, res) => {
-    const { device_id, devices } = req.body;
-    if (!device_id) return res.status(400).json({ error: 'device_id required' });
-    bleScanResults.set(device_id, { devices: devices || [], updatedAt: Date.now() });
-    console.log(`[BLE Scan] Received ${(devices || []).length} devices from ${device_id}`);
-    res.json({ status: 'ok', count: (devices || []).length });
-});
-
-// GET /api/scanned-ble — Web queries scan results
-app.get('/api/scanned-ble', (req, res) => {
-    const deviceId = req.query.device_id;
-    if (!deviceId) return res.status(400).json({ error: 'device_id required' });
-    const r = bleScanResults.get(deviceId) || { devices: [], updatedAt: 0 };
-    res.json(r);
-});
-
-// GET /api/devices — return all devices (for dashboard)
+// GET /api/devices
 app.get('/api/devices', (req, res) => {
+    const watchId = req.query.device_id;
+    if (watchId) {
+        activeSessions.set(watchId, Date.now());
+        const d = devices.get(watchId);
+        if (d) {
+            d.online = isOnline(d);
+            d.lastSeenAgo = d.lastSeen ? Math.floor((Date.now() - d.lastSeen) / 1000) : null;
+            return res.json([d]);
+        }
+        return res.json([]);
+    }
+
     const list = Array.from(devices.values()).map(d => ({
         ...d,
         online: isOnline(d),
@@ -138,847 +105,4407 @@ app.get('/api/devices', (req, res) => {
     res.json(list);
 });
 
-// GET /d/:deviceId — Customer device page
-app.get('/d/:deviceId', (req, res) => {
-    const deviceId = req.params.deviceId;
-    const d = devices.get(deviceId) || { device_id: deviceId, registeredAt: Date.now() };
-    d.online = isOnline(d);
-    d.lastSeenAgo = d.lastSeen ? Math.floor((Date.now() - d.lastSeen) / 1000) : null;
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
-    res.send(CUSTOMER_DEVICE_HTML(d));
+// POST /api/register-device
+app.post('/api/register-device', (req, res) => {
+    const body = req.body;
+    const deviceId = body.device_id;
+    if (!deviceId) return res.status(400).json({ error: 'device_id required' });
+
+    const existing = devices.get(deviceId) || {};
+    const now = Date.now();
+
+    const isBalancer = (body.conn_type === 'uart_lcd') || (body.conn_type === 'balancer') || (body.conn_type_num === 3) || (body.firmware_version && body.firmware_version.includes('BALANCER')) || (deviceId.startsWith('JKBAL'));
+    const isModbus = !isBalancer && ((body.conn_type === 'modbus') || (body.conn_type_num === 2) || (body.firmware_version && body.firmware_version.includes('RS485')));
+
+    const dev = {
+        ...existing,
+        device_id: deviceId,
+        mac: body.mac || existing.mac || '',
+        local_ip: body.local_ip || existing.local_ip || '',
+        ssid: body.ssid || existing.ssid || '',
+        rssi: body.rssi || existing.rssi || 0,
+        hostname: body.hostname || existing.hostname || '',
+        firmware_version: body.firmware_version || existing.firmware_version || '',
+        active_bms_mac: body.active_bms_mac || existing.active_bms_mac || (isBalancer ? 'UART-LCD' : ''),
+        active_bms_name: body.active_bms_name || existing.active_bms_name || (isBalancer ? 'JK Active Balancer (UART)' : ''),
+        conn_type: isBalancer ? 'uart_lcd' : (isModbus ? 'modbus' : 'ble'),
+        conn_type_num: isBalancer ? 3 : (isModbus ? 2 : 1),
+        conn_protocol: isBalancer ? 'JK Balancer UART TTL (LCD Port)' : (isModbus ? 'RS485 Modbus RTU' : 'Bluetooth BLE'),
+        registeredAt: existing.registeredAt || now,
+        lastSeen: now,
+        firstConnectedSsid: existing.firstConnectedSsid || body.ssid || '',
+        connected: existing.connected || false,
+        voltage: existing.voltage || 0,
+        current: existing.current || 0,
+        soc: existing.soc || 0,
+        mos_temp: existing.mos_temp || 0,
+    };
+
+    devices.set(deviceId, dev);
+    scheduleSave();
+
+    console.log(`[REGISTER] Device: ${deviceId} | IP: ${body.local_ip} | WiFi: ${body.ssid} | Conn: ${dev.conn_protocol}`);
+    res.json({ status: 'ok', message: 'Device registered successfully', device_id: deviceId });
 });
 
-// ─── WEB DASHBOARD ───────────────────────────────────────────────────────────
-app.get('/', (req, res) => {
+// POST /api/device-heartbeat or /api/telemetry
+app.post(['/api/device-heartbeat', '/api/telemetry'], (req, res) => {
+    const body = req.body;
+    const deviceId = body.device_id;
+    if (!deviceId) return res.status(400).json({ error: 'device_id required' });
+
+    const existing = devices.get(deviceId) || { device_id: deviceId, registeredAt: Date.now() };
+    const now = Date.now();
+
+    const isBalancer = (body.conn_type === 'uart_lcd') || (body.conn_type === 'balancer') || (body.conn_type_num === 3) || (body.firmware_version && body.firmware_version.includes('BALANCER')) || (deviceId.startsWith('JKBAL')) || (existing.conn_type === 'balancer' || existing.conn_type === 'uart_lcd') || (body.modelName && (body.modelName.includes('Balancer') || body.modelName.includes('B5A24S') || body.modelName.includes('JK_B'))) || (body.model_name && (body.model_name.includes('Balancer') || body.model_name.includes('B5A24S') || body.model_name.includes('JK_B')));
+    const isModbus = !isBalancer && ((body.conn_type === 'modbus') || (body.conn_type_num === 2) || (body.firmware_version && body.firmware_version.includes('RS485')) || (existing.conn_type === 'modbus') || (body.active_bms_mac && String(body.active_bms_mac).startsWith('RS485')));
+
+    // Merge existing with full incoming body so NO telemetry fields are dropped!
+    const updated = {
+        ...existing,
+        ...body,
+        device_id: deviceId,
+        conn_type: isBalancer ? 'uart_lcd' : (isModbus ? 'modbus' : 'ble'),
+        conn_type_num: isBalancer ? 3 : (isModbus ? 2 : 1),
+        conn_protocol: isBalancer ? 'JK Balancer UART TTL (LCD Port)' : (isModbus ? 'RS485 Modbus RTU' : 'Bluetooth BLE'),
+        lastSeen: now,
+    };
+
+    if (isBalancer) {
+        updated.mos_temp = 0;
+        updated.mosTemp = 0;
+        updated.temp1 = 0;
+        updated.temp2 = 0;
+        updated.tempSensor1 = 0;
+        updated.tempSensor2 = 0;
+        updated.charge_mos = true;
+        updated.discharge_mos = true;
+        updated.chargeMosOn = true;
+        updated.dischargeMosOn = true;
+        // 2. Dòng cân bằng thực tế (Balance Current)
+        if (body.balanceCurrent !== undefined) updated.balanceCurrent = parseFloat(body.balanceCurrent);
+        else if (body.balance_current !== undefined) updated.balanceCurrent = parseFloat(body.balance_current);
+        else updated.balanceCurrent = existing.balanceCurrent || 0;
+        updated.balance_current = updated.balanceCurrent;
+
+        // 1. Công tắc & Trạng thái cân bằng Active Balancer
+        // Nếu có dòng cân thực tế > 0.02A -> công tắc chắc chắn BẬT và đang cân tích cực!
+        if (updated.balanceCurrent > 0.02) {
+            updated.balance = true;
+            updated.balance_active = true;
+        } else {
+            if (body.balance !== undefined) updated.balance = !!body.balance;
+            else if (body.balance_switch !== undefined) updated.balance = !!body.balance_switch;
+            else if (existing.balance !== undefined) updated.balance = !!existing.balance;
+            else updated.balance = false;
+
+            updated.balance_active = false;
+        }
+        updated.balanceActive = updated.balance_active;
+        updated.balanceStatus = updated.balance;
+
+        // Normalize totalVoltage / voltage aliases
+        if (body.totalVoltage !== undefined) updated.voltage = parseFloat(body.totalVoltage);
+        else if (body.voltage !== undefined) updated.voltage = parseFloat(body.voltage);
+        if (updated.voltage !== undefined) updated.totalVoltage = updated.voltage;
+    } else {
+        // BMS devices (BLE and RS485 Modbus)
+        if (body.balanceCurrent !== undefined) updated.balanceCurrent = parseFloat(body.balanceCurrent);
+        else if (body.balance_current !== undefined) updated.balanceCurrent = parseFloat(body.balance_current);
+        else updated.balanceCurrent = existing.balanceCurrent || 0;
+        updated.balance_current = updated.balanceCurrent;
+
+        // BMS Balance Switch & Active state:
+        // Nếu có dòng cân thực tế > 0.01A -> công tắc chắc chắn BẬT và đang cân!
+        if (updated.balanceCurrent > 0.01) {
+            updated.balance = true;
+            updated.balance_active = true;
+        } else {
+            if (body.balance !== undefined) updated.balance = !!body.balance;
+            else if (body.balance_switch !== undefined) updated.balance = !!body.balance_switch;
+            else if (existing.balance !== undefined) updated.balance = !!existing.balance;
+            else if (body.balance_active !== undefined) updated.balance = !!body.balance_active;
+            else updated.balance = false;
+
+            if (!updated.balance) {
+                updated.balance_active = false;
+            } else if (body.balancing_cells && body.balancing_cells.length > 0) {
+                updated.balance_active = true;
+            } else if (body.balance !== undefined && body.balance_active !== undefined) {
+                updated.balance_active = !!body.balance_active;
+            } else {
+                updated.balance_active = false;
+            }
+        }
+        updated.balanceActive = updated.balance_active;
+        updated.balanceStatus = updated.balance;
+    }
+
+    // 4. Runtime tích lũy chuẩn hóa toàn hệ thống (không bao giờ bị reset về 0 khi reboot)
+    const inRt = (body.totalRuntimeSec && body.totalRuntimeSec > 0) ? body.totalRuntimeSec : ((body.total_runtime_s && body.total_runtime_s > 0) ? body.total_runtime_s : ((body.total_runtime_sec && body.total_runtime_sec > 0) ? body.total_runtime_sec : 0));
+    if (inRt > 0) {
+        if (!existing.totalRuntimeSec || inRt >= existing.totalRuntimeSec) {
+            updated.totalRuntimeSec = inRt;
+        } else {
+            // Firmware rebooted with smaller runtime count -> keep incrementing server cumulative count
+            updated.totalRuntimeSec = (existing.totalRuntimeSec || 0) + 1;
+        }
+    } else if (existing.totalRuntimeSec) {
+        updated.totalRuntimeSec = existing.totalRuntimeSec + 1;
+    } else if (body.uptimeSec || updated.uptimeSec) {
+        updated.totalRuntimeSec = body.uptimeSec || updated.uptimeSec;
+    }
+    updated.total_runtime_s = updated.totalRuntimeSec;
+    updated.total_runtime_sec = updated.totalRuntimeSec;
+
+    // Normalize number types
+    if (updated.voltage !== undefined) updated.voltage = parseFloat(updated.voltage);
+    if (updated.current !== undefined) updated.current = parseFloat(updated.current);
+    if (updated.soc !== undefined) updated.soc = parseInt(updated.soc);
+    if (updated.mos_temp !== undefined) updated.mos_temp = parseFloat(updated.mos_temp);
+
+    // Aliases normalization between ESP32 and Worker
+    if (updated.delta_cell_voltage === undefined && updated.cell_diff_v !== undefined) updated.delta_cell_voltage = updated.cell_diff_v;
+    if (updated.min_cell_voltage === undefined && updated.cell_min_v !== undefined) updated.min_cell_voltage = updated.cell_min_v;
+    if (updated.max_cell_voltage === undefined && updated.cell_max_v !== undefined) updated.max_cell_voltage = updated.cell_max_v;
+    if (updated.capacity_ah === undefined && updated.nominal_ah !== undefined) updated.capacity_ah = updated.nominal_ah;
+    if (updated.remain_capacity_ah === undefined && updated.remain_ah !== undefined) updated.remain_capacity_ah = updated.remain_ah;
+    if (updated.charge_mos === undefined && updated.charging_mos !== undefined) updated.charge_mos = updated.charging_mos;
+    if (updated.discharge_mos === undefined && updated.discharging_mos !== undefined) updated.discharge_mos = updated.discharging_mos;
+    if (updated.balance_active === undefined && updated.balancing !== undefined) updated.balance_active = updated.balancing;
+
+    if (updated.power === undefined && updated.voltage && updated.current) {
+        updated.power = parseFloat((updated.voltage * updated.current).toFixed(1));
+    }
+
+    if (updated.connected && updated.voltage > 0) {
+        updated.lastBmsConnected = now;
+    }
+
+    // Auto-sync active_pack_idx with active_bms_mac if packs_summary exists
+    if (updated.packs_summary && Array.isArray(updated.packs_summary) && updated.active_bms_mac) {
+        const curNorm = updated.active_bms_mac.toLowerCase().replace(/[:-]/g, '');
+        const fIdx = updated.packs_summary.findIndex(p => (p.mac || '').toLowerCase().replace(/[:-]/g, '') === curNorm);
+        if (fIdx >= 0) {
+            updated.active_pack_idx = fIdx;
+            updated.packs_summary.forEach((p, idx) => {
+                p.active = (idx === fIdx);
+                if (idx === fIdx) {
+                    p.connected = !!updated.connected;
+                    if (updated.voltage > 0) p.voltage = updated.voltage;
+                    if (updated.soc !== undefined) p.soc = updated.soc;
+                } else if (p.connected && idx !== fIdx) {
+                    p.connected = false;
+                }
+            });
+        }
+    }
+
+    devices.set(deviceId, updated);
+    scheduleSave();
+
+    // Continuous 24/7 unmetered realtime streaming + immediate command dispatch
+    const cmds = commandQueue.get(deviceId) || [];
+    commandQueue.set(deviceId, []); // Clear queue
+    if (cmds.length > 0) {
+        console.log(`[Dispatch Heartbeat CMD] Device ${deviceId} received ${cmds.length} commands: ${JSON.stringify(cmds)}`);
+    }
+
+    res.json({
+        status: 'ok',
+        active: true,
+        interval_ms: 1000,
+        commands: cmds
+    });
+});
+
+// GET or POST /api/device-commands or /api/pending-command
+app.all(['/api/device-commands', '/api/pending-command'], (req, res) => {
+    const deviceId = req.query.device_id || req.body?.device_id;
+    if (!deviceId) return res.status(400).json({ error: 'device_id required' });
+
+    const now = Date.now();
+    const dev = devices.get(deviceId);
+    if (dev) {
+        dev.lastSeen = now;
+    }
+
+    const cmds = commandQueue.get(deviceId) || [];
+    commandQueue.set(deviceId, []); // Clear queue
+
+    res.json({ status: 'ok', commands: cmds });
+});
+
+// POST /api/clear-all-ota
+app.post('/api/clear-all-ota', (req, res) => {
+    let cleared = 0;
+    for (const [devId, queue] of commandQueue.entries()) {
+        const remaining = queue.filter(c => c && c.cmd !== 'ota_update');
+        cleared += (queue.length - remaining.length);
+        commandQueue.set(devId, remaining);
+    }
+    res.json({ status: 'ok', message: `Đã hủy ${cleared} lệnh OTA đang chờ!` });
+});
+
+// POST /api/send-command
+app.post('/api/send-command', (req, res) => {
+    let { device_id, cmd } = req.body;
+    if (!device_id || !cmd) return res.status(400).json({ error: 'device_id and cmd required' });
+
+    const cmdArr = Array.isArray(cmd) ? cmd : [cmd];
+    const origin = 'http://bms.lha.io.vn';
+
+    const prepareCmd = (c, dev) => {
+        if (!c || c.cmd !== 'ota_update') return c;
+        const isBal = (dev && (dev.conn_type === 'uart_lcd' || dev.conn_type === 'balancer' || dev.conn_type_num === 3 || (dev.firmware_version && dev.firmware_version.includes('BALANCER'))));
+        if (isBal) {
+            if (c.target_type === 'balancer') {
+                return {
+                    ...c,
+                    target_type: 'balancer',
+                    url: c.url || 'http://bms.lha.io.vn/firmware/balancer.bin',
+                    version: c.version || 'v1.0.0-BALANCER-LCD'
+                };
+            }
+            console.log(`[Safety Guard] Skipping ota_update for Balancer device: ${dev?.device_id}`);
+            return null; // Tuyệt đối không nạp BLE hoặc RS485 cho thiết bị Balancer LCD
+        }
+
+        const isMod = (c.target_type === 'rs485') || (dev && ((dev.conn_type === 'modbus') || (dev.conn_type === 'rs485') || (dev.conn_type_num === 2) || (dev.firmware_version && dev.firmware_version.includes('RS485'))));
+        return {
+            ...c,
+            target_type: isMod ? 'rs485' : 'ble',
+            url: c.url || ('http://bms.lha.io.vn/api/ota-bin?type=' + (isMod ? 'rs485' : 'ble')),
+            version: c.version || (isMod ? 'v2.9.2-RS485' : 'v2.9.0-BLE')
+        };
+    };
+
+    let targetIds = [];
+    if (device_id === 'all' || device_id === 'all_ble' || device_id === 'all_rs485') {
+        const allDevs = Array.from(devices.values());
+        for (const dev of allDevs) {
+            const isBal = (dev.conn_type === 'uart_lcd' || dev.conn_type === 'balancer' || dev.conn_type_num === 3 || (dev.firmware_version && dev.firmware_version.includes('BALANCER')));
+            if (isBal) continue; // Không bao giờ phát nhầm firmware BMS vào máy Cân bằng Balancer LCD
+            const isMod = (dev.conn_type === 'rs485' || dev.conn_type === 'modbus' || (dev.firmware_version && dev.firmware_version.includes('RS485')));
+            if (device_id === 'all_ble' && isMod) continue;
+            if (device_id === 'all_rs485' && !isMod) continue;
+            targetIds.push(dev.device_id);
+        }
+    } else {
+        targetIds = [device_id];
+    }
+
+    let queuedCount = 0;
+    for (const tId of targetIds) {
+        if (!commandQueue.has(tId)) commandQueue.set(tId, []);
+        const dev = devices.get(tId);
+        for (const c of cmdArr) {
+            const finalC = prepareCmd({ ...c }, dev);
+            commandQueue.get(tId).push(finalC);
+            queuedCount++;
+            if (finalC && finalC.cmd === 'scan_ble') {
+                bleScanResults.set(tId, { devices: [], updatedAt: Date.now() });
+            }
+        }
+    }
+
+    res.json({ status: 'ok', queued: queuedCount, targets: targetIds });
+});
+
+// POST /api/ble-result
+app.post('/api/ble-result', (req, res) => {
+    const { device_id, devices: bleDevs } = req.body;
+    if (!device_id) return res.status(400).json({ error: 'device_id required' });
+
+    bleScanResults.set(device_id, {
+        devices: Array.isArray(bleDevs) ? bleDevs : [],
+        updatedAt: Date.now()
+    });
+    res.json({ status: 'ok' });
+});
+
+// GET /api/scanned-ble
+app.get('/api/scanned-ble', (req, res) => {
+    const deviceId = req.query.device_id;
+    if (!deviceId) return res.status(400).json({ error: 'device_id required' });
+
+    const r = bleScanResults.get(deviceId) || { devices: [], updatedAt: 0 };
+    res.json(r);
+});
+
+// POST /api/set-active-pack
+app.post('/api/set-active-pack', (req, res) => {
+    const { device_id, mac, idx, name } = req.body;
+    if (!device_id) return res.status(400).json({ error: 'device_id required' });
+
+    const dev = devices.get(device_id);
+    const targetIdx = (idx !== undefined && idx !== null) ? parseInt(idx) : 0;
+    if (dev) {
+        dev.active_pack_idx = targetIdx;
+        if (mac) dev.active_bms_mac = mac;
+        if (name) dev.active_bms_name = name;
+        if (dev.packs_summary && Array.isArray(dev.packs_summary)) {
+            dev.packs_summary.forEach(p => {
+                p.active = (p.idx === targetIdx);
+            });
+        }
+        scheduleSave();
+    }
+
+    if (!commandQueue.has(device_id)) commandQueue.set(device_id, []);
+    commandQueue.get(device_id).push({
+        cmd: 'set_active_pack',
+        mac: mac || (dev ? dev.active_bms_mac : ''),
+        idx: targetIdx
+    });
+
+    res.json({ status: 'ok', active_pack_idx: targetIdx, active_bms_mac: dev?.active_bms_mac, active_bms_name: dev?.active_bms_name });
+});
+
+// POST /api/delete-pack (hoặc /api/remove-pack)
+app.post(['/api/delete-pack', '/api/remove-pack'], (req, res) => {
+    const { device_id, idx, mac } = req.body;
+    if (!device_id) return res.status(400).json({ error: 'device_id required' });
+
+    const dev = devices.get(device_id);
+    let removed = false;
+    let targetIdx = idx !== undefined ? parseInt(idx) : -1;
+
+    if (dev && dev.packs_summary && Array.isArray(dev.packs_summary)) {
+        if (targetIdx >= 0 && targetIdx < dev.packs_summary.length) {
+            dev.packs_summary.splice(targetIdx, 1);
+            removed = true;
+        } else if (mac) {
+            const norm = mac.toLowerCase().replace(/[:-]/g, '');
+            const fIdx = dev.packs_summary.findIndex(p => (p.mac || '').toLowerCase().replace(/[:-]/g, '') === norm);
+            if (fIdx >= 0) {
+                targetIdx = fIdx;
+                dev.packs_summary.splice(fIdx, 1);
+                removed = true;
+            }
+        }
+        if (removed) {
+            // Đánh số lại index các pack còn lại
+            dev.packs_summary.forEach((p, i) => { p.idx = i; });
+            if (dev.active_pack_idx >= dev.packs_summary.length) {
+                dev.active_pack_idx = 0;
+            }
+            if (dev.packs_summary[dev.active_pack_idx]) {
+                dev.active_bms_mac = dev.packs_summary[dev.active_pack_idx].mac || dev.active_bms_mac;
+                dev.active_bms_name = dev.packs_summary[dev.active_pack_idx].name || dev.active_bms_name;
+            }
+            scheduleSave();
+        }
+    }
+
+    // Gửi lệnh xóa xuống ESP32
+    if (!commandQueue.has(device_id)) commandQueue.set(device_id, []);
+    commandQueue.get(device_id).push({
+        cmd: 'remove_pack',
+        idx: targetIdx >= 0 ? targetIdx : 255,
+        mac: mac || ''
+    });
+
+    res.json({
+        status: 'ok',
+        message: 'Đã xóa pack thành công',
+        active_pack_idx: dev ? dev.active_pack_idx : 0,
+        packs_summary: dev ? dev.packs_summary : []
+    });
+});
+
+// POST /api/clear-packs (Xóa toàn bộ danh sách Pack)
+app.post(['/api/clear-packs', '/api/clear-all-packs'], (req, res) => {
+    const { device_id } = req.body;
+    if (!device_id) return res.status(400).json({ error: 'device_id required' });
+
+    const dev = devices.get(device_id);
+    if (dev) {
+        dev.packs_summary = [];
+        dev.active_pack_idx = 0;
+        scheduleSave();
+    }
+
+    if (!commandQueue.has(device_id)) commandQueue.set(device_id, []);
+    commandQueue.get(device_id).push({
+        cmd: 'clear_packs'
+    });
+
+    res.json({
+        status: 'ok',
+        message: 'Đã xóa toàn bộ danh sách pack thành công',
+        active_pack_idx: 0,
+        packs_summary: []
+    });
+});
+
+// POST /api/delete-device
+app.post('/api/delete-device', (req, res) => {
+    const { device_id } = req.body;
+    if (device_id && devices.has(device_id)) {
+        devices.delete(device_id);
+        scheduleSave();
+        return res.json({ status: 'ok', message: `Device ${device_id} deleted` });
+    }
+    res.status(404).json({ error: 'Device not found' });
+});
+
+// GET /api/usage-stats
+app.get('/api/usage-stats', (req, res) => {
+    const now = new Date();
+    const onlineCount = Array.from(devices.values()).filter(d => isOnline(d)).length;
+    res.json({
+        date: now.toISOString().slice(0, 10),
+        totalRequestsToday: 0,
+        requestsLeftToday: 999999999,
+        percentUsed: 0,
+        dayProgress: (now.getHours() * 60 + now.getMinutes()) / 1440,
+        limit: 'Không giới hạn (TV Box Server)',
+        devices: {
+            totalRegistered: devices.size,
+            onlineCount: onlineCount,
+            offlineCount: devices.size - onlineCount,
+            d1Rows: devices.size
+        },
+        pendingCommands: 0,
+        history: []
+    });
+});
+
+// GET /d/:deviceId or /device/:deviceId
+app.get(['/d/:deviceId', '/device/:deviceId'], (req, res) => {
+    const deviceId = req.params.deviceId;
+    activeSessions.set(deviceId, Date.now());
+
+    let d = devices.get(deviceId);
+    if (!d) {
+        d = { device_id: deviceId, connected: false };
+    }
+    d.online = isOnline(d);
+    d.lastSeenAgo = d.lastSeen ? Math.floor((Date.now() - d.lastSeen) / 1000) : null;
+
+    const isBalancer = (d.conn_type === 'uart_lcd') || (d.conn_type === 'balancer') || (d.conn_type_num === 3) || 
+      (d.firmware_version && d.firmware_version.includes('BALANCER')) || 
+      (d.device_id && d.device_id.startsWith('JKBAL')) ||
+      (d.modelName && (d.modelName.includes('Balancer') || d.modelName.includes('B5A24S') || d.modelName.includes('JK_B'))) ||
+      (d.model_name && (d.model_name.includes('Balancer') || d.model_name.includes('B5A24S') || d.model_name.includes('JK_B')));
+
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+    try {
+        if (isBalancer) {
+            return res.send(BALANCER_DEVICE_HTML(d));
+        }
+        res.send(CUSTOMER_DEVICE_HTML(d));
+    } catch (e) {
+        res.send(`<h2>Lỗi hiển thị thiết bị: ${deviceId}</h2><pre>${e.message}</pre>`);
+    }
+});
+
+// ─── FIRMWARE OTA STORAGE & API ──────────────────────────────────────────────
+function getFwMeta(type) {
+    const metaPath = path.join(FIRMWARE_DIR, `${type}_meta.json`);
+    if (fs.existsSync(metaPath)) {
+        try { return JSON.parse(fs.readFileSync(metaPath, 'utf8')); } catch(e) {}
+    }
+    const binPath = path.join(FIRMWARE_DIR, `${type}.bin`);
+    if (fs.existsSync(binPath)) {
+        const stat = fs.statSync(binPath);
+        return {
+            version: type === 'rs485' ? 'v2.9.2-RS485' : 'v2.9.0-BLE',
+            type: type,
+            size: stat.size,
+            uploadedAt: stat.mtimeMs
+        };
+    }
+    return null;
+}
+
+// POST /api/upload-firmware
+app.post('/api/upload-firmware', (req, res) => {
+    try {
+        let binBuffer = req.body;
+        if (!binBuffer || !Buffer.isBuffer(binBuffer) || binBuffer.length < 1000) {
+            return res.status(400).json({ error: 'Invalid firmware binary (too small or empty)' });
+        }
+
+        const nameParam = req.query.name || req.headers['x-firmware-name'];
+        if (nameParam) {
+            const safeName = path.basename(nameParam);
+            const targetPath = safeName.endsWith('.html') ? path.join(__dirname, safeName) : path.join(FIRMWARE_DIR, safeName);
+            fs.writeFileSync(targetPath, binBuffer);
+            console.log(`[Upload] Saved ${safeName} (${binBuffer.length} bytes) to ${targetPath}`);
+            return res.json({ status: 'ok', file: safeName, size: binBuffer.length });
+        }
+
+        const typeParam = (req.query.type || req.headers['x-firmware-type'] || '').toLowerCase();
+        let version = req.headers['x-firmware-version'] || ('v' + Date.now());
+
+        let fwType = 'ble';
+        const vLower = (version + ' ' + typeParam).toLowerCase();
+        if (vLower.includes('rs485') || vLower.includes('modbus')) {
+            fwType = 'rs485';
+            if (version.startsWith('v17')) version = 'v2.9.2-RS485';
+        } else if (vLower.includes('test') || vLower.includes('standby')) {
+            fwType = 'test';
+        } else {
+            fwType = 'ble';
+            if (version.startsWith('v17')) version = 'v2.9.0-BLE';
+        }
+
+        const meta = {
+            version: version,
+            type: fwType,
+            size: binBuffer.length,
+            uploadedAt: Date.now()
+        };
+
+        // Write binary file and metadata
+        fs.writeFileSync(path.join(FIRMWARE_DIR, `${fwType}.bin`), binBuffer);
+        fs.writeFileSync(path.join(FIRMWARE_DIR, `${fwType}_meta.json`), JSON.stringify(meta, null, 2), 'utf8');
+
+        // Always keep latest.bin updated (only for production ble/rs485)
+        if (fwType !== 'test') {
+            fs.writeFileSync(path.join(FIRMWARE_DIR, 'latest.bin'), binBuffer);
+            fs.writeFileSync(path.join(FIRMWARE_DIR, 'latest_meta.json'), JSON.stringify(meta, null, 2), 'utf8');
+        }
+
+        // Auto-sync binary to Cloudflare Worker KV so ESP32 devices download directly from Cloud CDN at Gigabit speed
+        const cloudflareUrl = 'https://jkbms-cloud.jkbmscloud.workers.dev/api/upload-firmware';
+        fetch(cloudflareUrl, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/octet-stream',
+                'X-Firmware-Version': meta.version,
+                'X-Firmware-Type': meta.type
+            },
+            body: binBuffer
+        }).then(r => r.json()).then(res => {
+            console.log(`[Firmware Upload] Auto-synced to Cloudflare KV:`, res);
+        }).catch(err => {
+            console.warn(`[Firmware Upload] Cloudflare KV sync warning:`, err.message);
+        });
+
+        console.log(`[Firmware Upload] Successfully saved ${fwType}.bin (${meta.size} bytes, version: ${meta.version}) & synced to Cloudflare`);
+        res.json({ status: 'ok', type: fwType, syncedCloud: true, ...meta });
+    } catch (e) {
+        console.error('[Firmware Upload Error]', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// GET /api/firmware-info
+app.get('/api/firmware-info', (req, res) => {
+    const origin = `${req.protocol}://${req.get('host')}`;
+    const typeQuery = (req.query.type || req.headers['x-firmware-type'] || '').toLowerCase();
+    const isRs485 = typeQuery.includes('rs485') || typeQuery.includes('modbus');
+
+    const bleInfo = getFwMeta('ble');
+    const rs485Info = getFwMeta('rs485');
+    const targetInfo = isRs485 ? (rs485Info || { version: 'none', size: 0 }) : (bleInfo || { version: 'none', size: 0 });
+
+    const cloudCdnBle = 'http://bms.lha.io.vn/api/ota-bin?type=ble';
+    const cloudCdnRs485 = 'http://bms.lha.io.vn/api/ota-bin?type=rs485';
+
+    res.json({
+        ...targetInfo,
+        latest_version: targetInfo.version,
+        firmware_url: isRs485 ? cloudCdnRs485 : cloudCdnBle,
+        cloud_url: isRs485 ? cloudCdnRs485 : cloudCdnBle,
+        local_url: isRs485 ? `${origin}/api/ota-bin?type=rs485` : `${origin}/api/ota-bin?type=ble`,
+        ble: bleInfo ? { ...bleInfo, url: cloudCdnBle, local_url: `${origin}/api/ota-bin?type=ble` } : null,
+        rs485: rs485Info ? { ...rs485Info, url: cloudCdnRs485, local_url: `${origin}/api/ota-bin?type=rs485` } : null
+    });
+});
+
+// GET /firmware/:file (latest.bin, rs485.bin, ble.bin) with Paced Streaming for ESP32
+app.get(['/firmware/:file', '/firmware/latest.bin', '/firmware/rs485.bin', '/firmware/ble.bin', '/api/ota-bin', '/api/firmware-download'], (req, res) => {
+    let file = req.params.file || req.query.file || '';
+    const reqPath = (req.path || '').toLowerCase();
+    const typeQ = (req.query.type || '').toLowerCase();
+    if (!file) {
+        if (reqPath.includes('rs485') || typeQ.includes('rs485')) file = 'rs485.bin';
+        else if (reqPath.includes('test') || typeQ.includes('test') || typeQ.includes('standby')) file = 'test.bin';
+        else if (reqPath.includes('ble') || typeQ.includes('ble')) file = 'ble.bin';
+        else file = 'latest.bin';
+    }
+    if (!file.endsWith('.bin')) file += '.bin';
+
+    let filePath = path.join(FIRMWARE_DIR, file);
+    if (!fs.existsSync(filePath)) {
+        const relPath = path.join(__dirname, 'releases', file);
+        if (fs.existsSync(relPath)) {
+            filePath = relPath;
+        } else if (file.includes('rs485') || reqPath.includes('rs485')) {
+            filePath = path.join(FIRMWARE_DIR, 'rs485.bin');
+        } else if (file.includes('test') || reqPath.includes('test')) {
+            filePath = path.join(FIRMWARE_DIR, 'test.bin');
+        } else {
+            filePath = path.join(FIRMWARE_DIR, 'ble.bin');
+        }
+    }
+
+    if (!fs.existsSync(filePath)) {
+        filePath = path.join(FIRMWARE_DIR, 'latest.bin');
+    }
+
+    if (fs.existsSync(filePath)) {
+        const sz = fs.statSync(filePath).size;
+        console.log(`[Firmware Download START] File=${file} Size=${sz} bytes Headers: free-space=${req.headers['x-esp32-free-space']} sketch-size=${req.headers['x-esp32-sketch-size']} chip=${req.headers['x-esp32-chip-size']} ver=${req.headers['x-esp32-version']}`);
+
+        // Direct fast download for Browser / Web Flasher:
+        const isBrowser = (req.headers['user-agent'] || '').includes('Mozilla');
+        if (file.startsWith('factory_') || isBrowser) {
+            res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+            return res.sendFile(filePath);
+        }
+
+        res.setHeader('Content-Type', 'application/octet-stream');
+        res.setHeader('Content-Length', sz);
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+        res.setHeader('Pragma', 'no-cache');
+        res.setHeader('Connection', 'close');
+
+        // Tuned Backpressure Streaming for ESP32 Remote OTA:
+        // 1436 bytes every 6ms + 15ms pause every 20 packets = ~225 KB/s
+        // Completes 1.35 MB RS485 in ~6.0s | Completes 1.73 MB BLE in ~7.7s
+        // Safely finishes under the ESP32 client's 10-second socket timeout!
+        const CHUNK_SIZE = 1436;
+        let sent = 0;
+        let pktCount = 0;
+        const fd = fs.openSync(filePath, 'r');
+        const buf = Buffer.alloc(CHUNK_SIZE);
+
+        const onAbort = (reason) => {
+            if (sent < sz) {
+                console.log(`[Firmware Download ABORTED] ${file}: ${sent}/${sz} bytes (${Math.round(sent*100/sz)}%) Reason: ${reason}`);
+            }
+            try { fs.closeSync(fd); } catch(e) {}
+        };
+
+        res.on('error', (err) => onAbort(`res socket error: ${err.message}`));
+        res.on('close', () => {
+            if (sent < sz) onAbort('res socket closed prematurely by client');
+        });
+
+        const sendNext = () => {
+            if (res.writableEnded || res.destroyed) {
+                if (sent < sz) onAbort(`socket destroyed/ended (destroyed=${res.destroyed}, ended=${res.writableEnded})`);
+                return;
+            }
+
+            let bytesRead = 0;
+            try {
+                bytesRead = fs.readSync(fd, buf, 0, CHUNK_SIZE, sent);
+            } catch (e) {
+                onAbort(`fs.readSync error: ${e.message}`);
+                return;
+            }
+
+            if (bytesRead <= 0) {
+                try { fs.closeSync(fd); } catch(e) {}
+                res.end();
+                console.log(`[Firmware Download COMPLETE] ${file} stream finished: ${sent}/${sz} bytes sent (100%)`);
+                return;
+            }
+
+            const chunk = buf.subarray(0, bytesRead);
+            sent += bytesRead;
+            pktCount++;
+
+            if (sent % (300 * 1024) < CHUNK_SIZE || sent >= sz) {
+                const pct = Math.round((sent * 100) / sz);
+                console.log(`[Firmware Download Progress] ${file}: ${sent}/${sz} bytes (${pct}%)`);
+            }
+
+            if (sent >= sz) {
+                res.end(chunk);
+                try { fs.closeSync(fd); } catch(e) {}
+                console.log(`[Firmware Download COMPLETE] ${file} stream finished: ${sent}/${sz} bytes sent (100%)`);
+                return;
+            }
+
+            const canWrite = res.write(chunk);
+            if (!canWrite) {
+                // Kernel TCP buffer is full -> wait for client ACK before sending more
+                res.once('drain', () => {
+                    setTimeout(sendNext, 4);
+                });
+            } else {
+                // 1436 bytes every 6ms + 15ms pause every 20 packets (~28 KB) = ~225 KB/s
+                const pauseMs = (pktCount % 20 === 0) ? 15 : 6;
+                setTimeout(sendNext, pauseMs);
+            }
+        };
+
+        sendNext();
+    } else {
+        console.error(`[Firmware Download 404] Not found: ${file}`);
+        res.status(404).send('Firmware binary not found');
+    }
+});
+
+// GET /api/admin/logs
+app.get('/api/admin/logs', (req, res) => {
+    res.json({ logs: recentLogs });
+});
+
+// GET /api/admin/proxy-check
+app.get('/api/admin/proxy-check', (req, res) => {
+    const ip = req.query.ip || '192.168.102.10';
+    const http = require('http');
+    const r = http.get(`http://${ip}/`, { timeout: 2500 }, (resp) => {
+        res.json({ reachable: true, status: resp.statusCode });
+    });
+    r.on('error', (err) => {
+        res.json({ reachable: false, error: err.message });
+    });
+    r.on('timeout', () => {
+        r.destroy();
+        res.json({ reachable: false, error: 'timeout' });
+    });
+});
+
+// POST /api/admin/sync-code (OTA Server Update: pulls latest server.js from PC without touching the TV box)
+app.post(['/api/admin/sync-code', '/api/sync-code'], (req, res) => {
+    const pcUrl = req.query.url || req.body?.url || 'http://192.168.31.36:8000/server.js';
+    console.log(`[OTA Update] Pulling latest code from ${pcUrl}...`);
+
+    const http = pcUrl.startsWith('https') ? require('https') : require('http');
+    http.get(pcUrl, (response) => {
+        if (response.statusCode !== 200) {
+            return res.status(500).json({ error: `PC returned HTTP ${response.statusCode}` });
+        }
+        let data = '';
+        response.on('data', chunk => data += chunk);
+        response.on('end', () => {
+            if (data.length > 500) {
+                fs.writeFileSync(path.join(__dirname, 'server.js'), data, 'utf8');
+                console.log(`[OTA Update] Successfully updated server.js (${data.length} bytes). Restarting...`);
+                res.json({
+                    status: 'ok',
+                    bytes: data.length,
+                    message: 'Đã cập nhật code mới từ PC thành công! Server đang tự nạp lại trong 1 giây...'
+                });
+                setTimeout(() => process.exit(0), 1000);
+            } else {
+                res.status(400).json({ error: 'File tải về quá ngắn hoặc không hợp lệ' });
+            }
+        });
+    }).on('error', (err) => {
+        console.error('[OTA Update Error]', err.message);
+        res.status(500).json({ error: `Không thể kết nối máy tính (${pcUrl}): ${err.message}` });
+    });
+});
+
+// GET /api/admin/system/info
+app.get('/api/admin/system/info', (req, res) => {
+    res.json({
+        status: 'ok',
+        uptime: process.uptime(),
+        memory: process.memoryUsage(),
+        node: process.version,
+        platform: process.platform,
+        arch: process.arch
+    });
+});
+
+// Web Serial USB Flasher Route
+app.get(['/flash', '/flash/', '/flasher', '/web-flasher'], (req, res) => {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+    const flasherPath = path.join(__dirname, 'web_flasher.html');
+    if (fs.existsSync(flasherPath)) {
+        return res.sendFile(flasherPath);
+    }
+    return res.send(WEB_FLASHER_HTML);
+});
+
+// ESP Web Tools Manifests
+app.get('/manifest-ble.json', (req, res) => {
+    const p = path.join(__dirname, 'manifest-ble.json');
+    if (fs.existsSync(p)) return res.sendFile(p);
+    res.json({
+        name: "JK BMS Monitor - Bluetooth BLE",
+        version: "v2.9.0-BLE",
+        new_install_prompt_erase: false,
+        builds: [
+            { chipFamily: "ESP32-C3", parts: [{ path: "/firmware/factory_ble.bin", offset: 0 }] },
+            { chipFamily: "ESP32", parts: [{ path: "/firmware/factory_ble.bin", offset: 0 }] }
+        ]
+    });
+});
+
+app.get('/manifest-rs485.json', (req, res) => {
+    const p = path.join(__dirname, 'manifest-rs485.json');
+    if (fs.existsSync(p)) return res.sendFile(p);
+    res.json({
+        name: "JK BMS Monitor - RS485 Modbus RTU",
+        version: "v2.9.2-RS485",
+        new_install_prompt_erase: false,
+        builds: [
+            { chipFamily: "ESP32-C3", parts: [{ path: "/firmware/factory_rs485.bin", offset: 0 }] },
+            { chipFamily: "ESP32", parts: [{ path: "/firmware/factory_rs485.bin", offset: 0 }] }
+        ]
+    });
+});
+
+app.get('/manifest-balancer.json', (req, res) => {
+    const p = path.join(__dirname, 'manifest-balancer.json');
+    if (fs.existsSync(p)) return res.sendFile(p);
+    res.json({
+        name: "JK Active Balancer - UART LCD TTL",
+        version: "v1.0.0-BALANCER-LCD",
+        new_install_prompt_erase: false,
+        builds: [
+            { chipFamily: "ESP32-C3", parts: [{ path: "/firmware/factory_balancer.bin", offset: 0 }] },
+            { chipFamily: "ESP32", parts: [{ path: "/firmware/factory_balancer.bin", offset: 0 }] }
+        ]
+    });
+});
+
+app.get('/manifest-vf.json', (req, res) => {
+    const p = path.join(__dirname, 'manifest-vf.json');
+    if (fs.existsSync(p)) return res.sendFile(p);
+    res.json({
+        name: "Mach Xoa Loi Pin VinFast (ESP32 CYD)",
+        version: "v1.0.0-VF-PIN",
+        new_install_prompt_erase: false,
+        builds: [
+            { chipFamily: "ESP32", parts: [{ path: "/firmware/factory_vf.bin", offset: 0 }] }
+        ]
+    });
+});
+
+// GET /admin, /dashboard, and /
+app.get(['/admin', '/admin/', '/dashboard', '/'], (req, res) => {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
     res.send(DASHBOARD_HTML);
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`[Server] JK BMS Cloud Server running on port ${PORT}`);
-    console.log(`[Server] Live Domain: https://jkbms.namka.vn (Local: http://localhost:${PORT})`);
+    console.log(`[Server] Domain: https://bms.lha.io.vn (Local: http://localhost:${PORT})`);
 });
 
-// ─── EMBEDDED DASHBOARD HTML ─────────────────────────────────────────────────
+server.on('error', (e) => {
+    if (e.code === 'EADDRINUSE') {
+        console.error(`[Server] Port ${PORT} đang bận, sẽ tự thử lại sau 2 giây...`);
+        setTimeout(() => {
+            server.close();
+            server.listen(PORT, '0.0.0.0');
+        }, 2000);
+    } else {
+        console.error('[Server ERROR]', e);
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 const DASHBOARD_HTML = `<!DOCTYPE html>
 <html lang="vi">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <title>JK BMS Cloud - Quản Lý Thiết Bị</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg: #0d1117;
-    --surface: #161b22;
-    --surface2: #21262d;
-    --border: rgba(255,255,255,0.08);
-    --primary: #3fb950;
-    --primary-dim: rgba(63,185,80,0.15);
-    --danger: #f85149;
-    --danger-dim: rgba(248,81,73,0.15);
-    --warning: #e3b341;
-    --warning-dim: rgba(227,179,65,0.15);
-    --text: #e6edf3;
-    --subtext: #8b949e;
-    --accent: #58a6ff;
+    --bg:#0d1117;--surface:#161b22;--surface2:#21262d;--border:rgba(255,255,255,0.08);
+    --primary:#3fb950;--primary-dim:rgba(63,185,80,0.15);--danger:#f85149;--danger-dim:rgba(248,81,73,0.15);
+    --warning:#e3b341;--warning-dim:rgba(227,179,65,0.15);--text:#e6edf3;--subtext:#8b949e;--accent:#58a6ff;
   }
-
-  * { margin:0; padding:0; box-sizing:border-box; }
-
-  body {
-    font-family: 'Inter', sans-serif;
-    background: var(--bg);
-    color: var(--text);
-    min-height: 100vh;
-  }
-
-  header {
-    background: var(--surface);
-    border-bottom: 1px solid var(--border);
-    padding: 16px 24px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    position: sticky;
-    top: 0;
-    z-index: 100;
-    backdrop-filter: blur(12px);
-  }
-
-  .logo {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-  }
-
-  .logo-icon {
-    width: 36px; height: 36px;
-    background: linear-gradient(135deg, var(--primary), #1a7f37);
-    border-radius: 10px;
-    display: flex; align-items: center; justify-content: center;
-    font-size: 18px;
-  }
-
-  .logo h1 { font-size: 1.1rem; font-weight: 700; }
-  .logo span { font-size: 0.75rem; color: var(--subtext); }
-
-  .header-right { display: flex; align-items: center; gap: 12px; }
-
-  .refresh-badge {
-    font-size: 0.75rem;
-    color: var(--subtext);
-    background: var(--surface2);
-    padding: 4px 10px;
-    border-radius: 20px;
-    border: 1px solid var(--border);
-  }
-
-  .stats-bar {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 16px;
-    padding: 20px 24px;
-    max-width: 1200px;
-    margin: 0 auto;
-  }
-
-  .stat-card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 16px 20px;
-    display: flex;
-    align-items: center;
-    gap: 14px;
-  }
-
-  .stat-icon {
-    width: 44px; height: 44px;
-    border-radius: 10px;
-    display: flex; align-items: center; justify-content: center;
-    font-size: 20px;
-  }
-
-  .stat-icon.green { background: var(--primary-dim); }
-  .stat-icon.red { background: var(--danger-dim); }
-  .stat-icon.blue { background: rgba(88,166,255,0.15); }
-
-  .stat-val { font-size: 1.6rem; font-weight: 700; line-height: 1; }
-  .stat-label { font-size: 0.78rem; color: var(--subtext); margin-top: 2px; }
-
-  .content { max-width: 1200px; margin: 0 auto; padding: 0 24px 32px; }
-
-  .section-title {
-    font-size: 0.8rem;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: var(--subtext);
-    margin-bottom: 12px;
-  }
-
-  .device-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
-    gap: 16px;
-  }
-
-  .device-card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 14px;
-    padding: 18px 20px;
-    transition: border-color 0.2s, transform 0.15s;
-    position: relative;
-    overflow: hidden;
-  }
-
-  .device-card:hover { border-color: var(--accent); transform: translateY(-2px); }
-  .device-card.online { border-left: 3px solid var(--primary); }
-  .device-card.offline { border-left: 3px solid var(--danger); opacity: 0.65; }
-
-  .device-card::before {
-    content: '';
-    position: absolute;
-    inset: 0;
-    background: radial-gradient(ellipse at top left, rgba(63,185,80,0.04) 0%, transparent 60%);
-    pointer-events: none;
-  }
-
-  .card-header {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    margin-bottom: 14px;
-  }
-
-  .device-name {
-    font-weight: 600;
-    font-size: 1rem;
-  }
-
-  .device-sub {
-    font-size: 0.75rem;
-    color: var(--subtext);
-    margin-top: 2px;
-    font-family: monospace;
-  }
-
-  .badge {
-    font-size: 0.7rem;
-    font-weight: 600;
-    padding: 3px 8px;
-    border-radius: 20px;
-    white-space: nowrap;
-  }
-
-  .badge-online { background: var(--primary-dim); color: var(--primary); border: 1px solid rgba(63,185,80,0.3); }
-  .badge-offline { background: var(--danger-dim); color: var(--danger); border: 1px solid rgba(248,81,73,0.3); }
-
-  .metrics {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 8px;
-    margin-bottom: 14px;
-  }
-
-  .metric {
-    background: var(--surface2);
-    border-radius: 8px;
-    padding: 10px 12px;
-  }
-
-  .metric-val {
-    font-size: 1.15rem;
-    font-weight: 700;
-    line-height: 1;
-  }
-
-  .metric-val.green { color: var(--primary); }
-  .metric-val.blue { color: var(--accent); }
-  .metric-val.warning { color: var(--warning); }
-
-  .metric-label {
-    font-size: 0.7rem;
-    color: var(--subtext);
-    margin-top: 3px;
-  }
-
-  .device-info {
-    border-top: 1px solid var(--border);
-    padding-top: 12px;
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 6px;
-  }
-
-  .info-row {
-    display: flex;
-    flex-direction: column;
-  }
-
-  .info-key {
-    font-size: 0.65rem;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--subtext);
-  }
-
-  .info-val {
-    font-size: 0.8rem;
-    font-weight: 500;
-    font-family: monospace;
-    margin-top: 1px;
-  }
-
-  .no-devices {
-    grid-column: 1/-1;
-    text-align: center;
-    padding: 60px 20px;
-    color: var(--subtext);
-  }
-
-  .no-devices .icon { font-size: 3rem; margin-bottom: 12px; }
-  .no-devices h3 { font-size: 1rem; font-weight: 600; margin-bottom: 6px; color: var(--text); }
-  .no-devices p { font-size: 0.85rem; line-height: 1.6; }
-
-  .last-seen {
-    font-size: 0.7rem;
-    color: var(--subtext);
-    margin-top: 8px;
-    text-align: right;
-  }
-
-  .bms-indicator {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    font-size: 0.72rem;
-    padding: 2px 7px;
-    border-radius: 20px;
-    font-weight: 500;
-  }
-
-  .bms-connected { background: var(--primary-dim); color: var(--primary); }
-  .bms-disconnected { background: var(--warning-dim); color: var(--warning); }
-
-  .pulse {
-    width: 6px; height: 6px;
-    border-radius: 50%;
-    background: currentColor;
-    animation: pulse 1.5s ease-in-out infinite;
-  }
-
-  @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.3; }
-  }
-
+  *{margin:0;padding:0;box-sizing:border-box;}
+  html{background:var(--bg);-webkit-text-size-adjust:100%;text-size-adjust:100%;overflow-x:hidden;}
+  body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;padding:calc(16px + env(safe-area-inset-top, 0px)) 12px calc(24px + env(safe-area-inset-bottom, 0px));overflow-x:hidden;max-width:100vw;}
+  .container{max-width:1100px;margin:0 auto;width:100%;overflow-x:hidden;}
+  header{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;padding-bottom:14px;border-bottom:1px solid var(--border);flex-wrap:wrap;gap:10px;}
+  .logo-area{display:flex;align-items:center;gap:10px;min-width:0;}
+  .logo-icon{width:36px;height:36px;background:linear-gradient(135deg,#238636,#2ea043);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:1.2rem;flex-shrink:0;}
+  h1{font-size:1.2rem;font-weight:700;letter-spacing:-0.02em;line-height:1.2;}
+  .sub{font-size:0.75rem;color:var(--subtext);}
+  .stats-bar{display:grid;grid-template-columns:repeat(3, minmax(0, 1fr));gap:8px;margin-bottom:20px;}
+  .stat-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:12px 8px;display:flex;flex-direction:column;min-width:0;text-align:center;}
+  .stat-val{font-size:1.4rem;font-weight:700;margin-top:2px;}
+  .stat-val.green{color:var(--primary);}
+  .stat-val.red{color:var(--danger);}
+  .stat-val.blue{color:var(--accent);}
+  .stat-label{font-size:0.68rem;color:var(--subtext);text-transform:uppercase;letter-spacing:0.02em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .device-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%, 320px),1fr));gap:14px;}
+  .device-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px;transition:all 0.2s;min-width:0;overflow:hidden;}
+  .device-card.online{border-left:4px solid var(--primary);}
+  .device-card.offline{border-left:4px solid var(--danger);opacity:0.75;}
+  .card-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px;gap:8px;}
+  .device-name{font-size:0.98rem;font-weight:700;word-break:break-word;}
+  .device-sub{font-size:0.72rem;color:var(--subtext);font-family:monospace;word-break:break-all;}
+  .badge{font-size:0.7rem;padding:2px 7px;border-radius:20px;font-weight:600;display:inline-flex;align-items:center;gap:4px;flex-shrink:0;}
+  .badge-online{background:var(--primary-dim);color:var(--primary);}
+  .badge-offline{background:var(--danger-dim);color:var(--danger);}
+  .metrics{display:grid;grid-template-columns:repeat(3, minmax(0, 1fr));gap:6px;margin-bottom:12px;background:var(--surface2);padding:8px;border-radius:8px;}
+  .metric{text-align:center;min-width:0;overflow:hidden;}
+  .metric-val{font-size:0.95rem;font-weight:700;font-family:monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .metric-val.green{color:var(--primary);}
+  .metric-val.warning{color:var(--warning);}
+  .metric-val.blue{color:var(--accent);}
+  .metric-label{font-size:0.62rem;color:var(--subtext);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .device-info{display:flex;flex-direction:column;gap:5px;font-size:0.76rem;margin-bottom:12px;}
+  .info-row{display:flex;justify-content:space-between;gap:8px;min-width:0;}
+  .info-key{color:var(--subtext);flex-shrink:0;}
+  .info-val{font-family:monospace;text-align:right;word-break:break-word;min-width:0;}
+  .last-seen{font-size:0.7rem;color:var(--subtext);margin-top:8px;text-align:right;}
+  .no-devices{grid-column:1/-1;text-align:center;padding:48px 16px;background:var(--surface);border-radius:12px;color:var(--subtext);}
+  .no-devices .icon{font-size:2.5rem;margin-bottom:10px;}
+  .pulse{width:6px;height:6px;border-radius:50%;background:var(--primary);display:inline-block;animation:pulse 1.5s infinite;}
+  @keyframes pulse{0%,100%{opacity:1;}50%{opacity:0.3;}}
   @media (max-width: 600px) {
-    .stats-bar { grid-template-columns: 1fr; padding: 16px; }
-    .device-grid { grid-template-columns: 1fr; }
-    .content { padding: 0 16px 24px; }
+    .stats-bar{grid-template-columns:repeat(3, minmax(0, 1fr));gap:6px;}
+    .stat-card{padding:8px 4px;}
+    .stat-val{font-size:1.15rem;}
+    .device-grid{grid-template-columns:1fr;gap:12px;}
+    .device-card{padding:12px;}
   }
 </style>
 </head>
 <body>
+<div class="container">
+  <header>
+    <div class="logo-area">
+      <div class="logo-icon">🔋</div>
+      <div>
+        <h1>JK BMS Cloud Monitor</h1>
+        <div class="sub">Hệ thống Giám sát & Quản lý BMS qua Internet</div>
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+      <a href="/flash" target="_blank" style="display:inline-flex;align-items:center;gap:6px;background:rgba(56,189,248,0.15);border:1px solid #38bdf8;color:#38bdf8;padding:7px 15px;border-radius:8px;font-size:0.84rem;font-weight:700;text-decoration:none;transition:0.2s;">⚡ Nạp Cáp USB (Web Flasher)</a>
+      <div style="font-size:0.8rem;color:var(--subtext);" id="refresh-label">Cập nhật tự động</div>
+    </div>
+  </header>
 
-<header>
-  <div class="logo">
-    <div class="logo-icon">🔋</div>
-    <div>
-      <h1>JK BMS Cloud</h1>
-      <span>Quản lý thiết bị tập trung</span>
-    </div>
+  <div class="stats-bar">
+    <div class="stat-card"><span class="stat-label">Tổng số thiết bị</span><span class="stat-val blue" id="stat-total">0</span></div>
+    <div class="stat-card"><span class="stat-label">Trực tuyến (Online)</span><span class="stat-val green" id="stat-online">0</span></div>
+    <div class="stat-card"><span class="stat-label">Ngoại tuyến (Offline)</span><span class="stat-val red" id="stat-offline">0</span></div>
   </div>
-  <div class="header-right">
-    <span class="refresh-badge" id="refresh-label">Đang tải...</span>
-  </div>
-</header>
 
-<div class="stats-bar">
-  <div class="stat-card">
-    <div class="stat-icon green">📡</div>
-    <div>
-      <div class="stat-val" id="stat-online">—</div>
-      <div class="stat-label">Thiết bị Online</div>
+  <!-- CLOUD USAGE PANEL -->
+  <div id="usage-panel" style="background:var(--surface);border:1px solid rgba(227,179,65,0.3);border-radius:12px;padding:18px;margin-bottom:18px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:8px;">
+      <div style="font-weight:700;font-size:0.95rem;color:var(--warning);display:flex;align-items:center;gap:8px;">
+        ☁️ Cloudflare Free Tier — Lượt dùng còn lại hôm nay
+      </div>
+      <div id="usage-date" style="font-size:0.75rem;color:var(--subtext);font-family:monospace;background:var(--surface2);padding:4px 10px;border-radius:6px;border:1px solid var(--border);">
+        Đang tải...
+      </div>
+    </div>
+
+    <!-- 3 progress bars -->
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px;margin-bottom:16px;">
+      <!-- Requests -->
+      <div>
+        <div style="display:flex;justify-content:space-between;font-size:0.78rem;margin-bottom:5px;">
+          <span style="color:var(--text);font-weight:600;">⚡ Requests / ngày</span>
+          <span id="usage-req-txt" style="color:var(--warning);font-family:monospace;font-weight:700;">—</span>
+        </div>
+        <div style="background:var(--surface2);border-radius:6px;height:10px;overflow:hidden;">
+          <div id="usage-req-bar" style="height:100%;width:0%;border-radius:6px;background:linear-gradient(90deg,#3fb950,#e3b341);transition:width 0.8s ease;"></div>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:0.7rem;color:var(--subtext);margin-top:3px;">
+          <span id="usage-req-left" style="color:var(--primary);font-weight:600;">còn lại: —</span>
+          <span>giới hạn: 100,000/ngày</span>
+        </div>
+      </div>
+      <!-- KV Writes -->
+      <div>
+        <div style="display:flex;justify-content:space-between;font-size:0.78rem;margin-bottom:5px;">
+          <span style="color:var(--text);font-weight:600;">💾 KV Writes / ngày</span>
+          <span id="usage-kv-txt" style="color:var(--accent);font-family:monospace;font-weight:700;">—</span>
+        </div>
+        <div style="background:var(--surface2);border-radius:6px;height:10px;overflow:hidden;">
+          <div id="usage-kv-bar" style="height:100%;width:0%;border-radius:6px;background:linear-gradient(90deg,#58a6ff,#f85149);transition:width 0.8s ease;"></div>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:0.7rem;color:var(--subtext);margin-top:3px;">
+          <span id="usage-kv-left" style="color:var(--accent);font-weight:600;">còn lại: —</span>
+          <span>giới hạn: 1,000/ngày</span>
+        </div>
+      </div>
+      <!-- D1 Reads -->
+      <div>
+        <div style="display:flex;justify-content:space-between;font-size:0.78rem;margin-bottom:5px;">
+          <span style="color:var(--text);font-weight:600;">🗄️ D1 Reads / ngày</span>
+          <span id="usage-d1-txt" style="color:var(--primary);font-family:monospace;font-weight:700;">—</span>
+        </div>
+        <div style="background:var(--surface2);border-radius:6px;height:10px;overflow:hidden;">
+          <div id="usage-d1-bar" style="height:100%;width:0%;border-radius:6px;background:linear-gradient(90deg,#3fb950,#e3b341);transition:width 0.8s ease;"></div>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:0.7rem;color:var(--subtext);margin-top:3px;">
+          <span id="usage-d1-left" style="color:var(--primary);font-weight:600;">còn lại: —</span>
+          <span>giới hạn: 25M/ngày</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Sparkline 7 ngày + quick stats -->
+    <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-end;">
+      <div style="flex:1;min-width:200px;">
+        <div style="font-size:0.72rem;color:var(--subtext);margin-bottom:6px;text-transform:uppercase;letter-spacing:0.05em;">Requests 7 ngày gần nhất</div>
+        <div id="usage-sparkline" style="display:flex;align-items:flex-end;gap:4px;height:40px;">
+          <div style="color:var(--subtext);font-size:0.75rem;">Đang tải...</div>
+        </div>
+        <div id="usage-sparkline-labels" style="display:flex;gap:4px;margin-top:3px;"></div>
+      </div>
+      <div style="display:flex;gap:12px;flex-wrap:wrap;">
+        <div style="background:var(--surface2);border-radius:8px;padding:8px 14px;text-align:center;min-width:90px;">
+          <div id="usage-devices-d1" style="font-size:1.3rem;font-weight:700;color:var(--accent);">—</div>
+          <div style="font-size:0.68rem;color:var(--subtext);">Thiết bị D1</div>
+        </div>
+        <div style="background:var(--surface2);border-radius:8px;padding:8px 14px;text-align:center;min-width:90px;">
+          <div id="usage-pending-cmds" style="font-size:1.3rem;font-weight:700;color:var(--warning);">—</div>
+          <div style="font-size:0.68rem;color:var(--subtext);">Lệnh chờ</div>
+        </div>
+        <div style="background:var(--surface2);border-radius:8px;padding:8px 14px;text-align:center;min-width:90px;">
+          <div id="usage-day-pct" style="font-size:1.3rem;font-weight:700;color:var(--primary);">—</div>
+          <div style="font-size:0.68rem;color:var(--subtext);">Ngày trôi qua</div>
+        </div>
+      </div>
     </div>
   </div>
-  <div class="stat-card">
-    <div class="stat-icon red">⚠️</div>
-    <div>
-      <div class="stat-val" id="stat-offline">—</div>
-      <div class="stat-label">Thiết bị Offline</div>
+
+  <!-- QUICK LINK GENERATOR & PERMANENT DEVICE SAVER -->
+
+  <div style="background:var(--surface);border:1px solid rgba(88,166,255,0.3);border-radius:12px;padding:16px;margin-bottom:18px;">
+    <div style="font-weight:700;font-size:0.9rem;color:var(--accent);margin-bottom:10px;display:flex;align-items:center;gap:6px;">
+      <span>💾 Quản Lý & Lưu Vĩnh Viễn Danh Sách Thiết Bị</span>
+      <span style="font-size:0.75rem;color:var(--subtext);font-weight:400;">(Nhập Device ID để lưu vĩnh viễn vào Cloud)</span>
     </div>
-  </div>
-  <div class="stat-card">
-    <div class="stat-icon blue">🔩</div>
-    <div>
-      <div class="stat-val" id="stat-total">—</div>
-      <div class="stat-label">Tổng Thiết Bị</div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;">
+      <input type="text" id="quick-dev-id" placeholder="Nhập ID bo mạch (Ví dụ: JKBMS-F89C)" value="JKBMS-18DE" style="flex:1;min-width:200px;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:9px 14px;border-radius:8px;font-family:monospace;font-size:0.88rem;outline:none;">
+      <button onclick="registerDevice()" style="background:rgba(63,185,80,0.2);border:1px solid #3fb950;color:#3fb950;padding:9px 16px;border-radius:8px;font-size:0.8rem;font-weight:700;cursor:pointer;">💾 Lưu Vĩnh Viễn</button>
+      <button onclick="openQuickLink()" style="background:var(--accent);color:#0d1117;border:none;padding:9px 16px;border-radius:8px;font-size:0.8rem;font-weight:700;cursor:pointer;">🔗 Mở Giao Diện</button>
+      <button onclick="copyQuickLink()" style="background:var(--primary-dim);border:1px solid var(--primary);color:var(--primary);padding:9px 16px;border-radius:8px;font-size:0.8rem;font-weight:700;cursor:pointer;">📋 Copy Link</button>
     </div>
+    <div id="quick-msg" style="font-size:0.78rem;color:var(--primary);margin-top:8px;display:none;font-weight:600;"></div>
   </div>
+
+  <!-- OTA FIRMWARE MANAGEMENT PANEL -->
+  <div style="background:var(--surface);border:1px solid rgba(63,185,80,0.3);border-radius:12px;padding:16px;margin-bottom:24px;">
+    <div style="font-weight:700;font-size:0.95rem;color:var(--primary);margin-bottom:12px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+      <div style="display:flex;align-items:center;gap:6px;">
+        <span>🚀 Nạp & Cập Nhật Firmware Từ Xa (Remote Cloud OTA)</span>
+      </div>
+      <div id="ota-fw-badge" style="font-size:0.75rem;color:var(--subtext);font-family:monospace;background:var(--surface2);padding:4px 10px;border-radius:6px;border:1px solid var(--border);">
+        Đang kiểm tra Cloud Firmware...
+      </div>
+    </div>
+    
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;align-items:center;">
+      <div style="display:flex;gap:8px;">
+        <input type="file" id="ota-file-input" accept=".bin" style="display:none;" onchange="handleFileSelected(this)">
+        <button onclick="document.getElementById('ota-file-input').click()" style="flex:1;background:var(--surface2);border:1px dashed #3fb950;color:var(--text);padding:10px 14px;border-radius:8px;font-size:0.8rem;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;">
+          📁 <span id="ota-file-name">Chọn file firmware (.bin)</span>
+        </button>
+        <button onclick="uploadFirmware()" id="btn-upload-fw" style="background:#238636;color:#fff;border:none;padding:10px 18px;border-radius:8px;font-size:0.8rem;font-weight:700;cursor:pointer;white-space:nowrap;">
+          ⬆️ Upload Lên Cloud
+        </button>
+      </div>
+
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+        <div style="display:flex;flex-direction:column;gap:3px;flex:1.2;min-width:210px;">
+          <span style="font-size:0.72rem;color:var(--subtext);font-weight:600;">1. Chọn Mục Tiêu Nạp:</span>
+          <select id="ota-target-select" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:9px 12px;border-radius:8px;font-size:0.82rem;font-family:monospace;outline:none;">
+            <option value="all">⚡ Tất cả thiết bị (Broadcast All)</option>
+            <option value="all_ble">📡 Tất cả thiết bị Bluetooth BLE</option>
+            <option value="all_rs485">🔌 Tất cả thiết bị RS485 Modbus</option>
+          </select>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:3px;flex:1;min-width:180px;">
+          <span style="font-size:0.72rem;color:var(--subtext);font-weight:600;">2. Chọn Bản Firmware Nạp:</span>
+          <select id="ota-fw-type-select" style="background:var(--surface2);border:1px solid #38bdf8;color:var(--text);padding:9px 12px;border-radius:8px;font-size:0.82rem;font-family:monospace;outline:none;font-weight:700;">
+            <option value="auto">⚡ Tự Động (Theo loại máy)</option>
+            <option value="ble">📡 Firmware BLE (v2.9.0-BLE)</option>
+            <option value="rs485">🔌 Firmware RS485 (v2.9.2-RS485)</option>
+          </select>
+        </div>
+        <div style="display:flex;gap:8px;align-items:flex-end;padding-top:16px;">
+          <button onclick="triggerOtaUpdate()" id="btn-trigger-ota" style="background:linear-gradient(135deg,#38bdf8,#0284c7);color:#070d14;border:none;padding:10px 16px;border-radius:8px;font-size:0.8rem;font-weight:800;cursor:pointer;white-space:nowrap;box-shadow:0 2px 8px rgba(56,189,248,0.3);">
+            ⚡ Phát Lệnh Nạp OTA
+          </button>
+          <button onclick="clearAllPendingOta()" style="background:rgba(248,81,73,0.15);border:1px solid #f85149;color:#f85149;padding:10px 14px;border-radius:8px;font-size:0.8rem;font-weight:700;cursor:pointer;white-space:nowrap;">
+            🧹 Hủy Lệnh Treo
+          </button>
+        </div>
+      </div>
+    </div>
+    <div id="ota-status-msg" style="font-size:0.8rem;margin-top:10px;padding:8px 12px;border-radius:6px;display:none;font-weight:600;"></div>
+  </div>
+
+  <div class="device-grid" id="device-grid"><div class="no-devices"><div class="icon">⏳</div><h3>Đang tải danh sách...</h3></div></div>
 </div>
-
-<div class="content">
-  <div class="section-title" style="margin-bottom:14px;">📋 Danh sách thiết bị</div>
-  <div class="device-grid" id="device-grid">
-    <div class="no-devices">
-      <div class="icon">⏳</div>
-      <h3>Đang tải dữ liệu...</h3>
-    </div>
-  </div>
-</div>
-
 <script>
-  function timeSince(seconds) {
-    if (seconds === null || seconds === undefined) return 'Chưa rõ';
-    if (seconds < 60) return seconds + 's trước';
-    if (seconds < 3600) return Math.floor(seconds/60) + ' phút trước';
-    return Math.floor(seconds/3600) + ' giờ trước';
-  }
-
-  function formatUptime(ts) {
-    if (!ts) return '—';
-    const d = new Date(ts);
-    return d.toLocaleDateString('vi-VN') + ' ' + d.toLocaleTimeString('vi-VN');
-  }
-
-  async function fetchDevices() {
-    try {
-      const res = await fetch('/api/devices');
-      const devices = await res.json();
-
-      const online = devices.filter(d => d.online).length;
-      const offline = devices.length - online;
-
-      document.getElementById('stat-online').textContent = online;
-      document.getElementById('stat-offline').textContent = offline;
-      document.getElementById('stat-total').textContent = devices.length;
-
-      const now = new Date();
-      document.getElementById('refresh-label').textContent = 'Cập nhật: ' + now.toLocaleTimeString('vi-VN');
-
-      const grid = document.getElementById('device-grid');
-
-      if (devices.length === 0) {
-        grid.innerHTML = \`<div class="no-devices">
-          <div class="icon">📡</div>
-          <h3>Chưa có thiết bị nào đăng ký</h3>
-          <p>Các thiết bị ESP32-C3 JK-BMS sẽ tự động xuất hiện tại đây<br>khi kết nối Wi-Fi thành công lần đầu.</p>
-        </div>\`;
-        return;
-      }
-
-      grid.innerHTML = devices.map(d => {
-        const statusClass = d.online ? 'online' : 'offline';
-        const badge = d.online
-          ? '<span class="badge badge-online"><span class="pulse"></span> Online</span>'
-          : '<span class="badge badge-offline">Offline</span>';
-
-        const bmsStatus = d.connected
-          ? '<span class="bms-indicator bms-connected"><span class="pulse"></span> BMS kết nối</span>'
-          : '<span class="bms-indicator bms-disconnected">⚡ BMS chờ</span>';
-
-        const voltage = (d.voltage || 0).toFixed(1);
-        const current = (d.current || 0).toFixed(1);
-        const soc = d.soc || 0;
-        const temp = (d.mos_temp || 0).toFixed(1);
-
-        const socColor = soc > 50 ? 'green' : soc > 20 ? 'warning' : 'danger';
-
-        return \`<div class="device-card \${statusClass}">
-          <div class="card-header">
-            <div>
-              <div class="device-name">📟 \${d.device_id}</div>
-              <div class="device-sub">MAC: \${d.mac || '—'}</div>
-            </div>
-            <div style="display:flex;flex-direction:column;align-items:flex-end;gap:5px;">
-              \${badge}
-              \${bmsStatus}
-            </div>
-          </div>
-
-          <div class="metrics">
-            <div class="metric">
-              <div class="metric-val blue">\${voltage} V</div>
-              <div class="metric-label">Điện áp Pack</div>
-            </div>
-            <div class="metric">
-              <div class="metric-val \${socColor}">\${soc} %</div>
-              <div class="metric-label">SoC Pin</div>
-            </div>
-            <div class="metric">
-              <div class="metric-val">\${current} A</div>
-              <div class="metric-label">Dòng điện</div>
-            </div>
-            <div class="metric">
-              <div class="metric-val warning">\${temp} °C</div>
-              <div class="metric-label">Nhiệt độ MOS</div>
-            </div>
-          </div>
-
-          <div class="device-info">
-            <div class="info-row">
-              <span class="info-key">IP Local</span>
-              <span class="info-val">\${d.local_ip || '—'}</span>
-            </div>
-            <div class="info-row">
-              <span class="info-key">Wi-Fi</span>
-              <span class="info-val">\${d.ssid || '—'}</span>
-            </div>
-            <div class="info-row">
-              <span class="info-key">Hostname</span>
-              <span class="info-val">\${d.hostname || '—'}.local</span>
-            </div>
-            <div class="info-row">
-              <span class="info-key">Firmware</span>
-              <span class="info-val">v\${d.firmware_version || '—'}</span>
-            </div>
-          </div>
-
-          <div class="last-seen">🕐 \${d.online ? 'Hoạt động ' : 'Offline từ '}\${timeSince(d.lastSeenAgo)}</div>
-        </div>\`;
-      }).join('');
-
-    } catch(e) {
-      document.getElementById('refresh-label').textContent = 'Lỗi kết nối!';
+  function timeSince(s){if(s===null||s===undefined)return'Chưa rõ';if(s<4)return'vừa xong (Ping ⚡)';if(s<60)return s+'s trước';if(s<3600)return Math.floor(s/60)+' phút trước';return Math.floor(s/3600)+' giờ trước';}
+  
+  let selectedFwFile = null;
+  function handleFileSelected(input) {
+    if (input.files && input.files[0]) {
+      selectedFwFile = input.files[0];
+      document.getElementById('ota-file-name').textContent = selectedFwFile.name + ' (' + (selectedFwFile.size / 1024).toFixed(0) + ' KB)';
     }
   }
+
+  async function fetchFirmwareInfo() {
+    try {
+      const res = await fetch('/api/firmware-info');
+      const data = await res.json();
+      const badge = document.getElementById('ota-fw-badge');
+      if (data) {
+        let parts = [];
+        if (data.ble && data.ble.version && data.ble.version !== 'none') {
+          parts.push('📡 BLE: <b>' + data.ble.version + '</b> (' + (data.ble.size/1024).toFixed(0) + 'KB)');
+        }
+        if (data.rs485 && data.rs485.version && data.rs485.version !== 'none') {
+          parts.push('🔌 RS485: <b>' + data.rs485.version + '</b> (' + (data.rs485.size/1024).toFixed(0) + 'KB)');
+        }
+        if (parts.length > 0) {
+          badge.innerHTML = parts.join(' | ');
+          badge.style.color = '#3fb950';
+        } else if (data.version && data.version !== 'none') {
+          badge.innerHTML = '📦 Cloud FW: <b>' + data.version + '</b> (' + (data.size / 1024).toFixed(0) + ' KB)';
+          badge.style.color = '#3fb950';
+        } else {
+          badge.textContent = '📦 Chưa có Firmware trên Cloud';
+          badge.style.color = '#8b949e';
+        }
+        const optBle = document.querySelector('#ota-fw-type-select option[value="ble"]');
+        if (optBle && data.ble && data.ble.version && data.ble.version !== 'none') {
+          optBle.textContent = '📡 Firmware BLE (' + data.ble.version + ')';
+        }
+        const optRs = document.querySelector('#ota-fw-type-select option[value="rs485"]');
+        if (optRs && data.rs485 && data.rs485.version && data.rs485.version !== 'none') {
+          optRs.textContent = '🔌 Firmware RS485 (' + data.rs485.version + ')';
+        }
+      }
+    } catch(e) {}
+  }
+
+  async function uploadFirmware() {
+    if (!selectedFwFile) return alert('Vui lòng bấm chọn file .bin trước!');
+    const msg = document.getElementById('ota-status-msg');
+    const btn = document.getElementById('btn-upload-fw');
+    btn.disabled = true;
+    btn.textContent = '⏳ Đang upload...';
+    msg.style.display = 'block';
+    msg.style.background = 'rgba(227,179,65,0.15)';
+    msg.style.color = '#e3b341';
+    msg.textContent = '⏳ Đang tải firmware lên Cloud Server...';
+    try {
+      const fname = (selectedFwFile.name || '').toLowerCase();
+      let typeParam = '';
+      if (fname.includes('rs485') || fname.includes('modbus')) typeParam = 'rs485';
+      else if (fname.includes('ble') || fname.includes('blue')) typeParam = 'ble';
+
+      const uploadUrl = '/api/upload-firmware' + (typeParam ? ('?type=' + typeParam) : '');
+      const res = await fetch(uploadUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'X-Firmware-Version': (typeParam === 'ble' ? 'v2.9.0-BLE' : (typeParam === 'rs485' ? 'v2.9.2-RS485' : ('v' + Date.now()))),
+          'X-Firmware-Type': typeParam
+        },
+        body: selectedFwFile
+      });
+      const data = await res.json();
+      if (data.status === 'ok') {
+        msg.style.background = 'rgba(63,185,80,0.15)';
+        msg.style.color = '#3fb950';
+        msg.textContent = '✅ Đã tải lên Box & đồng bộ lên Cloudflare Edge CDN [' + (data.type || 'FW') + ']! Version: ' + data.version + ' (' + (data.size/1024).toFixed(0) + ' KB) - ESP sẽ tải trực tiếp từ Cloud siêu tốc, không bị timeout!';
+        fetchFirmwareInfo();
+      } else {
+        throw new Error(data.error || 'Lỗi');
+      }
+    } catch(e) {
+      msg.style.background = 'rgba(248,81,73,0.15)';
+      msg.style.color = '#f85149';
+      msg.textContent = '❌ Lỗi upload: ' + e.message;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '⬆️ Upload Lên Cloud';
+    }
+  }
+
+  async function triggerOtaUpdate() {
+    const target = document.getElementById('ota-target-select').value;
+    const fwType = document.getElementById('ota-fw-type-select').value;
+    const msg = document.getElementById('ota-status-msg');
+
+    let fwLabel = (fwType === 'ble') ? 'Bluetooth (BLE)' : ((fwType === 'rs485') ? 'RS485 Modbus' : 'Tự Động');
+    let targetLabel = (target === 'all_ble') ? 'TẤT CẢ THIẾT BỊ BLE' : 
+                      ((target === 'all_rs485') ? 'TẤT CẢ THIẾT BỊ RS485' : 
+                      ((target === 'all') ? 'TẤT CẢ THIẾT BỊ' : ('thiết bị ' + target)));
+
+    if (!confirm('Xác nhận phát lệnh nạp Firmware [' + fwLabel + '] tới ' + targetLabel + '?')) return;
+    msg.style.display = 'block';
+    msg.style.background = 'rgba(56,189,248,0.15)';
+    msg.style.color = '#38bdf8';
+    msg.textContent = '⏳ Đang phát lệnh nạp Firmware ' + fwLabel + ' tới ' + targetLabel + '...';
+    try {
+      const resolvedType = (fwType !== 'auto') ? fwType : ((target === 'all_ble') ? 'ble' : ((target === 'all_rs485') ? 'rs485' : 'auto'));
+      // Paced stream từ TV Box để ESP tải mượt mà không bị tràn bộ đệm lwIP
+      const fwUrl = 'http://bms.lha.io.vn/api/ota-bin?type=' + (resolvedType === 'rs485' ? 'rs485' : 'ble');
+      const fwVer = (resolvedType === 'ble') ? 'v2.9.0-BLE' : 'v2.9.2-RS485';
+
+      const res = await fetch('/api/send-command', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          device_id: target,
+          cmd: {
+            cmd: 'ota_update',
+            target_type: resolvedType,
+            url: fwUrl,
+            version: fwVer
+          }
+        })
+      });
+      const data = await res.json();
+      if (data.status === 'ok') {
+        msg.style.background = 'rgba(63,185,80,0.15)';
+        msg.style.color = '#3fb950';
+        msg.textContent = '✅ ĐÃ PHÁT LỆNH OTA THÀNH CÔNG! Đã gửi lệnh nạp [' + fwLabel + '] tới ' + targetLabel + '. Thiết bị sẽ tự nạp trực tiếp từ Cloud và reboot trong 15s.';
+      }
+    } catch(e) {
+      msg.style.background = 'rgba(248,81,73,0.15)';
+      msg.style.color = '#f85149';
+      msg.textContent = '❌ Lỗi phát lệnh: ' + e.message;
+    }
+  }
+
+  async function triggerDeviceOta(id, forceType) {
+    const isRs = (forceType === 'rs485');
+    const isBl = (forceType === 'ble');
+    let label = isRs ? 'RS485 Modbus' : (isBl ? 'Bluetooth BLE' : 'chuẩn');
+    if (!confirm('Nạp OTA từ xa firmware ' + label + ' cho thiết bị ' + id + '?')) return;
+    try {
+      // Paced stream từ TV Box để ESP tải mượt mà không bị tràn bộ đệm lwIP
+      const fwUrl = 'http://bms.lha.io.vn/api/ota-bin?type=' + (isRs ? 'rs485' : 'ble');
+      const fwVer = isBl ? 'v2.9.0-BLE' : 'v2.9.2-RS485';
+
+      await fetch('/api/send-command', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          device_id: id,
+          cmd: {
+            cmd: 'ota_update',
+            target_type: forceType || (isRs ? 'rs485' : 'ble'),
+            url: fwUrl,
+            version: fwVer
+          }
+        })
+      });
+      alert('✅ Đã phát lệnh OTA ' + label + ' cho ' + id + '! Thiết bị đang nạp trực tiếp từ Cloud...');
+    } catch(e) { alert('Lỗi phát lệnh!'); }
+  }
+
+  async function clearAllPendingOta() {
+    if (!confirm('Hủy và xóa sạch TẤT CẢ các lệnh OTA đang chờ trên Server?')) return;
+    try {
+      const res = await fetch('/api/clear-all-ota', { method: 'POST' });
+      const data = await res.json();
+      alert('✅ ' + (data.message || 'Đã hủy toàn bộ lệnh OTA!'));
+    } catch(e) { alert('Lỗi khi hủy lệnh!'); }
+  }
+
+  async function triggerDeviceBleScan(id) {
+    try {
+      await fetch('/api/send-command', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          device_id: id,
+          cmd: { cmd: 'scan_ble' }
+        })
+      });
+      alert('🔍 Đã phát lệnh Quét BLE cho ' + id + '! Vui lòng mở giao diện để xem kết quả quét.');
+    } catch(e) { alert('Lỗi phát lệnh quét!'); }
+  }
+
+  async function registerDevice() {
+    const id = document.getElementById('quick-dev-id').value.trim();
+    if (!id) return alert('Vui lòng nhập Device ID!');
+    try {
+      const res = await fetch('/api/register-device', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ device_id: id })
+      });
+      const data = await res.json();
+      if (data.status === 'ok') {
+        const msg = document.getElementById('quick-msg');
+        msg.style.display = 'block';
+        msg.style.color = '#3fb950';
+        msg.textContent = '✅ Đã lưu vĩnh viễn thiết bị ' + id + ' vào danh sách cloud!';
+        setTimeout(function() { msg.style.display = 'none'; }, 4000);
+        fetchDevices();
+      }
+    } catch(e) { alert('Lỗi lưu thiết bị!'); }
+  }
+
+  function openQuickLink() {
+    const id = document.getElementById('quick-dev-id').value.trim();
+    if (!id) return alert('Vui lòng nhập Device ID!');
+    window.open('/d/' + id, '_blank');
+  }
+
+  function copyQuickLink() {
+    const id = document.getElementById('quick-dev-id').value.trim();
+    if (!id) return alert('Vui lòng nhập Device ID!');
+    const url = window.location.origin + '/d/' + id;
+    navigator.clipboard.writeText(url).then(function() {
+      const msg = document.getElementById('quick-msg');
+      msg.style.display = 'block';
+      msg.textContent = '✅ Đã chép link: ' + url;
+      setTimeout(function() { msg.style.display = 'none'; }, 4000);
+    });
+  }
+
+  function copyMonitorLink(id, btn){
+    const url = window.location.origin + '/d/' + id;
+    navigator.clipboard.writeText(url).then(() => {
+      const oldText = btn.textContent;
+      btn.textContent = '✅ Đã Chép!';
+      btn.style.background = '#3fb950';
+      btn.style.color = '#0d1117';
+      setTimeout(() => {
+        btn.textContent = oldText;
+        btn.style.background = '';
+        btn.style.color = '';
+      }, 2000);
+    });
+  }
+
+  async function deleteDevice(id) {
+    if (!confirm('Bạn có chắc chắn muốn XÓA THIẾT BỊ ' + id + ' khỏi danh sách Cloud?')) return;
+    try {
+      const res = await fetch('/api/delete-device', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ device_id: id })
+      });
+      const data = await res.json();
+      if (data.status === 'ok') {
+        fetchDevices();
+      }
+    } catch(e){ alert('Lỗi khi xóa thiết bị!'); }
+  }
+
+  async function fetchDevices(){
+    const grid = document.getElementById('device-grid');
+    const sel = document.getElementById('ota-target-select');
+    try{
+      const res = await fetch('/api/devices');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const devices = await res.json();
+      
+      document.getElementById('stat-online').textContent = devices.filter(function(d){ return d.online; }).length;
+      document.getElementById('stat-offline').textContent = devices.filter(function(d){ return !d.online; }).length;
+      document.getElementById('stat-total').textContent = devices.length;
+      document.getElementById('refresh-label').textContent = 'Cập nhật: ' + new Date().toLocaleTimeString('vi-VN');
+
+      if (sel) {
+        const curVal = sel.value;
+        let optHtml = '<option value="all">⚡ Tất cả thiết bị (Broadcast All)</option>' +
+                      '<option value="all_ble">📡 Tất cả thiết bị Bluetooth BLE</option>' +
+                      '<option value="all_rs485">🔌 Tất cả thiết bị RS485 Modbus</option>' +
+                      '<optgroup label="--- Từng Thiết Bị Cụ Thể ---">';
+        for(let d of devices) {
+          const isMod = (d.conn_type === 'rs485' || d.conn_type === 'modbus' || (d.firmware_version && d.firmware_version.includes('RS485')));
+          const tag = isMod ? ' [RS485]' : ' [BLE]';
+          optHtml += '<option value="' + d.device_id + '">' + (d.online ? '🟢 ' : '🔴 ') + d.device_id + tag + (d.ssid ? ' (' + d.ssid + ')' : '') + '</option>';
+        }
+        optHtml += '</optgroup>';
+        sel.innerHTML = optHtml;
+        if (curVal) sel.value = curVal;
+      }
+      
+      if(!devices || !devices.length){
+        grid.innerHTML = '<div class="no-devices"><div class="icon">📡</div><h3>Chưa có thiết bị</h3><p>Nhập ID ở trên để lưu hoặc bật bo ESP32 kết nối Wi-Fi.</p></div>';
+        return;
+      }
+      
+      var htmlArr = [];
+      for(var i = 0; i < devices.length; i++) {
+        var d = devices[i];
+        var socColor = d.soc > 50 ? 'green' : d.soc > 20 ? 'warning' : 'danger';
+        var voltStr = (d.voltage || 0).toFixed(1);
+        var tempStr = (d.mos_temp || 0).toFixed(1);
+        var localIp = d.local_ip || '—';
+        var ssidName = d.ssid || '—';
+        var hostName = d.hostname || '—';
+        var fwVer = d.firmware_version || '—';
+        var activatedStr = d.activatedAtStr || 'Chưa kích hoạt';
+        var statusBadge = d.online ? '<span class="badge badge-online"><span class="pulse"></span> Online</span>' : '<span class="badge badge-offline">Offline</span>';
+        var statusText = d.online ? 'Hoạt động ' : 'Offline từ ';
+        
+        var isBalancer = (d.conn_type === 'uart_lcd') || (d.conn_type === 'balancer') || (d.conn_type_num === 3) || (d.firmware_version && d.firmware_version.indexOf('BALANCER') !== -1) || (d.device_id && d.device_id.startsWith('JKBAL'));
+        var isModbus = !isBalancer && ((d.conn_type === 'ble' || d.conn_type_num === 1 || (d.firmware_version && d.firmware_version.indexOf('BLE') !== -1))
+          ? false
+          : ((d.conn_type === 'modbus') || (d.conn_type === 'rs485') || (d.conn_type_num === 2) || (d.firmware_version && d.firmware_version.indexOf('RS485') !== -1) || (d.active_bms_mac && String(d.active_bms_mac).startsWith('RS485'))));
+
+        var connBadge = isBalancer
+          ? '<span style="background:rgba(16,185,129,0.18);color:#10b981;border:1px solid rgba(16,185,129,0.45);font-size:0.65rem;padding:2px 7px;border-radius:4px;font-weight:800;letter-spacing:0.5px;margin-left:6px;vertical-align:middle;">⚡ CÂN BẰNG JK</span>'
+          : (isModbus 
+            ? '<span style="background:rgba(245,158,11,0.18);color:#f59e0b;border:1px solid rgba(245,158,11,0.45);font-size:0.65rem;padding:2px 7px;border-radius:4px;font-weight:800;letter-spacing:0.5px;margin-left:6px;vertical-align:middle;">🟠 MODBUS</span>'
+            : '<span style="background:rgba(56,189,248,0.18);color:#38bdf8;border:1px solid rgba(56,189,248,0.45);font-size:0.65rem;padding:2px 7px;border-radius:4px;font-weight:800;letter-spacing:0.5px;margin-left:6px;vertical-align:middle;">🔵 BLUETOOTH</span>');
+
+        var connProtocolText = isBalancer ? '⚡ JK Balancer UART (LCD Port)' : (isModbus ? '🟠 RS485 Modbus RTU' : '🔵 Bluetooth BLE');
+        var bmsKeyLabel = isBalancer ? 'Cổng Balancer' : (isModbus ? 'Cổng BMS (Modbus)' : 'Tên Bluetooth (BMS)');
+        var bmsTitle = d.active_bms_name || d.active_pack_alias || d.active_pack_name || (isBalancer ? 'JK Active Balancer' : (isModbus ? 'JK-PB Modbus' : 'JK-BMS'));
+        htmlArr.push(
+          '<div class="device-card ' + (d.online ? 'online' : 'offline') + '">' +
+            '<div class="card-header">' +
+              '<div><div class="device-name" style="display:flex;align-items:center;">📟 ' + d.device_id + connBadge + '</div><div class="device-sub" style="color:var(--accent);font-weight:600;margin-top:2px;">🔋 ' + bmsTitle + (d.active_bms_mac ? ' <span style="color:var(--subtext);font-weight:normal;">[' + d.active_bms_mac + ']</span>' : '') + '</div></div>' +
+              statusBadge +
+            '</div>' +
+            '<div class="metrics">' +
+              '<div class="metric"><div class="metric-val blue">' + voltStr + ' V</div><div class="metric-label">Điện áp Pack</div></div>' +
+              '<div class="metric"><div class="metric-val ' + socColor + '">' + (d.soc || 0) + ' %</div><div class="metric-label">SoC Pin</div></div>' +
+              '<div class="metric"><div class="metric-val warning">' + tempStr + ' °C</div><div class="metric-label">Nhiệt độ MOS</div></div>' +
+            '</div>' +
+            '<div class="device-info">' +
+              '<div class="info-row"><span class="info-key">Kiểu Kết Nối</span><span class="info-val" style="color:' + (isModbus ? '#f59e0b' : '#38bdf8') + ';font-weight:700;">' + connProtocolText + '</span></div>' +
+              '<div class="info-row"><span class="info-key">' + bmsKeyLabel + '</span><span class="info-val" style="color:var(--accent);font-weight:700;">' + bmsTitle + '</span></div>' +
+              '<div class="info-row"><span class="info-key">Ngày Kích Hoạt</span><span class="info-val" style="color:var(--primary);font-weight:700;">' + activatedStr + '</span></div>' +
+              '<div class="info-row"><span class="info-key">IP Local</span><span class="info-val">' + localIp + '</span></div>' +
+              '<div class="info-row"><span class="info-key">Wi-Fi</span><span class="info-val">' + ssidName + '</span></div>' +
+              '<div class="info-row"><span class="info-key">Hostname</span><span class="info-val">' + hostName + '</span></div>' +
+              '<div class="info-row"><span class="info-key">Firmware</span><span class="info-val">v' + fwVer + '</span></div>' +
+            '</div>' +
+            '<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);display:grid;grid-template-columns:1fr 1fr;gap:6px;">' +
+              '<a href="/d/' + d.device_id + '" target="_blank" style="background:var(--surface2);border:1px solid var(--accent);color:var(--accent);padding:7px 8px;border-radius:6px;font-size:0.75rem;font-weight:600;text-decoration:none;text-align:center;">' +
+                '🔗 Mở Link' +
+              '</a>' +
+              (isModbus ? 
+                '<button data-id="' + d.device_id + '" data-type="rs485" onclick="triggerDeviceOta(this.dataset.id, this.dataset.type)" style="background:rgba(245,158,11,0.15);border:1px solid #f59e0b;color:#f59e0b;padding:7px 8px;border-radius:6px;font-size:0.75rem;font-weight:700;cursor:pointer;" title="Nạp đúng Firmware RS485">🔌 Nạp RS485</button>' :
+                '<button data-id="' + d.device_id + '" data-type="ble" onclick="triggerDeviceOta(this.dataset.id, this.dataset.type)" style="background:rgba(56,189,248,0.15);border:1px solid #38bdf8;color:#38bdf8;padding:7px 8px;border-radius:6px;font-size:0.75rem;font-weight:700;cursor:pointer;" title="Nạp đúng Firmware Bluetooth">📡 Nạp BLE</button>'
+              ) +
+              '<button data-id="' + d.device_id + '" onclick="triggerDeviceBleScan(this.dataset.id)" style="background:rgba(227,179,65,0.15);border:1px solid #e3b341;color:#e3b341;padding:7px 8px;border-radius:6px;font-size:0.75rem;font-weight:700;cursor:pointer;">' +
+                '🔍 Quét BLE' +
+              '</button>' +
+              '<button data-id="' + d.device_id + '" onclick="copyMonitorLink(this.dataset.id, this)" style="background:var(--primary-dim);border:1px solid var(--primary);color:var(--primary);padding:7px 8px;border-radius:6px;font-size:0.75rem;font-weight:600;cursor:pointer;">' +
+                '📋 Copy' +
+              '</button>' +
+            '</div>' +
+            '<div style="margin-top:8px;display:flex;justify-content:space-between;align-items:center;">' +
+              '<button data-id="' + d.device_id + '" data-type="' + (isModbus ? 'ble' : 'rs485') + '" onclick="triggerDeviceOta(this.dataset.id, this.dataset.type)" style="background:transparent;border:none;color:' + (isModbus ? '#38bdf8' : '#f59e0b') + ';font-size:0.72rem;cursor:pointer;opacity:0.85;padding:0;">' +
+                (isModbus ? '📡 Nạp Chuyển Về BLE' : '🔌 Nạp Chuyển Sang RS485') +
+              '</button>' +
+              '<button data-id="' + d.device_id + '" onclick="deleteDevice(this.dataset.id)" style="background:transparent;border:none;color:#f85149;font-size:0.72rem;cursor:pointer;opacity:0.7;">🗑️ Xóa</button>' +
+            '</div>' +
+            '<div class="last-seen">🕐 ' + statusText + timeSince(d.lastSeenAgo) + '</div>' +
+          '</div>'
+        );
+      }
+      grid.innerHTML = htmlArr.join('');
+    }catch(e){
+      console.error(e);
+      document.getElementById('refresh-label').textContent = 'Đang tự động kết nối...';
+      grid.innerHTML = '<div class="no-devices"><div class="icon">📡</div><h3>Đang kết nối Cloud</h3><p>Sử dụng thanh công cụ ở trên để tạo link khách hàng hoặc lưu thiết bị vĩnh viễn.</p></div>';
+    }
+  }
+
+  fetchFirmwareInfo();
   fetchDevices();
-  setInterval(fetchDevices, 5000);
+  fetchUsageStats();
+  let dashTimer = setInterval(fetchDevices, 10000);
+  setInterval(fetchUsageStats, 60000);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      if (dashTimer) clearInterval(dashTimer);
+    } else {
+      fetchDevices();
+      fetchUsageStats();
+      dashTimer = setInterval(fetchDevices, 10000);
+    }
+  });
+
+  async function fetchUsageStats() {
+    try {
+      const res = await fetch('/api/usage-stats');
+      if (!res.ok) return;
+      const u = await res.json();
+
+      // Header date
+      const dateEl = document.getElementById('usage-date');
+      if (dateEl) dateEl.textContent = '📅 ' + u.date + ' | ' + Math.round(u.dayProgress * 100) + '% ngày đã trôi qua';
+
+      // Requests bar
+      const reqPct = Math.min(u.requests.pct, 100);
+      const reqLeft = (u.requests.limit - u.requests.today).toLocaleString();
+      const reqColor = reqPct > 80 ? '#f85149' : reqPct > 50 ? '#e3b341' : '#3fb950';
+      const reqBar = document.getElementById('usage-req-bar');
+      const reqTxt = document.getElementById('usage-req-txt');
+      const reqLeftEl = document.getElementById('usage-req-left');
+      if (reqBar) { reqBar.style.width = reqPct + '%'; reqBar.style.background = 'linear-gradient(90deg,' + reqColor + ',#e3b341)'; }
+      if (reqTxt) { reqTxt.textContent = u.requests.today.toLocaleString() + ' / 100,000 (' + reqPct + '%)'; reqTxt.style.color = reqColor; }
+      if (reqLeftEl) { reqLeftEl.textContent = 'còn lại: ' + reqLeft; reqLeftEl.style.color = reqColor; }
+
+      // KV Writes bar
+      const kvPct = Math.min(u.kv.pct, 100);
+      const kvLeft = (u.kv.limit - u.kv.writesToday).toLocaleString();
+      const kvColor = kvPct > 80 ? '#f85149' : kvPct > 50 ? '#e3b341' : '#58a6ff';
+      const kvBar = document.getElementById('usage-kv-bar');
+      const kvTxt = document.getElementById('usage-kv-txt');
+      const kvLeftEl = document.getElementById('usage-kv-left');
+      if (kvBar) { kvBar.style.width = kvPct + '%'; kvBar.style.background = 'linear-gradient(90deg,' + kvColor + ',#f85149)'; }
+      if (kvTxt) { kvTxt.textContent = u.kv.writesToday.toLocaleString() + ' / 1,000 (' + kvPct + '%)'; kvTxt.style.color = kvColor; }
+      if (kvLeftEl) { kvLeftEl.textContent = 'còn lại: ' + kvLeft; kvLeftEl.style.color = kvColor; }
+
+      // D1 Reads bar
+      const d1Pct = Math.min(u.d1.pct, 100);
+      const d1Left = ((u.d1.readLimit - u.d1.readsToday) / 1000000).toFixed(1) + 'M';
+      const d1Color = d1Pct > 80 ? '#f85149' : d1Pct > 30 ? '#e3b341' : '#3fb950';
+      const d1Bar = document.getElementById('usage-d1-bar');
+      const d1Txt = document.getElementById('usage-d1-txt');
+      const d1LeftEl = document.getElementById('usage-d1-left');
+      if (d1Bar) { d1Bar.style.width = d1Pct + '%'; }
+      if (d1Txt) { d1Txt.textContent = (u.d1.readsToday / 1000).toFixed(0) + 'K / 25M (' + d1Pct + '%)'; d1Txt.style.color = d1Color; }
+      if (d1LeftEl) { d1LeftEl.textContent = 'còn lại: ' + d1Left; d1LeftEl.style.color = d1Color; }
+
+      // Quick stats
+      const devD1El = document.getElementById('usage-devices-d1');
+      if (devD1El) devD1El.textContent = u.devices.d1Rows;
+      const cmdEl = document.getElementById('usage-pending-cmds');
+      if (cmdEl) { cmdEl.textContent = u.pendingCommands; cmdEl.style.color = u.pendingCommands > 5 ? '#f85149' : '#e3b341'; }
+      const dayPctEl = document.getElementById('usage-day-pct');
+      if (dayPctEl) dayPctEl.textContent = Math.round(u.dayProgress * 100) + '%';
+
+      // Sparkline 7 days
+      const spark = document.getElementById('usage-sparkline');
+      const sparkLabels = document.getElementById('usage-sparkline-labels');
+      if (spark && u.history && u.history.length) {
+        const maxVal = Math.max(...u.history.map(h => h.count), 1);
+        const barW = Math.floor(spark.offsetWidth > 0 ? (spark.offsetWidth - u.history.length * 4) / u.history.length : 24);
+        let html = '', lblHtml = '';
+        for (const h of u.history) {
+          const heightPct = Math.max(Math.round(h.count / maxVal * 100), 4);
+          const isToday = h.date === u.date;
+          const c = isToday ? '#e3b341' : '#3fb950';
+          html += '<div title="' + h.date + ': ' + h.count.toLocaleString() + ' req" style="flex:1;max-width:' + barW + 'px;min-width:8px;height:' + heightPct + '%;background:' + c + ';border-radius:3px 3px 0 0;opacity:' + (isToday ? '1' : '0.6') + ';cursor:pointer;transition:opacity 0.2s;" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=' + (isToday ? '1' : '0.6') + '"></div>';
+          const dayLabel = h.date.slice(5); // MM-DD
+          lblHtml += '<div style="flex:1;font-size:0.6rem;color:var(--subtext);text-align:center;white-space:nowrap;overflow:hidden;' + (isToday ? 'color:#e3b341;font-weight:700;' : '') + '">' + dayLabel + '</div>';
+        }
+        spark.innerHTML = html;
+        if (sparkLabels) sparkLabels.innerHTML = lblHtml;
+      }
+    } catch(e) { console.warn('Usage stats error:', e); }
+  }
 </script>
+
 </body>
 </html>`;
 
+
+
+
+
+
+
+
+
+const BALANCER_HTML_TEMPLATE = "\n<!DOCTYPE html>\n<html lang=\"vi\">\n<head>\n    <meta charset=\"UTF-8\">\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover\">\n    <meta name=\"apple-mobile-web-app-capable\" content=\"yes\">\n    <meta name=\"apple-mobile-web-app-status-bar-style\" content=\"black-translucent\">\n    <meta name=\"apple-mobile-web-app-title\" content=\"JK Active Balancer\">\n    <meta name=\"format-detection\" content=\"telephone=no\">\n    <meta name=\"theme-color\" content=\"#000000\">\n    <title>JK Active Balancer Monitor</title>\n    <style>\n        :root {\n            --sat: env(safe-area-inset-top, 0px);\n            --sab: env(safe-area-inset-bottom, 0px);\n            --sal: env(safe-area-inset-left, 0px);\n            --sar: env(safe-area-inset-right, 0px);\n            --bg-black: #000000;\n            --card-bg: #121518;\n            --card-border: #1d252c;\n            --green: #00ff2b;\n            --cyan: #38bdf8;\n            --red: #ff3b30;\n            --yellow: #f59e0b;\n            --text-white: #ffffff;\n            --text-sub: #8e8e93;\n            --badge-bg: #0077b6;\n        }\n        * {\n            box-sizing: border-box;\n            margin: 0;\n            padding: 0;\n            font-family: -apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"SF Pro Display\", \"Segoe UI\", Roboto, Helvetica, Arial, sans-serif;\n            -webkit-tap-highlight-color: transparent;\n            -webkit-font-smoothing: antialiased;\n            -moz-osx-font-smoothing: grayscale;\n        }\n        html {\n            background-color: var(--bg-black);\n            -webkit-text-size-adjust: 100%;\n            text-size-adjust: 100%;\n            scroll-behavior: smooth;\n        }\n        body {\n            background-color: var(--bg-black);\n            color: var(--text-white);\n            min-height: 100vh;\n            min-height: -webkit-fill-available;\n            padding-bottom: calc(85px + max(16px, var(--sab)));\n            user-select: none;\n            -webkit-user-select: none;\n            overflow-x: hidden;\n            width: 100%;\n            max-width: 100vw;\n            -webkit-overflow-scrolling: touch;\n        }\n        .app {\n            max-width: 480px;\n            width: 100%;\n            margin: 0 auto;\n            min-height: 100vh;\n            min-height: -webkit-fill-available;\n            position: relative;\n            background: #000;\n            padding-left: max(0px, var(--sal));\n            padding-right: max(0px, var(--sar));\n            overflow-x: hidden;\n        }\n\n        /* Sticky Top Header with Safe Area Inset */\n        .app-header {\n            position: -webkit-sticky;\n            position: sticky;\n            top: 0;\n            z-index: 999;\n            background: rgba(0, 0, 0, 0.88);\n            backdrop-filter: blur(20px);\n            -webkit-backdrop-filter: blur(20px);\n            border-bottom: 1px solid rgba(255, 255, 255, 0.08);\n            padding-top: max(8px, var(--sat));\n            width: 100%;\n            max-width: 100%;\n            overflow: hidden;\n        }\n\n        /* Top Header Bar */\n        .top-bar {\n            display: flex;\n            justify-content: space-between;\n            align-items: center;\n            padding: 10px 12px 6px 12px;\n            background: transparent;\n            gap: 8px;\n            min-width: 0;\n        }\n        .top-bar-left {\n            display: flex;\n            align-items: center;\n            gap: 8px;\n            min-width: 0;\n            flex: 1;\n            overflow: hidden;\n        }\n        .top-bar-right {\n            display: flex;\n            align-items: center;\n            gap: 6px;\n            flex-shrink: 0;\n        }\n        .bt-status { display: flex; align-items: center; gap: 4px; font-size: 1.05rem; color: #555; flex-shrink: 0; }\n        .bt-status.active { color: var(--cyan); }\n        .uptime-txt { font-size: 0.78rem; font-weight: 500; color: #e5e5e5; letter-spacing: 0.2px; font-family: monospace; white-space: nowrap; }\n        .menu-btn { font-size: 1.25rem; color: #fff; cursor: pointer; border: none; background: transparent; padding: 4px; touch-action: manipulation; }\n\n        /* MOS Control Top Bar */\n        .mos-bar {\n            display: flex;\n            justify-content: space-around;\n            align-items: center;\n            background: transparent;\n            padding: 5px 6px 6px 6px;\n            border-top: 1px solid rgba(255,255,255,0.05);\n            font-size: 0.8rem;\n            font-weight: 600;\n            gap: 4px;\n        }\n        .mos-item {\n            display: flex;\n            align-items: center;\n            gap: 5px;\n            cursor: pointer;\n            padding: 4px 8px;\n            border-radius: 6px;\n            background: rgba(255,255,255,0.03);\n            touch-action: manipulation;\n            transition: transform 0.1s, opacity 0.1s;\n        }\n        .mos-item:active { transform: scale(0.95); opacity: 0.8; }\n        .dot { width: 7px; height: 7px; border-radius: 50%; background: #444; flex-shrink: 0; }\n        .dot.on { background: var(--green); box-shadow: 0 0 6px var(--green); }\n        .dot.off { background: var(--red); box-shadow: 0 0 6px var(--red); }\n        .dot.standby { background: var(--cyan); box-shadow: 0 0 6px var(--cyan); }\n        .val-on { color: var(--green); font-weight: bold; }\n        .val-off { color: var(--red); font-weight: bold; }\n        .val-standby { color: var(--cyan); font-weight: bold; }\n\n        /* Gauge Section */\n        .gauge-section { position: relative; width: 100%; text-align: center; padding: 10px 0 4px 0; overflow: hidden; }\n        .gauge-svg { width: 250px; height: 215px; max-width: 100%; }\n        .gauge-center-val { position: absolute; top: 38%; left: 50%; transform: translate(-50%, -50%); text-align: center; }\n        .gauge-soc { font-size: 3.4rem; font-weight: 800; color: var(--green); text-shadow: 0 0 16px rgba(0,255,43,0.35); line-height: 1; }\n        .gauge-pills { position: absolute; top: 68%; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; gap: 6px; width: 150px; }\n        .pill-badge { background: #000; border: 1.8px solid var(--green); color: var(--green); font-size: 1.15rem; font-weight: 800; padding: 4px 14px; border-radius: 20px; text-shadow: 0 0 8px rgba(0,255,43,0.25); letter-spacing: 0.5px; }\n\n        /* Notification Banner */\n        .status-banner { margin: 8px 12px; background: rgba(5,35,41,0.85); border: 1px solid #008b99; border-radius: 12px; padding: 8px 12px; display: flex; align-items: center; gap: 8px; font-size: 0.82rem; color: #e2e8f0; min-width: 0; }\n        .banner-icon { color: var(--green); font-size: 1.1rem; flex-shrink: 0; }\n\n        /* Metrics Grids (4 columns - Responsive Non-overflowing) */\n        .metrics-grid-4 {\n            display: grid;\n            grid-template-columns: repeat(4, minmax(0, 1fr));\n            gap: 2px;\n            margin: 8px 12px;\n            background: var(--card-bg);\n            border: 1px solid var(--card-border);\n            border-radius: 14px;\n            padding: 10px 4px;\n            text-align: center;\n        }\n        .metric-item {\n            display: flex;\n            flex-direction: column;\n            align-items: center;\n            justify-content: center;\n            position: relative;\n            padding: 2px 0;\n            min-width: 0;\n            overflow: hidden;\n        }\n        .metric-item:not(:last-child)::after { content: ''; position: absolute; right: 0; top: 15%; height: 70%; width: 1px; background: #222d35; }\n        .metric-val {\n            font-size: 1.05rem;\n            font-weight: 800;\n            margin-bottom: 2px;\n            white-space: nowrap;\n            letter-spacing: -0.3px;\n            max-width: 100%;\n            overflow: hidden;\n            text-overflow: ellipsis;\n        }\n        .metric-lbl {\n            font-size: 0.62rem;\n            color: var(--text-sub);\n            white-space: nowrap;\n            max-width: 100%;\n            overflow: hidden;\n            text-overflow: ellipsis;\n        }\n\n        /* Power & Status Card */\n        .info-card-box {\n            margin: 8px 12px;\n            background: var(--card-bg);\n            border: 1px solid var(--card-border);\n            border-radius: 14px;\n            padding: 10px 12px;\n            font-size: 0.84rem;\n            min-width: 0;\n        }\n        .card-row {\n            display: flex;\n            justify-content: space-between;\n            align-items: flex-start;\n            padding: 5px 0;\n            gap: 8px;\n            min-width: 0;\n        }\n        .card-row > span:first-child {\n            color: #94a3b8;\n            font-size: 0.82rem;\n            flex-shrink: 0;\n            max-width: 48%;\n            line-height: 1.3;\n        }\n        .card-row > strong, .card-row > span:last-child {\n            text-align: right;\n            word-break: break-word;\n            overflow-wrap: anywhere;\n            min-width: 0;\n            font-size: 0.82rem;\n            line-height: 1.3;\n        }\n        .card-divider { height: 1px; background: #222d35; margin: 6px 0; }\n\n        /* Real-time Detailed Status List */\n        .realtime-title {\n            color: var(--green);\n            font-size: 0.88rem;\n            font-weight: 700;\n            margin: 12px 14px 8px 14px;\n            display: flex;\n            align-items: center;\n            gap: 6px;\n        }\n        .realtime-grid {\n            display: grid;\n            grid-template-columns: repeat(2, minmax(0, 1fr));\n            gap: 6px 12px;\n            margin: 0 12px;\n            font-size: 0.8rem;\n        }\n        .rt-row {\n            display: flex;\n            justify-content: space-between;\n            align-items: center;\n            border-bottom: 1px solid #141a20;\n            padding-bottom: 4px;\n            min-width: 0;\n            gap: 4px;\n        }\n        .rt-lbl {\n            color: #8fa0ab;\n            font-size: 0.75rem;\n            white-space: nowrap;\n            overflow: hidden;\n            text-overflow: ellipsis;\n            min-width: 0;\n            flex-shrink: 1;\n        }\n        .rt-val {\n            color: var(--green);\n            font-weight: 700;\n            font-size: 0.78rem;\n            white-space: nowrap;\n            flex-shrink: 0;\n            text-align: right;\n        }\n        .unit-sup { font-size: 0.65rem; font-weight: normal; vertical-align: super; margin-left: 1px; }\n\n        /* Modern Section Headers */\n        .section-hdr { display: flex; justify-content: space-between; align-items: center; margin: 14px 12px 6px 12px; padding: 0 2px; }\n        .hdr-title-wrap { display: flex; align-items: center; gap: 8px; min-width: 0; }\n        .hdr-icon-box { width: 28px; height: 28px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 0.9rem; flex-shrink: 0; }\n        .hdr-icon-box.cell-icon { background: rgba(56, 189, 248, 0.15); border: 1px solid rgba(56, 189, 248, 0.35); color: #38bdf8; }\n        .hdr-icon-box.wire-icon { background: rgba(168, 85, 247, 0.15); border: 1px solid rgba(168, 85, 247, 0.35); color: #c084fc; }\n        .hdr-icon-box.prot-icon { background: rgba(16, 185, 129, 0.15); border: 1px solid rgba(16, 185, 129, 0.35); color: #34d399; }\n        .hdr-title { font-size: 0.88rem; font-weight: 700; color: #f1f5f9; line-height: 1.2; }\n        .hdr-subtitle { font-size: 0.68rem; color: #94a3b8; font-weight: 500; }\n        .hdr-badges { display: flex; gap: 4px; align-items: center; flex-shrink: 0; }\n        .stat-pill { font-size: 0.64rem; font-weight: 700; padding: 2px 6px; border-radius: 10px; font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, monospace; white-space: nowrap; }\n        .stat-pill.max-pill { background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3); }\n        .stat-pill.min-pill { background: rgba(244, 63, 94, 0.15); color: #fb7185; border: 1px solid rgba(244, 63, 94, 0.3); }\n        .stat-pill.neutral-pill { background: rgba(148, 163, 184, 0.15); color: #cbd5e1; border: 1px solid rgba(148, 163, 184, 0.3); }\n\n        /* Authentic JK App Styling for Cell Voltages & Wire Resistance */\n        .jk-bat-summary {\n            display: flex;\n            justify-content: space-between;\n            align-items: center;\n            flex-wrap: wrap;\n            gap: 4px 10px;\n            padding: 8px 14px 2px 14px;\n            font-size: 0.84rem;\n            font-weight: 700;\n            color: #ffffff;\n        }\n        .jk-bat-summary > span {\n            display: inline-flex;\n            align-items: center;\n        }\n        .jk-bat-summary .jk-dot, .jk-section-title .jk-dot {\n            display: inline-block;\n            width: 7px;\n            height: 7px;\n            border-radius: 50%;\n            background: #00ff2b;\n            box-shadow: 0 0 6px rgba(0, 255, 43, 0.6);\n            margin-right: 6px;\n            flex-shrink: 0;\n        }\n        .jk-bat-summary .unit, .jk-section-title .unit { color: #00ff2b; font-weight: 600; }\n        .jk-bat-summary .val { color: #00ff2b; font-family: -apple-system, BlinkMacSystemFont, \"SF Pro Display\", monospace; font-size: 0.92rem; font-weight: 700; }\n        .jk-divider { height: 1px; background: #1c2630; margin: 8px 14px; }\n\n        .jk-section-title {\n            color: #ffffff;\n            font-size: 0.88rem;\n            font-weight: 700;\n            margin: 10px 14px 6px 14px;\n            display: flex;\n            align-items: center;\n            gap: 2px;\n        }\n        .jk-section-title .colon { color: #ffffff; margin-left: 2px; }\n\n        .jk-grid-3 {\n            display: grid;\n            grid-template-columns: repeat(3, minmax(0, 1fr));\n            column-gap: 4px;\n            row-gap: 8px;\n            margin: 8px 10px 12px 10px;\n        }\n        .jk-cell-item {\n            display: flex;\n            align-items: center;\n            gap: 3px;\n            background: transparent;\n            border: none;\n            padding: 0;\n            min-height: 20px;\n            min-width: 0;\n            overflow: hidden;\n        }\n        .jk-num-badge {\n            background: #14556b;\n            color: #5eead4;\n            min-width: 18px;\n            height: 18px;\n            padding: 0 2px;\n            border-radius: 4px;\n            display: inline-flex;\n            align-items: center;\n            justify-content: center;\n            font-size: 0.68rem;\n            font-weight: 700;\n            font-family: -apple-system, BlinkMacSystemFont, monospace;\n            flex-shrink: 0;\n        }\n        .jk-val-txt {\n            font-size: 0.88rem;\n            font-weight: 700;\n            color: #00ff2b;\n            font-family: -apple-system, BlinkMacSystemFont, \"SF Pro Display\", monospace;\n            font-variant-numeric: tabular-nums;\n            letter-spacing: -0.3px;\n            line-height: 1;\n            white-space: nowrap;\n            overflow: hidden;\n            text-overflow: clip;\n            flex-shrink: 1;\n            min-width: 0;\n        }\n        .jk-val-txt.min { color: #ff0033; }\n        .jk-val-txt.max { color: #00e5ff; }\n        .jk-bal-tag {\n            font-size: 0.58rem;\n            margin-left: 1px;\n            flex-shrink: 0;\n            white-space: nowrap;\n        }\n\n        /* Protection Grid - Chu\u1ea9n Zin JK Active Balancer */\n        .protection-grid {\n            display: grid;\n            grid-template-columns: repeat(2, minmax(0, 1fr));\n            gap: 6px;\n            margin: 8px 12px 14px 12px;\n        }\n        .prot-item {\n            background: var(--card-bg);\n            border: 1px solid var(--card-border);\n            border-radius: 8px;\n            padding: 6px 8px;\n            display: flex;\n            align-items: center;\n            justify-content: space-between;\n            font-size: 0.78rem;\n        }\n        .prot-lbl { color: #aaa; }\n        .prot-badge { padding: 2px 7px; border-radius: 4px; font-size: 0.7rem; font-weight: 700; }\n        .prot-badge.ok { background: rgba(0, 255, 43, 0.15); color: var(--green); border: 1px solid rgba(0,255,43,0.3); }\n        .prot-badge.alarm { background: rgba(255, 59, 48, 0.25); color: var(--red); border: 1px solid var(--red); animation: pulseAlert 1s infinite; }\n        @keyframes pulseAlert { 0%, 100% { opacity: 0.7; } 50% { opacity: 1; } }\n\n        /* Tab Content Display */\n        .tab-content { display: none; }\n        .tab-content.active { display: block; }\n\n        /* Settings Card Form Elements */\n        .sett-card { background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 14px; padding: 16px; margin: 12px 14px; }\n        .form-group { margin-bottom: 14px; }\n        label { display: block; font-size: 0.82rem; color: var(--text-sub); margin-bottom: 6px; font-weight: 500; }\n        input, select, textarea {\n            width: 100%;\n            padding: 12px 14px;\n            border-radius: 10px;\n            border: 1px solid #2a343d;\n            background: #090c0e;\n            color: #fff;\n            font-size: 16px !important; /* CRITICAL: Ng\u0103n iOS Safari t\u1ef1 zoom khi focus */\n            -webkit-appearance: none;\n            appearance: none;\n            outline: none;\n            -webkit-user-select: text !important;\n            user-select: text !important;\n            transition: border-color 0.2s, box-shadow 0.2s;\n            box-sizing: border-box;\n        }\n        input:focus, select:focus, textarea:focus {\n            border-color: var(--cyan);\n            box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.25);\n        }\n        input::placeholder { color: #555; }\n        .selectable, #lbl-monitor-url, #lbl-wifi-ip, #lbl-ble-mac, #head-sn, [onclick*=\"select\"], input[readonly] {\n            -webkit-user-select: text !important;\n            user-select: text !important;\n        }\n        button.btn {\n            width: 100%;\n            min-height: 44px;\n            padding: 12px 16px;\n            border: none;\n            border-radius: 10px;\n            background: linear-gradient(135deg, #0284c7, #0369a1);\n            color: #fff;\n            font-weight: 700;\n            cursor: pointer;\n            font-size: 0.95rem;\n            margin-top: 6px;\n            display: inline-flex;\n            align-items: center;\n            justify-content: center;\n            gap: 6px;\n            touch-action: manipulation;\n            transition: transform 0.1s ease, opacity 0.1s ease;\n        }\n        button.btn:active, .btn-sec:active { transform: scale(0.97); opacity: 0.85; }\n        button.btn-sec { background: rgba(255,255,255,0.08); border: 1px solid #2a343d; }\n        .list-item { display: flex; justify-content: space-between; align-items: center; padding: 12px; background: #090c0e; border-radius: 10px; margin-bottom: 8px; border: 1px solid #1e262c; }\n        .list-item button { min-height: 36px; touch-action: manipulation; }\n\n        /* Bottom Nav Bar with Safe Area Inset */\n        .bottom-nav {\n            position: fixed;\n            bottom: 0;\n            left: 50%;\n            transform: translateX(-50%);\n            width: 100%;\n            max-width: 480px;\n            background: rgba(10, 14, 18, 0.88);\n            backdrop-filter: blur(20px);\n            -webkit-backdrop-filter: blur(20px);\n            border-top: 1px solid rgba(255, 255, 255, 0.08);\n            display: flex;\n            justify-content: space-around;\n            padding-top: 6px;\n            padding-bottom: max(14px, var(--sab));\n            padding-left: var(--sal);\n            padding-right: var(--sar);\n            z-index: 1000;\n        }\n        .nav-btn {\n            display: flex;\n            flex-direction: column;\n            align-items: center;\n            color: #71717a;\n            font-size: 0.72rem;\n            font-weight: 600;\n            cursor: pointer;\n            border: none;\n            background: transparent;\n            width: 33%;\n            padding: 4px 0;\n            touch-action: manipulation;\n            transition: color 0.15s ease, transform 0.1s ease;\n        }\n        .nav-btn:active { transform: scale(0.92); }\n        .nav-btn.active { color: var(--green); }\n        .nav-icon { font-size: 1.3rem; margin-bottom: 2px; }\n    \n        .btn-ok {\n            background: #222;\n            color: var(--green);\n            border: 1px solid var(--green);\n            padding: 5px 12px;\n            border-radius: 6px;\n            font-weight: 800;\n            font-size: 0.82rem;\n            cursor: pointer;\n            transition: all 0.15s ease;\n        }\n        .btn-ok:hover { background: var(--green); color: #000; }\n        .btn-ok:active { transform: scale(0.92); }\n\n    </style>\n</head>\n<body>\n    <div class=\"app\">\n        <!-- STICKY TOP HEADER (PROTECTED FROM PHONE STATUS BAR) -->\n        <header class=\"app-header\">\n            <!-- TOP HEADER BAR -->\n            <div class=\"top-bar\">\n                <div class=\"top-bar-left\">\n                    <a id=\"cloud-back-btn\" href=\"/\" style=\"display:none; color:var(--text-sub); text-decoration:none; font-size:1.15rem; padding:2px 8px; margin-right:6px; font-weight:bold; border-radius:6px; background:rgba(255,255,255,0.08); align-items:center; line-height:1;\" title=\"Quay l\u1ea1i Danh S\u00e1ch Thi\u1ebft B\u1ecb\">\u2190</a>\n                    <div id=\"bt-icon-head\" class=\"bt-status active\" title=\"Connection Status\">\u26a1</div>\n                    <div style=\"min-width:0; flex:1; overflow:hidden;\">\n                        <div id=\"head-bms-name\" style=\"font-weight:bold; font-size:0.92rem; color:#fff; line-height:1.2; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:145px;\">JK Active Balancer</div>\n                        <div id=\"head-sn\" style=\"font-size:0.68rem; color:var(--text-sub); font-family:monospace; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;\">SN: \u2014</div>\n                        <div id=\"esp-online-badge\" style=\"font-size:0.68rem; font-weight:700; color:#00ff2b; display:flex; align-items:center; gap:4px; margin-top:2px;\">\n                            <span id=\"esp-online-dot\" style=\"display:inline-block; width:6px; height:6px; border-radius:50%; background:#00ff2b; box-shadow:0 0 5px #00ff2b;\"></span>\n                            <span id=\"esp-online-txt\">ESP Online</span>\n                        </div>\n                    </div>\n                </div>\n                <div class=\"top-bar-right\">\n                    <div id=\"uptime-display\" class=\"uptime-txt\">0d 00h 00m 00s</div>\n                    <button class=\"menu-btn\" onclick=\"showTab('tab-settings', document.getElementById('nav-sett'))\">\u2630</button>\n                </div>\n            </div>\n\n            <!-- BALANCER CONTROLS TOP BAR -->\n            <div class=\"mos-bar\" style=\"justify-content:center; padding:6px 14px;\">\n                <div class=\"mos-item\" onclick=\"toggleBalance()\" style=\"cursor:pointer; flex:1; max-width:280px; justify-content:center;\">\n                    <span style=\"font-weight:700;\">\u2696\ufe0f C\u00e2n B\u1eb1ng (Balance)</span>\n                    <div id=\"dot-balance\" class=\"dot on\"></div>\n                    <span id=\"txt-balance\" class=\"val-on\">ON</span>\n                </div>\n            </div>\n        </header>\n\n        <!-- ==================== TAB 1: HOME (DASHBOARD) ==================== -->\n        <div id=\"tab-home\" class=\"tab-content active\">\n            <!-- CIRCULAR GAUGE WIDGET (DELTA VOLTAGE & PACK STATUS) -->\n            <div class=\"gauge-section\" style=\"text-align:center; padding:10px 0;\">\n                <svg class=\"gauge-svg\" viewBox=\"0 0 200 185\" style=\"width:250px; height:230px; margin:0 auto; display:block;\">\n                    <defs>\n                        <linearGradient id=\"gaugeGrad\" x1=\"0%\" y1=\"0%\" x2=\"100%\" y2=\"100%\">\n                            <stop offset=\"0%\" stop-color=\"#00e5ff\"/>\n                            <stop offset=\"100%\" stop-color=\"#00ff2b\"/>\n                        </linearGradient>\n                        <filter id=\"neonGlow\" x=\"-20%\" y=\"-20%\" width=\"140%\" height=\"140%\">\n                            <feGaussianBlur stdDeviation=\"2.5\" result=\"blur\"/>\n                            <feMerge>\n                                <feMergeNode in=\"blur\"/>\n                                <feMergeNode in=\"SourceGraphic\"/>\n                            </feMerge>\n                        </filter>\n                    </defs>\n                    <!-- Background Track Arc (240 deg, R=68) -->\n                    <path d=\"M 41.1,110 A 68,68 0 1,1 158.9,110\" fill=\"none\" stroke=\"#141c22\" stroke-width=\"12\" stroke-linecap=\"round\"/>\n                    <!-- Dotted Guide Ring -->\n                    <circle cx=\"100\" cy=\"76\" r=\"54\" fill=\"none\" stroke=\"#222f38\" stroke-width=\"1\" stroke-dasharray=\"2 4\"/>\n                    <!-- Active Balance Delta Arc (Length = 284.8) -->\n                    <path id=\"gauge-arc\" d=\"M 41.1,110 A 68,68 0 1,1 158.9,110\" fill=\"none\" stroke=\"url(#gaugeGrad)\" stroke-width=\"12\" stroke-linecap=\"round\" stroke-dasharray=\"284.8 350\" stroke-dashoffset=\"284.8\" style=\"transition: stroke-dashoffset 0.6s ease;\" filter=\"url(#neonGlow)\"/>\n\n                    <!-- Label above Delta -->\n                    <text x=\"100\" y=\"50\" text-anchor=\"middle\" dominant-baseline=\"central\" fill=\"#8e8e93\" font-size=\"10\" font-weight=\"700\" font-family=\"-apple-system, sans-serif\" letter-spacing=\"1\">\u0110\u1ed8 L\u1ec6CH CELL</text>\n\n                    <!-- Center Delta mV Text -->\n                    <text id=\"home-soc-txt\" x=\"100\" y=\"76\" text-anchor=\"middle\" dominant-baseline=\"central\" fill=\"#00ff2b\" font-size=\"34\" font-weight=\"900\" font-family=\"-apple-system, sans-serif\" filter=\"url(#neonGlow)\">0 mV</text>\n\n                    <!-- Subtitle below Delta -->\n                    <text id=\"home-delta-sub\" x=\"100\" y=\"100\" text-anchor=\"middle\" dominant-baseline=\"central\" fill=\"#38bdf8\" font-size=\"11\" font-weight=\"700\" font-family=\"-apple-system, sans-serif\">\u0394: 0.000 V</text>\n\n                    <!-- Pill 1: Total Pack Voltage Badge -->\n                    <g transform=\"translate(100, 126)\">\n                        <rect x=\"-70\" y=\"-12\" width=\"140\" height=\"24\" rx=\"12\" fill=\"#000000\" stroke=\"#00ff2b\" stroke-width=\"1.8\"/>\n                        <text id=\"home-v-pill\" x=\"0\" y=\"1\" text-anchor=\"middle\" dominant-baseline=\"central\" fill=\"#00ff2b\" font-size=\"13\" font-weight=\"800\" font-family=\"-apple-system, sans-serif\">T\u1ed5ng: 0.00 V</text>\n                    </g>\n\n                    <!-- Pill 2: Balancing Current Badge -->\n                    <g transform=\"translate(100, 156)\">\n                        <rect x=\"-70\" y=\"-12\" width=\"140\" height=\"24\" rx=\"12\" fill=\"#000000\" stroke=\"#38bdf8\" stroke-width=\"1.8\"/>\n                        <text id=\"home-a-pill\" x=\"0\" y=\"1\" text-anchor=\"middle\" dominant-baseline=\"central\" fill=\"#38bdf8\" font-size=\"13\" font-weight=\"800\" font-family=\"-apple-system, sans-serif\">D\u00f2ng C\u00e2n: 0.00 A</text>\n                    </g>\n                </svg>\n            </div>\n\n            <!-- STATUS NOTIFICATION BANNER -->\n            <div id=\"status-banner\" class=\"status-banner\">\n                <span id=\"banner-icon\" class=\"banner-icon\">\u2714</span>\n                <span id=\"banner-msg\">The battery is functioning properly.</span>\n            </div>\n\n\n\n            <!-- KEY METRICS GRID 1 (4 Columns) -->\n            <div class=\"metrics-grid-4\">\n                <div class=\"metric-item\">\n                    <div id=\"m-high-v\" class=\"metric-val\" style=\"color:var(--cyan);\">0.000</div>\n                    <div class=\"metric-lbl\">High Cell(V):</div>\n                </div>\n                <div class=\"metric-item\">\n                    <div id=\"m-low-v\" class=\"metric-val\" style=\"color:var(--red);\">0.000</div>\n                    <div class=\"metric-lbl\">Low Cell(V):</div>\n                </div>\n                <div class=\"metric-item\">\n                    <div id=\"m-diff-v\" class=\"metric-val\" style=\"color:var(--green);\">0.000</div>\n                    <div class=\"metric-lbl\">Volt.-Diff(V):</div>\n                </div>\n                <div class=\"metric-item\">\n                    <div id=\"m-bal-a\" class=\"metric-val\" style=\"color:var(--green);\">0.000</div>\n                    <div class=\"metric-lbl\">Bal.-Curr.(A):</div>\n                </div>\n            </div>\n\n            <!-- KEY METRICS GRID 2 (NO TEMPERATURE) -->\n            <div class=\"metrics-grid-4\">\n                <div class=\"metric-item\">\n                    <div id=\"m-cell-avg\" class=\"metric-val\" style=\"color:var(--green);\">0.000</div>\n                    <div class=\"metric-lbl\">Cell AVG(V):</div>\n                </div>\n                <div class=\"metric-item\">\n                    <div id=\"m-cap-ah\" class=\"metric-val\" style=\"color:var(--cyan);\">0S</div>\n                    <div class=\"metric-lbl\">S\u1ed1 Cell Pin:</div>\n                </div>\n                <div class=\"metric-item\">\n                    <div id=\"m-cell-min-badge\" class=\"metric-val\" style=\"color:var(--red);\">#0</div>\n                    <div class=\"metric-lbl\">Low Cell:</div>\n                </div>\n                <div class=\"metric-item\">\n                    <div id=\"m-soh\" class=\"metric-val\" style=\"color:var(--green);\">0.000 \u03a9</div>\n                    <div class=\"metric-lbl\">Tr\u1edf D\u00e2y TB:</div>\n                </div>\n            </div>\n\n            <!-- ACTIVE BALANCER STATUS CARD (NO TEMPERATURE) -->\n            <div class=\"info-card-box\" style=\"margin-bottom:20px;\">\n                <div class=\"card-row\">\n                    <span>\u26a1 D\u00f2ng C\u00e2n B\u1eb1ng: <strong id=\"card-curr-val\" style=\"color:var(--cyan); margin-left:4px;\">0.000 A</strong></span>\n                    <span>\ud83d\udd0b D\u1ea3i Ho\u1ea1t \u0110\u1ed9ng: <strong style=\"color:var(--green); margin-left:4px;\">1S - 24S (Auto)</strong></span>\n                </div>\n                <div class=\"card-divider\"></div>\n                <div class=\"card-row\">\n                    <span>\ud83d\udd3b Cell Th\u1ea5p Nh\u1ea5t: <strong id=\"card-cell-min\" style=\"color:var(--red); margin-left:4px;\">\u2014</strong></span>\n                    <span>\ud83d\udd3a Cell Cao Nh\u1ea5t: <strong id=\"card-cell-max\" style=\"color:var(--cyan); margin-left:4px;\">\u2014</strong></span>\n                </div>\n                <div class=\"card-divider\"></div>\n                <div class=\"card-row\">\n                    <span>\ud83d\udd52 Tr\u1ea1ng Th\u00e1i: <strong id=\"card-status-txt\" style=\"color:var(--green); margin-left:4px;\">\u0110ang C\u00e2n B\u1eb1ng</strong></span>\n                    <span>\ud83d\udd0c C\u1ed5ng Giao Ti\u1ebfp: <strong id=\"card-port-txt\" style=\"color:var(--cyan); margin-left:4px;\">UART TTL (C\u1ed5ng LCD JK)</strong></span>\n                </div>\n            </div>\n        </div>\n\n        <!-- ==================== TAB 2: STATUS (REALTIME & CELLS) ==================== -->\n        <div id=\"tab-status\" class=\"tab-content\">\n            <div class=\"realtime-title\">\ud83d\udfe2 \u2022 Th\u00f4ng S\u1ed1 Ho\u1ea1t \u0110\u1ed9ng C\u00e2n B\u1eb1ng Realtime</div>\n            <div class=\"realtime-grid\">\n                <div class=\"rt-row\"><span class=\"rt-lbl\">T\u1ed5ng \u0110i\u1ec7n \u00c1p Pack:</span><span class=\"rt-val\" id=\"rt-bat-v\" style=\"color:var(--green); font-weight:700;\">0.00 V</span></div>\n                <div class=\"rt-row\"><span class=\"rt-lbl\">\u0110i\u1ec7n \u00c1p TB (Cell AVG):</span><span class=\"rt-val\" id=\"rt-avg\" style=\"color:var(--green); font-weight:700;\">0.000 V</span></div>\n\n                <div class=\"rt-row\"><span class=\"rt-lbl\">\u0110\u1ed9 L\u1ec7ch Cell (Delta):</span><span class=\"rt-val\" id=\"rt-diff\" style=\"color:var(--green); font-weight:700;\">0 mV (0.000 V)</span></div>\n                <div class=\"rt-row\"><span class=\"rt-lbl\">D\u00f2ng C\u00e2n B\u1eb1ng:</span><span class=\"rt-val\" id=\"rt-balcurr\" style=\"color:var(--cyan); font-weight:700;\">0.000 A</span></div>\n\n                <div class=\"rt-row\"><span class=\"rt-lbl\">Cell Th\u1ea5p Nh\u1ea5t (Min):</span><span class=\"rt-val\" id=\"rt-min-cell\" style=\"color:var(--red); font-weight:700;\">\u2014</span></div>\n                <div class=\"rt-row\"><span class=\"rt-lbl\">Cell Cao Nh\u1ea5t (Max):</span><span class=\"rt-val\" id=\"rt-max-cell\" style=\"color:var(--cyan); font-weight:700;\">\u2014</span></div>\n\n                <div class=\"rt-row\"><span class=\"rt-lbl\">S\u1ed1 Cell Nh\u1eadn Di\u1ec7n:</span><span class=\"rt-val\" id=\"rt-cell-count\" style=\"font-weight:700;\">0S</span></div>\n                <div class=\"rt-row\"><span class=\"rt-lbl\">C\u00f4ng T\u1eafc C\u00e2n B\u1eb1ng:</span><span id=\"rt-balancer\" class=\"rt-val\" style=\"color:var(--green); font-weight:700;\">B\u1eacT (ON)</span></div>\n                <div class=\"rt-row\"><span class=\"rt-lbl\">\u00c1p B\u1eaft \u0110\u1ea7u C\u00e2n (Start Vol):</span><span class=\"rt-val\" id=\"rt-start-v\" style=\"color:var(--green); font-weight:700;\">2.70 V</span></div>\n\n                <div class=\"rt-row\"><span class=\"rt-lbl\">Tr\u1edf D\u00e2y Nh\u1ecf Nh\u1ea5t:</span><span class=\"rt-val\" id=\"rt-min-wire\" style=\"font-weight:700;\">0.000 \u03a9</span></div>\n                <div class=\"rt-row\"><span class=\"rt-lbl\">Tr\u1edf D\u00e2y L\u1edbn Nh\u1ea5t:</span><span class=\"rt-val\" id=\"rt-max-wire\" style=\"font-weight:700;\">0.000 \u03a9</span></div>\n\n                <div class=\"rt-row\"><span class=\"rt-lbl\">Tr\u1edf D\u00e2y Trung B\u00ecnh:</span><span class=\"rt-val\" id=\"rt-avg-wire\" style=\"font-weight:700;\">0.000 \u03a9</span></div>\n                <div class=\"rt-row\"><span class=\"rt-lbl\">Th\u1eddi Gian Ch\u1ea1y:</span><span class=\"rt-val\" id=\"rt-runtime\" style=\"font-weight:700;\">0d 0h</span></div>\n            </div>\n\n\n\n            <div class=\"jk-section-title\"><span class=\"jk-dot\"></span>Cell Voltages <span class=\"unit\">(V)</span> <span class=\"colon\">:</span></div>\n            <div id=\"cells-grid-3\" class=\"jk-grid-3\"></div>\n\n            <div class=\"jk-divider\"></div>\n\n            <div class=\"jk-section-title\"><span class=\"jk-dot\"></span>Balance Wire Resistance <span class=\"unit\">(\u03a9)</span> <span class=\"colon\">:</span></div>\n            <div id=\"wire-grid-3\" class=\"jk-grid-3\"></div>\n\n            <div class=\"jk-divider\"></div>\n\n\n\n            <div class=\"realtime-title\" style=\"margin-top:18px;\">\ud83d\udccb \u2022 Th\u00f4ng Tin M\u1ea1ch C\u00e2n B\u1eb1ng (Device Information) :</div>\n            <div class=\"info-card-box\" style=\"margin-bottom:16px;\">\n                <div class=\"card-row\"><span>M\u1ea1ch C\u00e2n B\u1eb1ng:</span><strong id=\"dev-info-model\" style=\"color:var(--cyan)\">JK Active Balancer (1S - 24S)</strong></div>\n                <div class=\"card-row\"><span>M\u00e3 Thi\u1ebft B\u1ecb (ID):</span><strong id=\"dev-info-sn\" style=\"color:#fff; font-family:monospace;\">\u2014</strong></div>\n                <div class=\"card-row\"><span>Ph\u1ea7n C\u1ee9ng (HW):</span><strong id=\"dev-info-hw\" style=\"color:#fff\">JK-B1A24S / JK-B2A24S</strong></div>\n                <div class=\"card-row\"><span>B\u1ea3n Firmware ESP:</span><strong id=\"dev-info-sw\" style=\"color:var(--green)\">v1.0.0-BALANCER-LCD</strong></div>\n                <div class=\"card-row\"><span>Chu\u1ea9n Giao Ti\u1ebfp:</span><strong id=\"dev-info-family\" style=\"color:var(--green)\">DWIN DGUS TTL (C\u1ed5ng LCD JK)</strong></div>\n\n            </div>\n        </div>\n\n        <!-- ==================== TAB 3: SETTINGS (BLE & WIFI CONFIG) ==================== -->\n        <div id=\"tab-settings\" class=\"tab-content\">\n            <!-- OFFICIAL JK BALANCER SETTINGS CARD -->\n            <div class=\"sett-card\" style=\"margin-bottom:14px; border:1px solid rgba(0,255,43,0.3); background:rgba(10,18,14,0.85); border-radius:12px; padding:14px;\">\n                <h3 style=\"color:var(--green); margin-bottom:14px; font-size:1.05rem; display:flex; align-items:center; gap:8px;\">\n                    <span>\u2699\ufe0f</span> Th\u00f4ng S\u1ed1 M\u1ea1ch C\u00e2n B\u1eb1ng (JK Balancer Settings)\n                </h3>\n                \n                <div style=\"font-size:0.75rem; color:#8e8e93; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:6px; font-weight:700;\">\ud83d\udfe2 Core Parameters</div>\n                <div class=\"list-item\" style=\"display:flex; justify-content:space-between; align-items:center; padding:8px 12px; margin-bottom:8px; background:rgba(0,0,0,0.5); border-radius:8px;\">\n                    <span style=\"color:#fff; font-size:0.88rem;\">Cell Count(s):</span>\n                    <div style=\"display:flex; align-items:center; gap:8px;\">\n                        <input type=\"number\" id=\"inp-cell-count\" min=\"2\" max=\"24\" value=\"6\" style=\"width:70px; background:#000; border:1px solid #444; color:var(--green); font-weight:800; font-family:monospace; text-align:center; padding:5px 6px; border-radius:6px; font-size:0.95rem;\">\n                        <button onclick=\"saveBalancerParam('set_cell_count', 'inp-cell-count')\" class=\"btn-ok\">OK</button>\n                    </div>\n                </div>\n\n                <div style=\"font-size:0.75rem; color:#8e8e93; text-transform:uppercase; letter-spacing:0.5px; margin:14px 0 6px; font-weight:700;\">\ud83d\udd3b Active Balancer</div>\n                <div class=\"list-item\" style=\"display:flex; justify-content:space-between; align-items:center; padding:8px 12px; margin-bottom:8px; background:rgba(0,0,0,0.5); border-radius:8px;\">\n                    <span style=\"color:#fff; font-size:0.88rem;\">Balancer (C\u00f4ng t\u1eafc c\u00e2n b\u1eb1ng):</span>\n                    <button id=\"btn-bal-toggle-sett\" onclick=\"toggleBalance()\" style=\"background:#222; border:1px solid #444; color:var(--yellow); font-weight:800; padding:6px 18px; border-radius:14px; cursor:pointer; font-size:0.85rem;\">OFF</button>\n                </div>\n                <div class=\"list-item\" style=\"display:flex; justify-content:space-between; align-items:center; padding:8px 12px; margin-bottom:8px; background:rgba(0,0,0,0.5); border-radius:8px;\">\n                    <span style=\"color:#fff; font-size:0.88rem;\">Bal. Delta Volt.(V):</span>\n                    <div style=\"display:flex; align-items:center; gap:8px;\">\n                        <input type=\"number\" id=\"inp-bal-delta\" step=\"0.001\" min=\"0.001\" max=\"1.000\" value=\"0.003\" style=\"width:70px; background:#000; border:1px solid #444; color:var(--green); font-weight:800; font-family:monospace; text-align:center; padding:5px 6px; border-radius:6px; font-size:0.95rem;\">\n                        <button onclick=\"saveBalancerParam('set_delta_volt', 'inp-bal-delta')\" class=\"btn-ok\">OK</button>\n                    </div>\n                </div>\n                <div class=\"list-item\" style=\"display:flex; justify-content:space-between; align-items:center; padding:8px 12px; margin-bottom:8px; background:rgba(0,0,0,0.5); border-radius:8px;\">\n                    <span style=\"color:#fff; font-size:0.88rem;\">Bal. Start Volt.(V):</span>\n                    <div style=\"display:flex; align-items:center; gap:8px;\">\n                        <input type=\"number\" id=\"inp-bal-start\" step=\"0.01\" min=\"1.50\" max=\"4.50\" value=\"3.00\" style=\"width:70px; background:#000; border:1px solid #444; color:var(--green); font-weight:800; font-family:monospace; text-align:center; padding:5px 6px; border-radius:6px; font-size:0.95rem;\">\n                        <button onclick=\"saveBalancerParam('set_start_volt', 'inp-bal-start')\" class=\"btn-ok\">OK</button>\n                    </div>\n                </div>\n                <div class=\"list-item\" style=\"display:flex; justify-content:space-between; align-items:center; padding:8px 12px; margin-bottom:8px; background:rgba(0,0,0,0.5); border-radius:8px;\">\n                    <span style=\"color:#fff; font-size:0.88rem;\">Max. Bal. Current(A):</span>\n                    <div style=\"display:flex; align-items:center; gap:8px;\">\n                        <input type=\"number\" id=\"inp-bal-max-curr\" step=\"0.1\" min=\"0.1\" max=\"5.0\" value=\"0.5\" style=\"width:70px; background:#000; border:1px solid #444; color:var(--green); font-weight:800; font-family:monospace; text-align:center; padding:5px 6px; border-radius:6px; font-size:0.95rem;\">\n                        <button onclick=\"saveBalancerParam('set_max_current', 'inp-bal-max-curr')\" class=\"btn-ok\">OK</button>\n                    </div>\n                </div>\n\n                <div style=\"font-size:0.75rem; color:#8e8e93; text-transform:uppercase; letter-spacing:0.5px; margin:14px 0 6px; font-weight:700;\">\ud83d\udd3b Data and Communication</div>\n                <div class=\"list-item\" style=\"display:flex; justify-content:space-between; align-items:center; padding:8px 12px; margin-bottom:8px; background:rgba(0,0,0,0.5); border-radius:8px;\">\n                    <span style=\"color:#fff; font-size:0.88rem;\">Device Address:</span>\n                    <div style=\"display:flex; align-items:center; gap:8px;\">\n                        <input type=\"number\" id=\"inp-bal-addr\" min=\"1\" max=\"247\" value=\"1\" style=\"width:70px; background:#000; border:1px solid #444; color:var(--green); font-weight:800; font-family:monospace; text-align:center; padding:5px 6px; border-radius:6px; font-size:0.95rem;\">\n                        <button onclick=\"saveBalancerParam('set_device_address', 'inp-bal-addr')\" class=\"btn-ok\">OK</button>\n                    </div>\n                </div>\n\n                <div style=\"font-size:0.75rem; color:#8e8e93; text-transform:uppercase; letter-spacing:0.5px; margin:14px 0 6px; font-weight:700;\">\ud83d\udd3b Factory & Information (JiKong Balancer)</div>\n                <div class=\"list-item\" style=\"display:flex; justify-content:space-between; align-items:center; padding:8px 12px; margin-bottom:6px; background:rgba(0,0,0,0.5); border-radius:8px;\">\n                    <span style=\"color:#8e8e93; font-size:0.82rem;\">Volt Calibration(V):</span>\n                    <strong id=\"bal-cfg-volt-calib\" style=\"color:var(--green); font-family:monospace; font-size:0.88rem;\">23.41 V</strong>\n                </div>\n                <div class=\"list-item\" style=\"display:flex; justify-content:space-between; align-items:center; padding:8px 12px; margin-bottom:6px; background:rgba(0,0,0,0.5); border-radius:8px;\">\n                    <span style=\"color:#8e8e93; font-size:0.82rem;\">Vendor ID:</span>\n                    <strong id=\"bal-about-vendor\" style=\"color:var(--green); font-family:monospace; font-size:0.88rem;\">JK_B5A24S</strong>\n                </div>\n                <div class=\"list-item\" style=\"display:flex; justify-content:space-between; align-items:center; padding:8px 12px; margin-bottom:6px; background:rgba(0,0,0,0.5); border-radius:8px;\">\n                    <span style=\"color:#8e8e93; font-size:0.82rem;\">Serial Number:</span>\n                    <strong id=\"bal-about-sn\" style=\"color:var(--green); font-family:monospace; font-size:0.88rem;\">604130F0293</strong>\n                </div>\n                <div class=\"list-item\" style=\"display:flex; justify-content:space-between; align-items:center; padding:8px 12px; margin-bottom:6px; background:rgba(0,0,0,0.5); border-radius:8px;\">\n                    <span style=\"color:#8e8e93; font-size:0.82rem;\">Hardware Version:</span>\n                    <strong id=\"bal-about-hw\" style=\"color:#fff; font-family:monospace; font-size:0.88rem;\">V11U</strong>\n                </div>\n                <div class=\"list-item\" style=\"display:flex; justify-content:space-between; align-items:center; padding:8px 12px; margin-bottom:6px; background:rgba(0,0,0,0.5); border-radius:8px;\">\n                    <span style=\"color:#8e8e93; font-size:0.82rem;\">Software Version:</span>\n                    <strong id=\"bal-about-sw\" style=\"color:var(--green); font-family:monospace; font-size:0.88rem;\">V11.57</strong>\n                </div>\n                <div class=\"list-item\" style=\"display:flex; justify-content:space-between; align-items:center; padding:8px 12px; margin-bottom:6px; background:rgba(0,0,0,0.5); border-radius:8px;\">\n                    <span style=\"color:#8e8e93; font-size:0.82rem;\">Power-on Times:</span>\n                    <strong id=\"bal-about-power-on\" style=\"color:var(--green); font-family:monospace; font-size:0.88rem;\">\u2014</strong>\n                </div>\n                <div class=\"list-item\" style=\"display:flex; justify-content:space-between; align-items:center; padding:8px 12px; margin-bottom:6px; background:rgba(0,0,0,0.5); border-radius:8px;\">\n                    <span style=\"color:#8e8e93; font-size:0.82rem;\">First On Date:</span>\n                    <strong id=\"bal-about-first-on\" style=\"color:var(--green); font-family:monospace; font-size:0.88rem;\">\u2014</strong>\n                </div>\n            </div>\n\n            <!-- WIFI CONFIG & STATUS -->\n            <div class=\"sett-card\" id=\"wifi-card\">\n                <h3 style=\"color:var(--cyan); margin-bottom:10px; font-size:1rem;\">\ud83d\udce1 Tr\u1ea1ng Th\u00e1i Wi-Fi & M\u1ea1ng</h3>\n                \n                <!-- CONNECTED VIEW (Default when already connected) -->\n                <div id=\"wifi-connected-view\" style=\"display:block;\">\n                    <div class=\"list-item\" style=\"display:flex; justify-content:space-between; align-items:center; padding:12px; margin-bottom:10px; border-left:4px solid var(--green); background:rgba(15,23,42,0.7);\">\n                        <div>\n                            <div style=\"font-weight:700; font-size:0.95rem; color:#fff;\" id=\"lbl-wifi-ssid\">\ud83d\udcf6 \u0110ang ki\u1ec3m tra...</div>\n                            <div style=\"font-size:0.8rem; color:var(--text-sub); margin-top:3px;\">IP: <span id=\"lbl-wifi-ip\" style=\"color:var(--cyan); font-family:monospace;\">\u2014</span></div>\n                        </div>\n                        <div style=\"text-align:right;\">\n                            <span class=\"cell-badge\" style=\"background:rgba(63,185,80,0.2); color:var(--green); border:1px solid var(--green); width:auto; padding:3px 8px; font-size:0.75rem; border-radius:12px;\" id=\"lbl-wifi-status\">\u25cf \u0110ang k\u1ebft n\u1ed1i</span>\n                            <div style=\"font-size:0.72rem; color:var(--text-sub); margin-top:4px;\" id=\"lbl-wifi-rssi\">T\u00edn hi\u1ec7u: \u2014</div>\n                        </div>\n                    </div>\n                    <!-- Monitor URL card -->\n                    <div id=\"monitor-url-card\" style=\"display:block; margin-top:10px; background:rgba(0,119,182,0.12); border:1px solid #0077b6; border-radius:10px; padding:10px 12px;\">\n                        <div style=\"font-size:0.75rem; color:var(--text-sub); margin-bottom:5px;\">\ud83c\udf10 Link xem BMS t\u1eeb xa (Cloud Monitor):</div>\n                        <div style=\"display:flex; align-items:center; gap:8px;\">\n                            <input id=\"lbl-monitor-url\" type=\"text\" readonly\n                                style=\"flex:1; background:#000; border:1px solid #333; color:var(--cyan); font-family:monospace; font-size:0.78rem; padding:6px 10px; border-radius:7px; cursor:pointer; outline:none;\"\n                                onclick=\"this.select()\"\n                                value=\"https://bms.lha.io.vn/d/JKBMS-C4CA\">\n                            <button onclick=\"copyMonitorUrl()\" style=\"background:var(--badge-bg); color:#fff; border:none; border-radius:7px; padding:6px 12px; font-size:0.8rem; cursor:pointer; white-space:nowrap;\">\ud83d\udccb Copy</button>\n                        </div>\n                        <div id=\"monitor-url-copied\" style=\"display:none; color:var(--green); font-size:0.75rem; margin-top:4px; text-align:center;\">\u2705 \u0110\u00e3 sao ch\u00e9p!</div>\n                    </div>\n                    <div style=\"display:flex; gap:8px; margin-top:10px;\">\n                        <button class=\"btn btn-sec\" onclick=\"toggleWifiForm(true)\" style=\"flex:1;\">\ud83d\udd04 \u0110\u1ed5i / C\u00e0i Wi-Fi Kh\u00e1c</button>\n                        <button onclick=\"resetWifi()\" class=\"btn btn-sec\" style=\"flex:1; border-color:var(--red); color:var(--red);\">\u267b\ufe0f Reset Wi-Fi</button>\n                    </div>\n                </div>\n\n                <!-- CONFIGURATION FORM (Hidden by default when connected; shown in AP mode, on reset, or when clicking '\u0110\u1ed5i Wi-Fi') -->\n                <div id=\"wifi-config-view\" style=\"display:none; margin-top:10px;\">\n                    <button class=\"btn btn-sec\" onclick=\"scanWifi()\">\ud83d\udd04 Qu\u00e9t M\u1ea1ng Wi-Fi Xung Quanh</button>\n                    <div id=\"wifi-list\" style=\"margin-top:8px;\"></div>\n\n                    <form id=\"cfg-form\" onsubmit=\"saveConfig(event)\" style=\"margin-top:10px;\">\n                        <div class=\"form-group\">\n                            <label>T\u00ean M\u1ea1ng Wi-Fi (SSID)</label>\n                            <input type=\"text\" id=\"ssid\" required placeholder=\"T\u00ean Wi-Fi\">\n                        </div>\n                        <div class=\"form-group\">\n                            <label>M\u1eadt Kh\u1ea9u Wi-Fi</label>\n                            <input type=\"password\" id=\"pass\" placeholder=\"M\u1eadt kh\u1ea9u\">\n                        </div>\n                        <input type=\"hidden\" id=\"mqtt_srv\" value=\"192.168.1.100\">\n                        <input type=\"hidden\" id=\"mqtt_port\" value=\"1883\">\n                        <div style=\"display:flex; gap:8px;\">\n                            <button type=\"submit\" id=\"btn-save-wifi\" class=\"btn\" style=\"flex:1;\">\ud83d\udcbe L\u01b0u & K\u1ebft N\u1ed1i</button>\n                            <button type=\"button\" class=\"btn btn-sec\" onclick=\"toggleWifiForm(false)\" style=\"flex:1;\" id=\"btn-cancel-wifi\">H\u1ee7y B\u1ecf</button>\n                        </div>\n                        <div id=\"wifi-msg\" style=\"margin-top:8px; font-size:0.8rem; text-align:center;\"></div>\n                    </form>\n                    <button onclick=\"resetWifi()\" class=\"btn btn-sec\" style=\"border-color:var(--red); color:var(--red); margin-top:12px;\">\u267b\ufe0f Reset C\u00e0i \u0110\u1eb7t Wi-Fi V\u1ec1 M\u1eb7c \u0110\u1ecbnh</button>\n                </div>\n            </div>\n\n\n\n            <!-- LOCAL OTA UPDATE -->\n            <div class=\"sett-card\">\n                <h3 style=\"color:var(--cyan); margin-bottom:8px; font-size:1rem;\">\u2699\ufe0f N\u1ea1p Firmware M\u1edbi (Local OTA)</h3>\n                <div class=\"form-group\">\n                    <label>Ch\u1ecdn file firmware (.bin):</label>\n                    <input type=\"file\" id=\"ota-file\" accept=\".bin\">\n                </div>\n                <button class=\"btn\" onclick=\"uploadFirmwareOTA()\">\ud83d\ude80 B\u1eaft \u0110\u1ea7u N\u1ea1p OTA</button>\n                <div id=\"ota-progress-box\" style=\"display:none; margin-top:12px; text-align:center;\">\n                    <p id=\"ota-status-text\" style=\"color:var(--cyan); font-size:0.85rem;\">\u0110ang n\u1ea1p...</p>\n                    <div style=\"background:#222; border-radius:8px; height:10px; margin-top:6px; overflow:hidden;\">\n                        <div id=\"ota-bar\" style=\"background:var(--green); height:100%; width:0%;\"></div>\n                    </div>\n                </div>\n            </div>\n        </div>\n\n        <!-- BOTTOM NAVIGATION BAR -->\n        <div class=\"bottom-nav\">\n            <button id=\"nav-status\" class=\"nav-btn\" onclick=\"showTab('tab-status', this)\">\n                <span class=\"nav-icon\">\ud83c\udf9b\ufe0f</span>\n                <span>Status</span>\n            </button>\n            <button id=\"nav-home\" class=\"nav-btn active\" onclick=\"showTab('tab-home', this)\">\n                <span class=\"nav-icon\">\ud83c\udfe0</span>\n                <span>Home</span>\n            </button>\n            <button id=\"nav-sett\" class=\"nav-btn\" onclick=\"showTab('tab-settings', this)\">\n                <span class=\"nav-icon\">\u2699\ufe0f</span>\n                <span>Settings</span>\n            </button>\n        </div>\n    </div>\n\n        <script>\n\n        let _cloudDevId = (window._cloudDevId && typeof window._cloudDevId === 'string') ? window._cloudDevId : '';\n        if (!_cloudDevId) {\n            const p = window.location.pathname;\n            if (p.includes('/d/')) {\n                _cloudDevId = p.split('/d/')[1].split('/')[0].split('?')[0];\n            } else if (p.includes('/device/')) {\n                _cloudDevId = p.split('/device/')[1].split('/')[0].split('?')[0];\n            }\n        }\n        const _isCloud = !!_cloudDevId || (window.location.hostname !== 'localhost' && !window.location.hostname.startsWith('192.168.'));\n\n        window.addEventListener('DOMContentLoaded', () => {\n            if (_isCloud) {\n                const btn = document.getElementById('cloud-back-btn');\n                if (btn) btn.style.display = 'inline-flex';\n            }\n        });\n\n        \n        async function saveBalancerParam(cmdName, inputId, btn) {\n            const el = document.getElementById(inputId);\n            if (!el) return;\n            const val = parseFloat(el.value);\n            if (isNaN(val)) return alert('Gi\u00e1 tr\u1ecb kh\u00f4ng h\u1ee3p l\u1ec7!');\n            let origTxt = 'OK';\n            if (btn) {\n                origTxt = btn.textContent;\n                btn.textContent = '\u23f3';\n                btn.disabled = true;\n            }\n            try {\n                if (_isCloud) {\n                    const devId = _cloudDevId || 'JKBMS-C4CA';\n                    await fetch('/api/send-command', {\n                        method: 'POST',\n                        headers: {'Content-Type': 'application/json'},\n                        body: JSON.stringify({ device_id: devId, cmd: { cmd: cmdName, val: val, value: val } })\n                    });\n                } else {\n                    await fetch('/api/command', {\n                        method: 'POST',\n                        headers: {'Content-Type': 'application/json'},\n                        body: JSON.stringify({ cmd: cmdName, val: val, value: val })\n                    });\n                }\n                showConnectToast('\u2705 \u0110\u00e3 l\u01b0u c\u00e0i \u0111\u1eb7t ' + val + '!');\n                if (btn) {\n                    btn.textContent = '\u2705';\n                    setTimeout(() => { btn.textContent = origTxt; btn.disabled = false; }, 1500);\n                }\n                setTimeout(fetchTelemetry, 600);\n            } catch(e) {\n                alert('L\u1ed7i g\u1eedi c\u00e0i \u0111\u1eb7t: ' + e.message);\n                if (btn) { btn.textContent = origTxt; btn.disabled = false; }\n            }\n        }\n\n        async function toggleBalance() {\n            const curVal = (window._lastTelemetry && window._lastTelemetry.balance !== undefined) ? window._lastTelemetry.balance : ((window._lastTelemetry && window._lastTelemetry.balanceActive !== undefined) ? window._lastTelemetry.balanceActive : false);\n            const newVal = !curVal;\n            try {\n                if (_isCloud && _cloudDevId) {\n                    await fetch('/api/send-command', {\n                        method: 'POST',\n                        headers: {'Content-Type': 'application/json'},\n                        body: JSON.stringify({ device_id: _cloudDevId, cmd: { cmd: 'balance', val: newVal, value: newVal ? 1 : 0 } })\n                    });\n                } else {\n                    await fetch('/api/command', {\n                        method: 'POST',\n                        headers: {'Content-Type': 'application/json'},\n                        body: JSON.stringify({ cmd: 'balance', val: newVal, value: newVal ? 1 : 0 })\n                    });\n                }\n                if (window._lastTelemetry) {\n                    window._lastTelemetry.balance = newVal;\n                    window._lastTelemetry.balanceActive = newVal;\n                }\n                updateMosDot('balance', newVal);\n                const btnSw = document.getElementById('btn-bal-toggle-sett');\n                if (btnSw) {\n                    btnSw.textContent = newVal ? 'ON' : 'OFF';\n                    btnSw.style.color = newVal ? 'var(--green)' : 'var(--yellow)';\n                }\n                setTimeout(fetchTelemetry, 600);\n            } catch(e) {\n                console.error('Toggle balance error:', e);\n            }\n        }\n\n        let currentPacks = [];\n        let mosStates = { charge_mos: true, discharge_mos: true, balance: true };\n        let mosCmdLockMs = 0;\n        let _wasConnected = null;\n\n        function showConnectToast(bmsName) {\n            let toast = document.getElementById('connect-toast');\n            if (!toast) {\n                toast = document.createElement('div');\n                toast.id = 'connect-toast';\n                toast.style.cssText = 'position:fixed; top:70px; left:50%; transform:translateX(-50%) translateY(-20px); background:linear-gradient(135deg,rgba(0,255,43,0.18),rgba(0,229,255,0.18)); border:1px solid var(--green); border-radius:12px; padding:12px 20px; z-index:9999; font-size:0.9rem; font-weight:700; color:#fff; text-align:center; box-shadow:0 0 24px rgba(0,255,43,0.3); opacity:0; transition:all 0.4s ease; max-width:320px; width:90%;';\n                document.body.appendChild(toast);\n            }\n            toast.innerHTML = '\ud83d\udd0b \u0110\u00e3 k\u1ebft n\u1ed1i BMS JK<br><span style=\"color:var(--green); font-size:0.82rem; font-weight:500;\">' + bmsName + '</span><br><span style=\"color:var(--cyan); font-size:0.75rem;\">\u0110ang nh\u1eadn d\u1eef li\u1ec7u pin...</span>';\n            toast.style.opacity = '1';\n            toast.style.transform = 'translateX(-50%) translateY(0)';\n            setTimeout(() => {\n                toast.style.opacity = '0';\n                toast.style.transform = 'translateX(-50%) translateY(-20px)';\n            }, 4000);\n        }\n\n        function showTab(id, btn) {\n            const tabs = ['tab-home', 'tab-status', 'tab-settings'];\n            tabs.forEach(tId => {\n                const el = document.getElementById(tId);\n                if (el) {\n                    el.style.display = 'none';\n                    el.classList.remove('active');\n                }\n            });\n            document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));\n\n            const targetEl = document.getElementById(id);\n            if (targetEl) {\n                targetEl.style.display = 'block';\n                targetEl.classList.add('active');\n            }\n            if (btn) btn.classList.add('active');\n            if (id === 'tab-home' || id === 'tab-status') fetchTelemetry();\n            if (id === 'tab-settings') { /* Settings Tab */ }\n            window.scrollTo({ top: 0, behavior: 'instant' });\n        }\n\n        // \u2500\u2500 DOM Cache & Fast Dirty-Set \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n        const $ = id => document.getElementById(id);\n        const _el = {};\n        function _c(id) { return _el[id] || (_el[id] = $(id)); }\n        function _set(id, val) {\n            const el = _c(id);\n            if (el) {\n                const s = String(val);\n                if (el.textContent !== s) el.textContent = s;\n            }\n        }\n\n        // \u2500\u2500 State Tracking \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n        let _lastUpdateMs = -1;\n        let _lastErrMask  = -1;\n        let _lastCellCnt  = 0;\n        let _lastConnState = null;\n        let _pollActive = false;\n\n        const PROT_ITEMS = [\n            { bit: 0,  desc: \"L\u1ec7ch tr\u1edf d\u00e2y\" },\n            { bit: 1,  desc: \"Qu\u00e1 nhi\u1ec7t MOS\" },\n            { bit: 2,  desc: \"L\u1ec7ch s\u1ed1 cell\" },\n            { bit: 4,  desc: \"Pin \u0111\u00e3 s\u1ea1c \u0111\u1ea7y\" },\n            { bit: 5,  desc: \"Qu\u00e1 \u00e1p pack\" },\n            { bit: 6,  desc: \"Qu\u00e1 d\u00f2ng s\u1ea1c\" },\n            { bit: 7,  desc: \"Ng\u1eafn m\u1ea1ch s\u1ea1c\" },\n            { bit: 8,  desc: \"Qu\u00e1 nhi\u1ec7t s\u1ea1c\" },\n            { bit: 9,  desc: \"Qu\u00e1 l\u1ea1nh s\u1ea1c\" },\n            { bit: 11, desc: \"Th\u1ea5p \u00e1p cell\" },\n            { bit: 12, desc: \"Th\u1ea5p \u00e1p pack\" },\n            { bit: 13, desc: \"Qu\u00e1 d\u00f2ng x\u1ea3\" },\n            { bit: 14, desc: \"Ng\u1eafn m\u1ea1ch x\u1ea3\" },\n            { bit: 15, desc: \"Qu\u00e1 nhi\u1ec7t x\u1ea3\" },\n            { bit: 19, desc: \"M\u1eadt kh\u1ea9u m\u1eb7c \u0111\u1ecbnh\" },\n            { bit: 27, desc: \"Qu\u00e1 l\u1ea1nh x\u1ea3\" }\n        ];\n\n        let _consecutiveFailures = 0;\n        async function fetchTelemetry() {\n            if (_pollActive) return;\n            _pollActive = true;\n            const controller = new AbortController();\n            const timeoutId = setTimeout(() => controller.abort(), 6000);\n            try {\n                let fetchUrl = '/api/telemetry';\n                if (_isCloud) {\n                    const devIdToFetch = _cloudDevId || 'JKBMS-C4CA';\n                    fetchUrl = `/api/devices?device_id=${encodeURIComponent(devIdToFetch)}&watch=1&_t=${Date.now()}`;\n                }\n                const res = await fetch(fetchUrl, { signal: controller.signal });\n                clearTimeout(timeoutId);\n                if (!res.ok) throw new Error('HTTP ' + res.status);\n                const rawText = await res.text();\n                const cleanText = rawText.replace(/[\\u0000-\\u0008\\u000B\\u000C\\u000E-\\u001F]/g, '');\n                let jsonParsed = JSON.parse(cleanText);\n                let d = jsonParsed;\n                if (Array.isArray(d)) d = d[0];\n                else if (d.Devices && Array.isArray(d.Devices)) d = d.Devices[0];\n                else if (d.devices && Array.isArray(d.devices)) d = d.devices[0];\n\n                if (!d) throw new Error('D\u1eef li\u1ec7u r\u1ed7ng');\n\n                // Normalize fields between Cloud (snake_case) and Local (camelCase)\n                if (d.totalVoltage === undefined && d.voltage !== undefined) d.totalVoltage = d.voltage;\n                if (d.deltaCellVoltage === undefined && d.delta_cell_voltage !== undefined) d.deltaCellVoltage = d.delta_cell_voltage;\n                if (d.balanceCurrent === undefined && d.balance_current !== undefined) d.balanceCurrent = d.balance_current;\n                if (d.balanceActive === undefined && d.balance_active !== undefined) d.balanceActive = d.balance_active;\n                if (d.balanceActive === undefined && d.balance !== undefined) d.balanceActive = d.balance;\n                if (!d.cells && d.cell_voltages) d.cells = d.cell_voltages;\n                if (!d.cellResistances && d.cell_resistances) d.cellResistances = d.cell_resistances;\n                if (d.minCellVoltage === undefined && d.min_cell_voltage !== undefined) d.minCellVoltage = d.min_cell_voltage;\n                if (d.maxCellVoltage === undefined && d.max_cell_voltage !== undefined) d.maxCellVoltage = d.max_cell_voltage;\n                if (d.avgCellVoltage === undefined && d.avg_cell_voltage !== undefined) d.avgCellVoltage = d.avg_cell_voltage;\n                if (d.cellCount === undefined && d.cell_count !== undefined) d.cellCount = d.cell_count;\n                if (d.minCellNum === undefined && d.min_cell_num !== undefined) d.minCellNum = d.min_cell_num;\n                if (d.maxCellNum === undefined && d.max_cell_num !== undefined) d.maxCellNum = d.max_cell_num;\n                if (d.serialNumber === undefined && d.serial_number !== undefined) d.serialNumber = d.serial_number;\n                if (d.modelName === undefined && d.model_name !== undefined) d.modelName = d.model_name;\n                if (d.vendorId === undefined && d.vendor_id !== undefined) d.vendorId = d.vendor_id;\n                if (d.hardwareVersion === undefined && d.hardware_version !== undefined) d.hardwareVersion = d.hardware_version;\n                if (d.softwareVersion === undefined && d.software_version !== undefined) d.softwareVersion = d.software_version;\n                if (d.balDeltaVolt === undefined && d.bal_delta_volt !== undefined) d.balDeltaVolt = d.bal_delta_volt;\n                if (d.maxBalCurrent === undefined && d.max_bal_current !== undefined) d.maxBalCurrent = d.max_bal_current;\n                if (d.deviceAddress === undefined && d.device_address !== undefined) d.deviceAddress = d.device_address;\n                if (d.balStartVolt === undefined && d.bal_start_volt !== undefined) d.balStartVolt = d.bal_start_volt;\n                window._lastTelemetry = d;\n                _consecutiveFailures = 0;\n\n                // Update ESP / Cloud Online Badge\n                const dot = _c('esp-online-dot');\n                const txt = _c('esp-online-txt');\n                const badge = _c('esp-online-badge');\n                if (dot && txt && badge) {\n                    if (_isCloud) {\n                        const isLive = (d.online !== false);\n                        dot.style.background = isLive ? '#00ff2b' : '#ff3b30';\n                        dot.style.boxShadow = isLive ? '0 0 5px #00ff2b' : 'none';\n                        txt.textContent = isLive ? 'Cloud Online' : `Offline (${d.lastSeenAgo || 0}s)`;\n                        badge.style.color = isLive ? '#00ff2b' : '#ff3b30';\n                    } else {\n                        dot.style.background = '#00ff2b';\n                        dot.style.boxShadow = '0 0 5px #00ff2b';\n                        txt.textContent = 'ESP Online';\n                        badge.style.color = '#00ff2b';\n                    }\n                }\n\n                // Update Official Balancer Settings Card\n                \n                // Define isConn for entire telemetry update scope\n                const isConn = !_isCloud\n                    ? (d.connected === true || d.connected === undefined)\n                    : (d.online !== false && (d.lastSeenAgo === undefined || d.lastSeenAgo < 60));\n\n                // Update inputs if user not actively typing\n                const inpCell = document.getElementById('inp-cell-count');\n                if (inpCell && document.activeElement !== inpCell && d.cellCount) inpCell.value = d.cellCount;\n                const inpDelta = document.getElementById('inp-bal-delta');\n                if (inpDelta && document.activeElement !== inpDelta && d.balDeltaVolt) inpDelta.value = d.balDeltaVolt;\n                const inpStart = document.getElementById('inp-bal-start');\n                if (inpStart && document.activeElement !== inpStart && d.balStartVolt) inpStart.value = d.balStartVolt;\n                const inpMaxC = document.getElementById('inp-bal-max-curr');\n                if (inpMaxC && document.activeElement !== inpMaxC && d.maxBalCurrent) inpMaxC.value = d.maxBalCurrent;\n                const inpAddr = document.getElementById('inp-bal-addr');\n                if (inpAddr && document.activeElement !== inpAddr && d.deviceAddress) inpAddr.value = d.deviceAddress;\n\n                const btnSw = document.getElementById('btn-bal-toggle-sett');\n                if (btnSw) {\n                    btnSw.textContent = d.balanceActive ? 'ON' : 'OFF';\n                    btnSw.style.color = d.balanceActive ? 'var(--green)' : 'var(--yellow)';\n                }\n                _set('bal-cfg-volt-calib', isConn && d.totalVoltage ? `${d.totalVoltage.toFixed(2)} V` : '23.41 V');\n\n                const monCard = _c('monitor-url-card');\n                if (monCard) monCard.style.display = 'block';\n                const monInput = _c('lbl-monitor-url');\n                const curDevId = d.device_id || _cloudDevId || 'JKBMS-C4CA';\n                if (monInput) monInput.value = 'https://bms.lha.io.vn/d/' + curDevId;\n\n                const isBalSw = (d.balance !== undefined) ? !!d.balance : (d.balance_switch !== undefined ? !!d.balance_switch : !!d.balanceActive);\n                const curBalA = (d.balanceCurrent !== undefined && d.balanceCurrent > 0) ? d.balanceCurrent : (d.balance_current !== undefined && d.balance_current > 0 ? d.balance_current : 0);\n                const isBalAct = (d.balance_active !== undefined) ? !!d.balance_active : (isBalSw && curBalA > 0.02);\n                window._lastBalAct = isBalAct;\n                window._lastBalCur = curBalA;\n\n                const btnBalSett = _c('btn-bal-toggle-sett');\n                if (btnBalSett) {\n                    btnBalSett.textContent = isBalSw ? 'ON' : 'OFF';\n                    btnBalSett.style.color = isBalSw ? 'var(--green)' : 'var(--yellow)';\n                    btnBalSett.style.background = isBalSw ? 'rgba(0,255,43,0.15)' : '#222';\n                    btnBalSett.style.borderColor = isBalSw ? 'var(--green)' : '#444';\n                }\n                const balSwEl = _c('bal-cfg-switch');\n                if (balSwEl) {\n                    balSwEl.textContent = isBalSw ? 'ON' : 'OFF';\n                    balSwEl.style.color = isBalSw ? 'var(--green)' : 'var(--yellow)';\n                }\n                const dDelta = (d.balDeltaVolt !== undefined && d.balDeltaVolt > 0) ? d.balDeltaVolt : 0.003;\n                _set('bal-cfg-delta', `${dDelta.toFixed(3)} V (${Math.round(dDelta * 1000)} mV)`);\n                const dStartV = (d.balStartVolt !== undefined && d.balStartVolt > 0) ? d.balStartVolt : 2.70;\n                _set('bal-cfg-start-v', `${dStartV.toFixed(2)} V`);\n                const dMaxCurr = (d.maxBalCurrent !== undefined && d.maxBalCurrent > 0) ? d.maxBalCurrent : 0.5;\n                _set('bal-cfg-max-curr', `${dMaxCurr.toFixed(1)} A`);\n                _set('bal-cfg-address', d.deviceAddress !== undefined ? `${d.deviceAddress}` : '1');\n\n                _set('bal-cfg-volt-calib', isConn && d.totalVoltage ? `${d.totalVoltage.toFixed(2)} V` : '23.41 V');\n                _set('bal-about-vendor', d.vendorId || d.modelName || 'JK_B5A24S');\n                _set('bal-about-sn', d.serialNumber || '604130F0293');\n                _set('bal-about-hw', d.hardwareVersion || 'V11U');\n                _set('bal-about-sw', d.softwareVersion || 'V11.57');\n                _set('bal-about-power-on', d.power_on_count ? `${d.power_on_count} l\u1ea7n` : '15 l\u1ea7n');\n                _set('bal-about-first-on', (d.activated_at && d.activated_at.length > 0) ? d.activated_at : '27/09/2026');\n\n                // isConn already initialized above\n\n                // \u2500\u2500 Connection Header Icon \u2500\u2500\n                const btIcon = _c('bt-icon-head');\n                if (btIcon) {\n                    if (d.conn_type === 2) {\n                        btIcon.textContent = '\ud83d\udd0c';\n                    } else if (d.conn_type === 1) {\n                        btIcon.textContent = '\ud83d\udcf6';\n                    } else {\n                        btIcon.textContent = '\u26d4';\n                    }\n                    const hasActive = btIcon.classList.contains('active');\n                    if (isConn && !hasActive) btIcon.classList.add('active');\n                    else if (!isConn && hasActive) btIcon.classList.remove('active');\n                }\n\n                // \u2500\u2500 Cumulative Total Runtime \u2500\u2500\n                const sec = (d.totalRuntimeSec && d.totalRuntimeSec > 0) ? d.totalRuntimeSec : ((d.total_runtime_sec && d.total_runtime_sec > 0) ? d.total_runtime_sec : (d.uptimeSec || 0));\n                const days = Math.floor(sec / 86400);\n                const hours = Math.floor((sec % 86400) / 3600);\n                const mins = Math.floor((sec % 3600) / 60);\n                const s = sec % 60;\n                const fmtRuntime = `${days}d ${hours.toString().padStart(2,'0')}h ${mins.toString().padStart(2,'0')}m ${s.toString().padStart(2,'0')}s`;\n                _set('uptime-display', fmtRuntime);\n\n                // \u2500\u2500 Active Balancer Delta Gauge \u2500\u2500\n                const deltaMv = isConn ? Math.round((d.deltaCellVoltage || 0) * 1000) : 0;\n                _set('home-soc-txt', isConn ? `${deltaMv} mV` : '0 mV');\n                _set('home-delta-sub', isConn ? `\u0394: ${(d.deltaCellVoltage || 0).toFixed(3)} V` : '\u0394: 0.000 V');\n\n                const arc = _c('gauge-arc');\n                if (arc) {\n                    const pct = Math.min(100, Math.max(2, (deltaMv / 80.0) * 100));\n                    const offset = isConn ? (284.8 - (pct / 100.0) * 284.8).toFixed(1) : '284.8';\n                    if (arc.style.strokeDashoffset !== offset) arc.style.strokeDashoffset = offset;\n                    const deltaColor = (!isConn) ? '#556570' : (deltaMv <= 15 ? '#00ff2b' : (deltaMv <= 35 ? '#f59e0b' : '#ff3b30'));\n                    arc.setAttribute('stroke', (isConn && deltaMv <= 15) ? 'url(#gaugeGrad)' : deltaColor);\n                    const socTxt = _c('home-soc-txt');\n                    if (socTxt) socTxt.setAttribute('fill', deltaColor);\n                }\n\n                const vStr = isConn && d.totalVoltage !== undefined ? `T\u1ed5ng: ${d.totalVoltage.toFixed(2)} V` : 'T\u1ed5ng: 0.00 V';\n                _set('home-v-pill', vStr);\n                const balA = (d.balanceCurrent !== undefined && d.balanceCurrent > 0) ? d.balanceCurrent : 0;\n                const aStr = isConn ? `D\u00f2ng C\u00e2n: ${balA.toFixed(3)} A` : 'D\u00f2ng C\u00e2n: 0.00 A';\n                _set('home-a-pill', aStr);\n\n                const rxTxEl = _c('txt-rx-tx-pin');\n                if (rxTxEl && d.uart_rx_pin !== undefined) {\n                    rxTxEl.textContent = `RX:${d.uart_rx_pin} | TX:${d.uart_tx_pin}`;\n                }\n\n                // \u2500\u2500 Toast on connect \u2500\u2500\n                if (_wasConnected === false && isConn) {\n                    const toastName = d.active_pack_alias || d.modelName || d.active_bms_name || (d.active_pack_mac || 'JK Active Balancer');\n                    showConnectToast(toastName);\n                }\n                _wasConnected = isConn;\n\n                // \u2500\u2500 Status Banner (Updated dynamically every telemetry packet) \u2500\u2500\n                const sBanner = _c('status-banner');\n                const bMsg = _c('banner-msg');\n                const bIcon = _c('banner-icon');\n                const hasPack = (d.active_bms_mac && d.active_bms_mac.length > 0);\n                const isRealError = isConn && (d.rawErrorsBitmask > 0 || (d.errorsStr && d.errorsStr !== 'No Errors' && d.errorsStr !== 'Ho\u1ea1t \u0111\u1ed9ng b\u00ecnh th\u01b0\u1eddng' && d.errorsStr.indexOf('b\u00ecnh th\u01b0\u1eddng') < 0));\n\n                if (bMsg && bIcon) {\n                    if (!isConn) {\n                        bMsg.innerText = '\u0110ang ch\u1edd t\u00edn hi\u1ec7u UART DWIN t\u1eeb c\u1ed5ng LCD c\u1ee7a m\u1ea1ch c\u00e2n b\u1eb1ng...';\n                        bIcon.innerText = '\ud83d\udd0c'; bIcon.style.color = 'var(--yellow)';\n                        if (sBanner) { sBanner.style.borderColor = 'rgba(245,158,11,0.5)'; sBanner.style.background = 'rgba(40,30,5,0.85)'; }\n                    } else if (isRealError) {\n                        bMsg.innerText = d.errorsStr;\n                        bIcon.innerText = '\u26a0\ufe0f'; bIcon.style.color = 'var(--red)';\n                        if (sBanner) { sBanner.style.borderColor = 'rgba(255,59,48,0.5)'; sBanner.style.background = 'rgba(40,5,5,0.85)'; }\n                    } else if (!isBalSw) {\n                        bMsg.innerText = `\u26d4 C\u00e2n b\u1eb1ng \u0111ang T\u1eaeT (\u0394 = ${deltaMv} mV) \u2022 B\u1ea5m n\u00fat C\u00e2n B\u1eb1ng \u0111\u1ec3 k\u00edch ho\u1ea1t`;\n                        bIcon.innerText = '\u2696\ufe0f'; bIcon.style.color = 'var(--yellow)';\n                        if (sBanner) { sBanner.style.borderColor = 'rgba(245,158,11,0.5)'; sBanner.style.background = 'rgba(40,30,5,0.85)'; }\n                    } else if (isBalAct && curBalA > 0.02) {\n                        bMsg.innerText = `\u2696\ufe0f \u0110ang c\u00e2n b\u1eb1ng ch\u1ee7 \u0111\u1ed9ng (${curBalA.toFixed(2)} A) \u2022 \u0110\u1ed9 l\u1ec7ch cell: \u0394 = ${deltaMv} mV`;\n                        bIcon.innerText = '\u2696\ufe0f'; bIcon.style.color = 'var(--green)';\n                        if (sBanner) { sBanner.style.borderColor = 'rgba(63,185,80,0.4)'; sBanner.style.background = 'rgba(5,40,20,0.85)'; }\n                    } else {\n                        if (deltaMv <= 15) {\n                            bMsg.innerText = `\u2714 \u0110\u1ed9 l\u1ec7ch cell r\u1ea5t t\u1ed1t (\u0394 = ${deltaMv} mV) \u2022 C\u00e1c cell pin \u0111\u1ed3ng \u0111\u1ec1u`;\n                            bIcon.innerText = '\u2714'; bIcon.style.color = 'var(--green)';\n                            if (sBanner) { sBanner.style.borderColor = 'rgba(63,185,80,0.4)'; sBanner.style.background = 'rgba(5,40,20,0.85)'; }\n                        } else {\n                            bMsg.innerText = `\u23f3 Ch\u1edd c\u00e2n b\u1eb1ng (\u0394 = ${deltaMv} mV) \u2022 \u0110ang \u0111\u1ee3i ng\u01b0\u1ee1ng \u0111i\u1ec7n \u00e1p ho\u1eb7c \u0111i\u1ec1u ki\u1ec7n c\u00e2n`;\n                            bIcon.innerText = '\u23f3'; bIcon.style.color = 'var(--cyan)';\n                            if (sBanner) { sBanner.style.borderColor = 'rgba(56,189,248,0.4)'; sBanner.style.background = 'rgba(5,35,45,0.85)'; }\n                        }\n                    }\n                }\n\n                // \u2500\u2500 Header Balancer name & ID \u2500\u2500\n                _set('head-bms-name', d.modelName || 'JK_B5A24S');\n                _set('head-sn', d.serialNumber ? `SN: ${d.serialNumber}` : 'UART LCD (115200)');\n\n                // \u2500\u2500 Home RS485 Bar Indicators \u2500\u2500\n                const hRsName = _c('home-rs485-name');\n                const hRsPins = _c('home-rs485-pins');\n                if (hRsName) {\n                    if (isConn) {\n                        hRsName.innerHTML = `<span style=\"color:var(--green);\">\ud83d\udfe2</span> ${bmsName} <span style=\"font-size:0.75rem; color:var(--green);\">(Online)</span>`;\n                    } else {\n                        hRsName.innerHTML = `<span style=\"color:var(--yellow);\">\ud83d\udfe1</span> RS485 Modbus RTU <span style=\"font-size:0.75rem; color:var(--yellow);\">(Ch\u1edd t\u00edn hi\u1ec7u...)</span>`;\n                    }\n                }\n                if (hRsPins) {\n                    const rxP = d.rs485_rx_pin !== undefined ? d.rs485_rx_pin : 20;\n                    const txP = d.rs485_tx_pin !== undefined ? d.rs485_tx_pin : 21;\n                    const baud = d.rs485_baud || 115200;\n                    hRsPins.innerText = `RX: GPIO ${rxP} | TX: GPIO ${txP} | ${baud} bps`;\n                }\n\n                // \u2500\u2500 Live RS485 Sniffer Bar Updates \u2500\u2500\n                _set('dbg-rx-bytes', `${d.rs485_rx_bytes || 0} bytes`);\n                _set('dbg-ok-frames', d.rs485_success_count || 0);\n                const dbgHex = _c('dbg-rx-hex');\n                if (dbgHex) {\n                    if (d.rs485_rx_hex && d.rs485_rx_hex.trim().length > 0) {\n                        dbgHex.textContent = d.rs485_rx_hex;\n                    } else if (isConn) {\n                        dbgHex.textContent = '\u0110ang nh\u1eadn lu\u1ed3ng 308-byte li\u00ean t\u1ee5c...';\n                    } else {\n                        dbgHex.textContent = 'Ch\u01b0a c\u00f3 byte n\u00e0o \u0111\u1ebfn... (B\u1ea5m [\ud83d\udd00 \u0110\u1ea3o RX/TX] n\u1ebfu \u0111\u00e3 c\u1eafm d\u00e2y)';\n                    }\n                }\n                const dbgType = _c('dbg-frame-type');\n                if (dbgType) {\n                    if (isConn) {\n                        dbgType.textContent = '\ud83d\udfe2 Kh\u1edbp Frame BMS!';\n                        dbgType.style.color = 'var(--green)';\n                    } else if ((d.rs485_rx_bytes || 0) > 0) {\n                        dbgType.textContent = '\ud83d\udfe1 C\u00f3 byte nh\u01b0ng ch\u01b0a kh\u1edbp Frame (Th\u1eed \u0111\u1ed5i Baud)';\n                        dbgType.style.color = 'var(--yellow)';\n                    } else {\n                        dbgType.textContent = '\u26aa Ch\u1edd t\u00edn hi\u1ec7u t\u1eeb pin...';\n                        dbgType.style.color = '#888';\n                    }\n                }\n\n                // \u2500\u2500 Fast metrics for Active Balancer (NO TEMPERATURE) \u2500\u2500\n                _set('m-high-v', isConn && d.maxCellVoltage !== undefined ? d.maxCellVoltage.toFixed(3) : '0.000');\n                _set('m-low-v',  isConn && d.minCellVoltage !== undefined ? d.minCellVoltage.toFixed(3) : '0.000');\n                _set('m-diff-v', isConn && d.deltaCellVoltage !== undefined ? d.deltaCellVoltage.toFixed(3) : '0.000');\n                _set('m-bal-a',  isConn && d.balanceCurrent !== undefined ? d.balanceCurrent.toFixed(3) : '0.000');\n                const avgV = (isConn && d.avgCellVoltage > 0) ? d.avgCellVoltage : ((isConn && d.cellCount > 0 && d.totalVoltage) ? (d.totalVoltage / d.cellCount) : 0);\n                _set('m-cell-avg', avgV.toFixed(3));\n                _set('m-cap-ah', isConn && d.cellCount ? `${d.cellCount}S / 24S` : '0S / 24S');\n                _set('m-cell-min-badge', isConn && d.minCellNum ? `#${d.minCellNum}` : '\u2014');\n\n                // Calculate average wire resistance (in Ohms, e.g. 0.037) across active cells\n                let avgWire = 0;\n                let minWire = 9999, maxWire = 0, minWireIdx = 1, maxWireIdx = 1;\n                if (d.cellResistances && d.cellResistances.length > 0) {\n                    let sumW = 0, countW = 0;\n                    for (let k = 0; k < d.cellResistances.length; k++) {\n                        const cv = (d.cells && k < d.cells.length) ? d.cells[k] : 0;\n                        if (cv > 0.5) {\n                            let w = d.cellResistances[k] || 0;\n                            if (w > 1.0) w = w / 1000.0; // normalize to Ohms if in mOhm\n                            sumW += w;\n                            countW++;\n                            if (w > 0 && w < minWire) { minWire = w; minWireIdx = k + 1; }\n                            if (w > maxWire) { maxWire = w; maxWireIdx = k + 1; }\n                        }\n                    }\n                    avgWire = countW > 0 ? (sumW / countW) : 0;\n                }\n                _set('m-soh', isConn && avgWire > 0 ? `${avgWire.toFixed(3)} \u03a9` : '\u2014');\n\n                // Info Card fields (NO TEMPERATURE)\n                _set('card-curr-val', isConn ? `${curBalA.toFixed(3)} A` : '0.000 A');\n                _set('card-cell-min', isConn && d.minCellNum ? `#${d.minCellNum} (${(d.minCellVoltage||0).toFixed(3)} V)` : '\u2014');\n                _set('card-cell-max', isConn && d.maxCellNum ? `#${d.maxCellNum} (${(d.maxCellVoltage||0).toFixed(3)} V)` : '\u2014');\n                let stTxt = 'M\u1ea5t K\u1ebft N\u1ed1i';\n                let stColor = '#ef4444';\n                if (isConn) {\n                    if (!isBalSw) {\n                        stTxt = '\u0110\u00e3 T\u1eaft (OFF)';\n                        stColor = '#ef4444';\n                    } else if (isBalAct && curBalA > 0.02) {\n                        stTxt = `\u0110ang C\u00e2n B\u1eb1ng (${curBalA.toFixed(3)} A)`;\n                        stColor = 'var(--green)';\n                    } else {\n                        stTxt = 'Ch\u1edd C\u00e2n B\u1eb1ng (Standby)';\n                        stColor = 'var(--cyan)';\n                    }\n                }\n                const stEl = _c('card-status-txt');\n                if (stEl) {\n                    stEl.textContent = stTxt;\n                    stEl.style.color = stColor;\n                }\n                _set('card-port-txt', 'UART TTL (C\u1ed5ng LCD JK)');\n\n                // \u2500\u2500 Realtime Tab Fields (CLEAN UNITS, NO DUPLICATE CHARACTERS) \u2500\u2500\n                _set('rt-bat-v', isConn && d.totalVoltage !== undefined ? `${d.totalVoltage.toFixed(2)} V` : '0.00 V');\n                _set('rt-avg', `${avgV.toFixed(3)} V`);\n                const diffMv = isConn && d.deltaCellVoltage !== undefined ? Math.round(d.deltaCellVoltage * 1000) : 0;\n                _set('rt-diff', isConn && d.deltaCellVoltage !== undefined ? `${diffMv} mV (${d.deltaCellVoltage.toFixed(3)} V)` : '0 mV (0.000 V)');\n                _set('rt-balcurr', isConn ? `${curBalA.toFixed(3)} A` : '0.000 A');\n                _set('rt-min-cell', isConn && d.minCellNum ? `Cell #${d.minCellNum} (${(d.minCellVoltage||0).toFixed(3)} V)` : '\u2014');\n                _set('rt-max-cell', isConn && d.maxCellNum ? `Cell #${d.maxCellNum} (${(d.maxCellVoltage||0).toFixed(3)} V)` : '\u2014');\n                _set('rt-cell-count', isConn && d.cellCount ? `${d.cellCount}S / 24S (${d.cellCount} Cell \u0110ang Ch\u1ea1y)` : '0S / 24S');\n                _set('rt-min-wire', isConn && minWire < 9000 ? `${minWire.toFixed(3)} \u03a9 (Cell ${minWireIdx})` : '0.000 \u03a9');\n                _set('rt-max-wire', isConn && maxWire > 0 ? `${maxWire.toFixed(3)} \u03a9 (Cell ${maxWireIdx})` : '0.000 \u03a9');\n                _set('rt-avg-wire', isConn && avgWire > 0 ? `${avgWire.toFixed(3)} \u03a9` : '0.000 \u03a9');\n                _set('rt-balancer', !isBalSw ? 'T\u1eaeT (OFF)' : ((isBalAct && curBalA > 0.02) ? `B\u1eacT (\u0110ang c\u00e2n ${curBalA.toFixed(2)} A)` : 'B\u1eacT (Ch\u1edd c\u00e2n / Standby)'));\n                _set('rt-start-v', isConn && d.balStartVolt ? `${d.balStartVolt.toFixed(2)} V` : '2.70 V');\n                _set('rt-runtime', isConn ? fmtRuntime : '0d 00h 00m 00s');\n\n                // \u2500\u2500 MOS Dots \u2500\u2500\n                if (Date.now() > mosCmdLockMs) {\n                    updateMosDot('charge', d.chargeMosOn);\n                    updateMosDot('discharge', d.dischargeMosOn);\n                    updateMosDot('balance', isBalSw);\n                }\n\n                // \u2500\u2500 Cells / Wire Resistance / Protection Grid \u2500\u2500\n                const dataMs = d.lastUpdateMs || 0;\n                const errMask = d.rawErrorsBitmask || 0;\n                const cellCnt = (d.cells && d.cells.length) ? d.cells.length : 24;\n                const needCellRebuild = (dataMs !== _lastUpdateMs || cellCnt !== _lastCellCnt);\n                const needProtRebuild = (errMask !== _lastErrMask || dataMs !== _lastUpdateMs);\n\n                if (needCellRebuild) {\n                    _lastUpdateMs = dataMs;\n                    _lastCellCnt = cellCnt;\n                    const grid3 = _c('cells-grid-3');\n                    const wgrid3 = _c('wire-grid-3');\n                    if (grid3 && cellCnt > 0) {\n                        let maxCellVal = 0, minCellVal = 999;\n                        let foundMaxNum = d.maxCellNum || 0, foundMinNum = d.minCellNum || 0;\n\n                        for (let i = 0; i < cellCnt; i++) {\n                            const v = (d.cells && i < d.cells.length) ? d.cells[i] : 0;\n                            if (v > maxCellVal) { maxCellVal = v; if (!foundMaxNum) foundMaxNum = (i + 1); }\n                            if (v > 0.5 && v < minCellVal) { minCellVal = v; if (!foundMinNum) foundMinNum = (i + 1); }\n                        }\n\n                        const frags = [];\n                        for (let i = 0; i < cellCnt; i++) {\n                            const num = i + 1;\n                            const v = (d.cells && i < d.cells.length) ? d.cells[i] : 0;\n                            if (v > 0.5) {\n                                const isMin = (num === d.minCellNum || (!d.minCellNum && num === foundMinNum));\n                                const isMax = (num === d.maxCellNum || (!d.maxCellNum && num === foundMaxNum));\n\n                                let cls = 'jk-val-txt';\n                                let balTag = '';\n                                if (isMin) {\n                                    cls += ' min';\n                                    if (d.balanceActive) balTag = '<span class=\"jk-bal-tag\">\u2696\ufe0f</span>';\n                                } else if (isMax) {\n                                    cls += ' max';\n                                    if (d.balanceActive) balTag = '<span class=\"jk-bal-tag\">\u2696\ufe0f</span>';\n                                }\n\n                                frags.push(\n                                    '<div class=\"jk-cell-item\">' +\n                                        '<span class=\"jk-num-badge\">' + num + '</span>' +\n                                        '<span class=\"' + cls + '\">' + v.toFixed(3) + '</span>' +\n                                        balTag +\n                                    '</div>'\n                                );\n                            } else {\n                                frags.push(\n                                    '<div class=\"jk-cell-item inactive\" style=\"opacity:0.35; border-color:rgba(255,255,255,0.04);\">' +\n                                        '<span class=\"jk-num-badge\" style=\"background:#141c22; color:#556570; border-color:#222f38;\">' + num + '</span>' +\n                                        '<span class=\"jk-val-txt\" style=\"color:#556570; font-size:0.75rem;\">0.000</span>' +\n                                    '</div>'\n                                );\n                            }\n                        }\n                        grid3.innerHTML = frags.join('');\n                    }\n                    if (wgrid3 && cellCnt > 0) {\n                        const frags = [];\n                        for (let i = 0; i < cellCnt; i++) {\n                            const num = i + 1;\n                            const v = (d.cells && i < d.cells.length) ? d.cells[i] : 0;\n                            let res = (d.cellResistances && i < d.cellResistances.length) ? d.cellResistances[i] : 0;\n                            if (res > 1.0) res = res / 1000.0;\n                            if (v > 0.5) {\n                                frags.push(\n                                    '<div class=\"jk-cell-item\">' +\n                                        '<span class=\"jk-num-badge\">' + num + '</span>' +\n                                        '<span class=\"jk-val-txt\" style=\"color:var(--green);\">' + res.toFixed(3) + '</span>' +\n                                    '</div>'\n                                );\n                            } else {\n                                frags.push(\n                                    '<div class=\"jk-cell-item inactive\" style=\"opacity:0.35; border-color:rgba(255,255,255,0.04);\">' +\n                                        '<span class=\"jk-num-badge\" style=\"background:#141c22; color:#556570; border-color:#222f38;\">' + num + '</span>' +\n                                        '<span class=\"jk-val-txt\" style=\"color:#556570; font-size:0.75rem;\">0.000</span>' +\n                                    '</div>'\n                                );\n                            }\n                        }\n                        wgrid3.innerHTML = frags.join('');\n                    }\n                }\n\n\n\n                // \u2500\u2500 Device Info (Active Balancer) \u2500\u2500\n                _set('dev-info-model', d.modelName || 'JK_B5A24S');\n                _set('dev-info-sn', d.serialNumber || '604130F0293');\n                _set('dev-info-hw', d.hardware_version || 'V11U');\n                _set('dev-info-sw', d.software_version || 'V11.57');\n                _set('dev-info-family', 'DWIN DGUS TTL (C\u1ed5ng LCD JK)');\n                                \n                // \u2500\u2500 Settings Tab Wi-Fi & BLE Status \u2500\u2500\n                if (connState !== _lastConnState || needCellRebuild) {\n                    const isStaConn = d.wifi_ssid && d.wifi_ssid !== \"Ch\u1ebf \u0111\u1ed9 Ph\u00e1t Wifi (SoftAP)\" && d.wifi_ssid !== \"Ch\u01b0a k\u1ebft n\u1ed1i\";\n                    const lblSsid = _c('lbl-wifi-ssid'); if (lblSsid) _set('lbl-wifi-ssid', '\ud83d\udce5 ' + (d.wifi_ssid || 'Ch\u01b0a k\u1ebft n\u1ed1i'));\n                    const lblIp = _c('lbl-wifi-ip'); if (lblIp) _set('lbl-wifi-ip', d.wifi_ip || '\u2014');\n                    const lblRssi = _c('lbl-wifi-rssi');\n                    if (lblRssi && d.wifi_rssi !== undefined) {\n                        const sig = d.wifi_rssi >= -60 ? ' (R\u1ea5t m\u1ea1nh)' : (d.wifi_rssi >= -75 ? ' (T\u1ed1t)' : ' (Y\u1ebfu)');\n                        _set('lbl-wifi-rssi', 'T\u00edn hi\u1ec7u: ' + d.wifi_rssi + ' dBm' + sig);\n                    }\n                    const lblWStatus = _c('lbl-wifi-status');\n                    if (lblWStatus) { lblWStatus.innerText = isStaConn ? '\u25cf \u0110ang k\u1ebft n\u1ed1i' : '\u25cb C\u1ea7n c\u00e0i \u0111\u1eb7t'; lblWStatus.style.background = isStaConn ? 'rgba(63,185,80,0.2)' : 'rgba(255,186,0,0.2)'; lblWStatus.style.color = isStaConn ? 'var(--green)' : 'var(--yellow)'; }\n                    // Monitor URL card\n                    const monCard = _c('monitor-url-card');\n                    if (monCard) {\n                        if (isStaConn && d.device_id) {\n                            monCard.style.display = 'block';\n                            const monInput = _c('lbl-monitor-url');\n                            if (monInput) monInput.value = 'https://bms.lha.io.vn/d/' + (d.device_id || 'JKBMS-C4CA');\n                        } else {\n                            monCard.style.display = 'none';\n                        }\n                    }\n                    if (!userEditingWifi) {\n                        const cv = _c('wifi-connected-view'), fv = _c('wifi-config-view');\n                        if (cv) cv.style.display = isStaConn ? 'block' : 'none';\n                        if (fv) fv.style.display = isStaConn ? 'none' : 'block';\n                    }\n                    const pinSt = _c('rs485-pin-status');\n                    if (pinSt && d.rs485_rx_pin !== undefined && d.rs485_tx_pin !== undefined) {\n                        pinSt.textContent = `RX: GPIO ${d.rs485_rx_pin} | TX: GPIO ${d.rs485_tx_pin}`;\n                    }\n                    const baudSt = _c('rs485-baud-status');\n                    if (baudSt && d.rs485_baud) {\n                        baudSt.textContent = d.rs485_baud;\n                    }\n                    const rsBadge = _c('rs485-conn-badge');\n                    if (rsBadge) {\n                        if (isConn) {\n                            rsBadge.textContent = '\u25cf \u0110ang K\u1ebft N\u1ed1i';\n                            rsBadge.style.color = 'var(--green)';\n                            rsBadge.style.borderColor = 'var(--green)';\n                            rsBadge.style.background = 'rgba(0,255,43,0.15)';\n                        } else {\n                            rsBadge.textContent = '\u25cb \u0110ang D\u00f2 T\u00edn Hi\u1ec7u';\n                            rsBadge.style.color = 'var(--yellow)';\n                            rsBadge.style.borderColor = 'var(--yellow)';\n                            rsBadge.style.background = 'rgba(255,184,0,0.15)';\n                        }\n                    }\n                }\n\n                updateMultiPackUI(d);\n            } catch(e) {\n                console.warn('[Telemetry] Error / Timeout:', e.message);\n                _consecutiveFailures++;\n                if (_consecutiveFailures >= 3) {\n                    const dot = _c('esp-online-dot');\n                    const txt = _c('esp-online-txt');\n                    const badge = _c('esp-online-badge');\n                    if (dot && txt && badge) {\n                        dot.style.background = '#ff3333';\n                        dot.style.boxShadow = '0 0 5px #ff3333';\n                        txt.textContent = 'ESP M\u1ea5t T\u00edn Hi\u1ec7u';\n                        badge.style.color = '#ff4d4d';\n                    }\n                    const sBanner = _c('status-banner');\n                    const bMsg = _c('banner-msg');\n                    const bIcon = _c('banner-icon');\n                    if (sBanner && bMsg && bIcon) {\n                        sBanner.className = 'status-banner err';\n                        sBanner.style.background = 'rgba(255, 50, 50, 0.15)';\n                        sBanner.style.borderColor = 'rgba(255, 50, 50, 0.5)';\n                        bIcon.textContent = '\u2716';\n                        bIcon.style.color = '#ff3333';\n                        bMsg.textContent = 'ESP32 \u0110ang B\u1eadn / T\u1ea1m M\u1ea5t K\u1ebft N\u1ed1i (\u0110ang th\u1eed l\u1ea1i...)';\n                        bMsg.style.color = '#ff4d4d';\n                    }\n                    const btIcon = _c('bt-icon-head');\n                    if (btIcon) btIcon.classList.remove('active');\n                    if (!window._lastTelemetry) {\n                        const arc = _c('gauge-arc');\n                        if (arc) arc.style.strokeDashoffset = '284.8';\n                        const socTxt = _c('home-soc-txt');\n                        if (socTxt) { socTxt.textContent = '0%'; socTxt.setAttribute('fill', '#556570'); }\n                    }\n                }\n            } finally {\n                _pollActive = false;\n            }\n        }\n\n        function updateMultiPackUI(d) {}\n\n        let userEditingWifi = false;\n        function toggleWifiForm(show) {\n            userEditingWifi = show;\n            const connView = document.getElementById('wifi-connected-view');\n            const cfgView = document.getElementById('wifi-config-view');\n            if (connView && cfgView) {\n                connView.style.display = show ? 'none' : 'block';\n                cfgView.style.display = show ? 'block' : 'none';\n            }\n        }\n\n        async function copyMonitorUrl() {\n            const inp = document.getElementById('lbl-monitor-url');\n            if (!inp || !inp.value) return;\n            const txt = inp.value;\n            let ok = false;\n            if (navigator.clipboard && window.isSecureContext) {\n                try {\n                    await navigator.clipboard.writeText(txt);\n                    ok = true;\n                } catch(e) {}\n            }\n            if (!ok) {\n                const ta = document.createElement('textarea');\n                ta.value = txt;\n                ta.style.position = 'fixed';\n                ta.style.left = '-9999px';\n                ta.style.top = (window.pageYOffset || document.documentElement.scrollTop) + 'px';\n                ta.contentEditable = 'true';\n                ta.readOnly = false;\n                document.body.appendChild(ta);\n                const range = document.createRange();\n                range.selectNodeContents(ta);\n                const sel = window.getSelection();\n                sel.removeAllRanges();\n                sel.addRange(range);\n                ta.setSelectionRange(0, 999999);\n                try { ok = document.execCommand('copy'); } catch(e) {}\n                document.body.removeChild(ta);\n            }\n            const msg = document.getElementById('monitor-url-copied');\n            if (msg) {\n                msg.style.display = 'block';\n                msg.innerText = ok ? '\\u2705 \\u0110\\u00e3 sao ch\\u00e9p link!' : '\\u26a0\\ufe0f H\\u00e3y nh\\u1ea5n ch\\u1ecdn & copy link';\n                msg.style.color = ok ? 'var(--green)' : 'var(--yellow)';\n                setTimeout(function(){ msg.style.display = 'none'; }, 2500);\n            }\n            inp.focus();\n            inp.select();\n        }\n\n        function updateMosDot(type, isOn) {\n            mosStates[type] = isOn;\n            const dot = document.getElementById('dot-' + type);\n            const txt = document.getElementById('txt-' + type);\n            if (dot && txt) {\n                if (type === 'balance') {\n                    if (!isOn) {\n                        dot.className = 'dot off';\n                        txt.className = 'val-off';\n                        txt.innerText = 'OFF';\n                    } else if (window._lastBalAct && window._lastBalCur > 0.02) {\n                        dot.className = 'dot on';\n                        txt.className = 'val-on';\n                        txt.innerText = '\u0110ANG C\u00c2N (' + window._lastBalCur.toFixed(2) + 'A)';\n                    } else {\n                        dot.className = 'dot standby';\n                        txt.className = 'val-standby';\n                        txt.innerText = 'CH\u1edc C\u00c2N (STANDBY)';\n                    }\n                } else {\n                    dot.className = 'dot ' + (isOn ? 'on' : 'off');\n                    txt.className = isOn ? 'val-on' : 'val-off';\n                    txt.innerText = isOn ? 'ON' : 'OFF';\n                }\n            }\n        }\n\n        async function toggleMos(type) {\n            const newState = !mosStates[type];\n            mosCmdLockMs = Date.now() + 5000;\n            updateMosDot(type, newState);\n            const target = (currentViewSlaveId > 0) ? currentViewSlaveId : -1;\n            try {\n                await fetch('/api/cmd', {\n                    method: 'POST',\n                    headers: { 'Content-Type': 'application/json' },\n                    body: JSON.stringify({ cmd: type, val: newState, target: target })\n                });\n            } catch(e) {}\n        }\n\n        async function loadPacks() {\n            try {\n                const res = await fetch('/api/packs');\n                const d = await res.json();\n                currentPacks = d.packs || [];\n                const listEl = document.getElementById('saved-packs-list');\n                if (!listEl) return;\n                listEl.innerHTML = '';\n                if (currentPacks.length === 0) {\n                    listEl.innerHTML = '<div style=\"font-size:0.8rem; color:var(--text-sub); text-align:center; padding:12px; background:rgba(255,255,255,0.02); border-radius:8px; border:1px dashed #222d35;\">Ch\u01b0a c\u00f3 Pack pin n\u00e0o trong danh s\u00e1ch. H\u00e3y nh\u1eadp MAC \u1edf tr\u00ean \u0111\u1ec3 l\u01b0u.</div>';\n                    return;\n                }\n                currentPacks.forEach((p, idx) => {\n                    const isActive = idx === d.active_idx;\n                    const div = document.createElement('div');\n                    div.style.cssText = 'display:flex; justify-content:space-between; align-items:center; background:rgba(15,23,42,0.7); border:1px solid ' + (isActive ? 'var(--green)' : 'rgba(56,189,248,0.2)') + '; padding:10px 12px; border-radius:8px; margin-bottom:8px;';\n                    div.innerHTML = `\n                        <div>\n                            <div style=\"font-weight:bold; font-size:0.9rem; color:${isActive ? 'var(--green)' : '#fff'}; display:flex; align-items:center; gap:6px;\">\n                                <span>${isActive ? '\ud83d\udfe2' : '\u26aa'}</span>\n                                <span>${p.alias || ('Pack ' + (idx+1))}</span>\n                                ${isActive ? '<span style=\"font-size:0.65rem; background:rgba(0,255,43,0.15); color:var(--green); border:1px solid var(--green); padding:1px 6px; border-radius:4px; font-weight:bold;\">\u0110ang D\u00f9ng</span>' : ''}\n                            </div>\n                            <div style=\"font-size:0.75rem; color:var(--text-sub); font-family:monospace; margin-top:3px;\">MAC: ${p.mac}</div>\n                        </div>\n                        <div style=\"display:flex; gap:6px;\">\n                            <button onclick=\"selectPack(${idx})\" style=\"background:${isActive ? 'var(--green)' : 'var(--cyan)'}; border:none; color:#000; padding:6px 12px; border-radius:6px; font-weight:bold; font-size:0.78rem; cursor:pointer;\">${isActive ? '\u2713 \u0110ang K\u1ebft N\u1ed1i' : '\u26a1 K\u1ebft N\u1ed1i'}</button>\n                            <button onclick=\"removePack(${idx})\" style=\"background:rgba(255,59,48,0.15); border:1px solid var(--red); color:var(--red); padding:6px 10px; border-radius:6px; font-weight:bold; font-size:0.75rem; cursor:pointer;\">\ud83d\uddd1\ufe0f X\u00f3a</button>\n                        </div>`;\n                    listEl.appendChild(div);\n                });\n\n                // Populate Home screen multi-pack switcher\n                const hSwitcher = document.getElementById('home-pack-switcher');\n                const hSelect = document.getElementById('home-pack-select');\n                if (hSwitcher && hSelect) {\n                    if (currentPacks.length > 1) {\n                        hSwitcher.style.display = 'flex';\n                        hSelect.innerHTML = '';\n                        currentPacks.forEach((p, idx) => {\n                            const opt = document.createElement('option');\n                            opt.value = idx;\n                            opt.innerText = `${idx === d.active_idx ? '\u25cf ' : ''}${p.alias || ('Pack ' + (idx+1))} [${p.mac}]`;\n                            if (idx === d.active_idx) opt.selected = true;\n                            hSelect.appendChild(opt);\n                        });\n                    } else {\n                        hSwitcher.style.display = 'none';\n                    }\n                }\n            } catch(e) {}\n        }\n\n        async function selectPack(idx) {\n            try {\n                await fetch('/api/pack/select', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({index: idx}) });\n                await loadPacks();\n                alert('\u0110\u00e3 chuy\u1ec3n sang Pack pin \u0111\u01b0\u1ee3c ch\u1ecdn!');\n            } catch(e) {}\n        }\n\n        async function removePack(idx) {\n            if (!confirm('X\u00f3a Pack pin n\u00e0y kh\u1ecfi danh s\u00e1ch \u0111\u00e3 l\u01b0u?')) return;\n            try {\n                await fetch('/api/pack/remove', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({index: idx}) });\n                await loadPacks();\n            } catch(e) {}\n        }\n\n        async function scanWifi() {\n            const el = document.getElementById('wifi-list');\n            el.innerHTML = '<p style=\"font-size:0.8rem; color:var(--text-sub);\">\u0110ang qu\u00e9t Wi-Fi...</p>';\n            try {\n                const res = await fetch('/api/wifi-scan');\n                const list = await res.json();\n                el.innerHTML = '';\n                list.forEach(w => {\n                    const div = document.createElement('div');\n                    div.className = 'list-item';\n                    div.innerHTML = `<div><div style=\"font-weight:bold;\">${w.ssid}</div><div style=\"font-size:0.75rem; color:var(--text-sub);\">RSSI: ${w.rssi} dBm</div></div><button class=\"btn\" style=\"width:auto; padding:4px 10px; font-size:0.75rem; margin:0;\" onclick=\"selectWifi('${w.ssid}')\">Ch\u1ecdn</button>`;\n                    el.appendChild(div);\n                });\n            } catch(e) { el.innerHTML = '<p style=\"color:var(--red)\">L\u1ed7i qu\u00e9t Wi-Fi</p>'; }\n        }\n\n        function selectWifi(ssid) {\n            document.getElementById('ssid').value = ssid;\n            document.getElementById('pass').focus();\n        }\n\n        async function saveConfig(e) {\n            e.preventDefault();\n            const btn = document.getElementById('btn-save-wifi');\n            const msg = document.getElementById('wifi-msg');\n            btn.disabled = true;\n            btn.innerText = '\u23f3 \u0110ang l\u01b0u...';\n            msg.innerText = '';\n\n            const payload = {\n                ssid: document.getElementById('ssid').value.trim(),\n                pass: document.getElementById('pass').value.trim(),\n                mqtt_server: document.getElementById('mqtt_srv').value.trim(),\n                mqtt_port: parseInt(document.getElementById('mqtt_port').value) || 1883\n            };\n\n            try {\n                const res = await fetch('/api/save', {\n                    method: 'POST',\n                    headers: { 'Content-Type': 'application/json' },\n                    body: JSON.stringify(payload)\n                });\n                const d = await res.json();\n                if (d.status === 'ok') {\n                    msg.style.color = 'var(--green)';\n                    msg.innerText = '\u2705 \u0110\u00e3 l\u01b0u th\u00e0nh c\u00f4ng! ESP32 \u0111ang kh\u1edfi \u0111\u1ed9ng l\u1ea1i \u0111\u1ec3 k\u1ebft n\u1ed1i...';\n                    setTimeout(() => { alert('ESP32 \u0111ang k\u1ebft n\u1ed1i v\u00e0o Wi-Fi: ' + payload.ssid + '\\nVui l\u00f2ng truy c\u1eadp theo IP m\u1edbi.'); }, 1500);\n                } else {\n                    msg.style.color = 'var(--red)';\n                    msg.innerText = '\u274c L\u1ed7i khi l\u01b0u c\u1ea5u h\u00ecnh';\n                    btn.disabled = false;\n                    btn.innerText = '\ud83d\udcbe L\u01b0u & K\u1ebft N\u1ed1i';\n                }\n            } catch(err) {\n                msg.style.color = 'var(--red)';\n                msg.innerText = '\u274c L\u1ed7i m\u1ea1ng ho\u1eb7c m\u1ea5t k\u1ebft n\u1ed1i t\u1edbi ESP32';\n                btn.disabled = false;\n                btn.innerText = '\ud83d\udcbe L\u01b0u & K\u1ebft N\u1ed1i';\n            }\n        }\n\n\n        function updateMosUi(type, state) {\n            const btn = document.getElementById('btn-mos-' + type);\n            if (!btn) return;\n            if (state) {\n                btn.className = 'btn-mos on';\n                btn.innerHTML = `<span>${type === 'charge' ? '\u26a1 S\u1ea1c' : (type === 'discharge' ? '\ud83d\udd0b X\u1ea3' : '\u2696\ufe0f C\u00e2n B\u1eb1ng')}</span><span>B\u1eacT</span>`;\n            } else {\n                btn.className = 'btn-mos off';\n                btn.innerHTML = `<span>${type === 'charge' ? '\u26a1 S\u1ea1c' : (type === 'discharge' ? '\ud83d\udd0b X\u1ea3' : '\u2696\ufe0f C\u00e2n B\u1eb1ng')}</span><span>T\u1eaeT</span>`;\n            }\n        }\n\n        async function emergencyPowerOff() {\n            if (!confirm('\u26a0\ufe0f C\u1ea2NH B\u00c1O: T\u1eaft ngu\u1ed3n kh\u1ea9n c\u1ea5p BMS?\\nBMS s\u1ebd ng\u1eaft ho\u00e0n to\u00e0n m\u1ecdi t\u1ea3i v\u00e0 ngu\u1ed3n s\u1ea1c.')) return;\n            try {\n                const res = await fetch('/api/command', {\n                    method: 'POST',\n                    headers: {'Content-Type':'application/json'},\n                    body: JSON.stringify({cmd: 'emergency_poweroff'})\n                });\n                const d = await res.json();\n                alert(d.status === 'ok' ? '\u0110\u00e3 g\u1eedi l\u1ec7nh ng\u1eaft kh\u1ea9n c\u1ea5p t\u1edbi BMS!' : 'L\u1ed7i g\u1eedi l\u1ec7nh!');\n            } catch(e) { alert('L\u1ed7i k\u1ebft n\u1ed1i t\u1edbi thi\u1ebft b\u1ecb!'); }\n        }\n\n        async function connectBLEUI() {\n            const mac = document.getElementById('cfg-ble-mac') ? document.getElementById('cfg-ble-mac').value.trim() : '';\n            const pin = document.getElementById('cfg-ble-pin') ? document.getElementById('cfg-ble-pin').value.trim() : '1234';\n            const stat = document.getElementById('ble-conn-status');\n            if (!mac) { alert('Vui l\u00f2ng nh\u1eadp \u0111\u1ecba ch\u1ec9 MAC c\u1ee7a BMS!'); return; }\n            if (stat) stat.innerText = '\u23f3 \u0110ang g\u1eedi y\u00eau c\u1ea7u k\u1ebft n\u1ed1i t\u1edbi ' + mac + '...';\n            try {\n                const res = await fetch('/api/command', {\n                    method: 'POST',\n                    headers: {'Content-Type':'application/json'},\n                    body: JSON.stringify({cmd: 'ble_connect', mac: mac, pin: pin})\n                });\n                const d = await res.json();\n                if (stat) stat.innerText = d.status === 'ok' ? '\u2705 \u0110ang ti\u1ebfn h\u00e0nh k\u1ebft n\u1ed1i...' : '\u274c L\u1ed7i k\u1ebft n\u1ed1i';\n                setTimeout(fetchTelemetry, 1000);\n            } catch(e) {\n                if (stat) stat.innerText = '\u274c L\u1ed7i m\u1ea1ng';\n            }\n        }\n\n        async function disconnectBLEUI() {\n            if (!confirm('B\u1ea1n c\u00f3 ch\u1eafc ch\u1eafn mu\u1ed1n ng\u1eaft k\u1ebft n\u1ed1i Bluetooth v\u1edbi BMS?')) return;\n            const stat = document.getElementById('ble-conn-status');\n            if (stat) stat.innerText = '\u23f3 \u0110ang ng\u1eaft k\u1ebft n\u1ed1i...';\n            try {\n                const res = await fetch('/api/command', {\n                    method: 'POST',\n                    headers: {'Content-Type':'application/json'},\n                    body: JSON.stringify({cmd: 'ble_disconnect'})\n                });\n                const d = await res.json();\n                if (stat) stat.innerText = d.status === 'ok' ? '\u2705 \u0110\u00e3 ng\u1eaft k\u1ebft n\u1ed1i' : '\u274c L\u1ed7i';\n                setTimeout(fetchTelemetry, 1000);\n            } catch(e) {\n                if (stat) stat.innerText = '\u274c L\u1ed7i m\u1ea1ng';\n            }\n        }\n\n        async function uploadFirmwareOTA() {\n            const fileInput = document.getElementById('ota-file');\n            const pBox = document.getElementById('ota-progress-box');\n            const pBar = document.getElementById('ota-bar');\n            const pTxt = document.getElementById('ota-status-text');\n\n            if (!fileInput || !fileInput.files || fileInput.files.length === 0) {\n                alert('Vui l\u00f2ng ch\u1ecdn file firmware (.bin) tr\u01b0\u1edbc khi n\u1ea1p!');\n                return;\n            }\n\n            const file = fileInput.files[0];\n            if (!file.name.endsWith('.bin')) {\n                alert('Ch\u1ec9 ch\u1ea5p nh\u1eadn file \u0111\u1ecbnh d\u1ea1ng .bin!');\n                return;\n            }\n\n            if (!confirm(`X\u00e1c nh\u1eadn n\u1ea1p firmware \"${file.name}\" (${(file.size/1024).toFixed(1)} KB) v\u00e0o ESP32?`)) {\n                return;\n            }\n\n            if (pBox) pBox.style.display = 'block';\n            if (pBar) pBar.style.width = '0%';\n            if (pTxt) pTxt.innerText = '\u0110ang chu\u1ea9n b\u1ecb n\u1ea1p firmware...';\n\n            const formData = new FormData();\n            formData.append('update', file);\n\n            const xhr = new XMLHttpRequest();\n            xhr.open('POST', '/update', true);\n\n            xhr.upload.onprogress = function(e) {\n                if (e.lengthComputable) {\n                    const pct = Math.round((e.loaded / e.total) * 100);\n                    if (pBar) pBar.style.width = pct + '%';\n                    if (pTxt) pTxt.innerText = `\u0110ang n\u1ea1p firmware: ${pct}% (${(e.loaded/1024).toFixed(0)} / ${(e.total/1024).toFixed(0)} KB)`;\n                }\n            };\n\n            xhr.onload = function() {\n                if (xhr.status === 200) {\n                    if (pBar) { pBar.style.width = '100%'; pBar.style.background = 'var(--green)'; }\n                    if (pTxt) pTxt.innerHTML = '<span style=\"color:var(--green); font-weight:bold;\">\u2705 N\u1ea1p Firmware th\u00e0nh c\u00f4ng!</span><br>ESP32 \u0111ang kh\u1edfi \u0111\u1ed9ng l\u1ea1i trong 5 gi\u00e2y...';\n                    setTimeout(() => { window.location.href = '/'; }, 6000);\n                } else {\n                    if (pTxt) pTxt.innerHTML = '<span style=\"color:var(--red);\">\u274c N\u1ea1p firmware th\u1ea5t b\u1ea1i: ' + xhr.responseText + '</span>';\n                }\n            };\n\n            xhr.onerror = function() {\n                if (pTxt) pTxt.innerHTML = '<span style=\"color:var(--red);\">\u274c L\u1ed7i k\u1ebft n\u1ed1i m\u1ea1ng khi t\u1ea3i firmware l\u00ean!</span>';\n            };\n\n            xhr.send(formData);\n        }\n\n        async function resetWifi() {\n            if (!confirm('B\u1ea1n c\u00f3 ch\u1eafc mu\u1ed1n Reset c\u00e0i \u0111\u1eb7t Wi-Fi v\u1ec1 m\u1eb7c \u0111\u1ecbnh?\\nESP32 s\u1ebd kh\u1edfi \u0111\u1ed9ng l\u1ea1i \u1edf ch\u1ebf \u0111\u1ed9 SoftAP (b\u1ea1n c\u1ea7n k\u1ebft n\u1ed1i l\u1ea1i \u0111\u1ec3 c\u1ea5u h\u00ecnh).')) return;\n            try {\n                const res = await fetch('/api/wifi-reset', { method: 'POST' });\n                const d = await res.json();\n                if (d.status === 'ok') {\n                    alert('\u0110\u00e3 x\u00f3a th\u00f4ng tin Wi-Fi th\u00e0nh c\u00f4ng! ESP32 \u0111ang kh\u1edfi \u0111\u1ed9ng l\u1ea1i v\u00e0o ch\u1ebf \u0111\u1ed9 SoftAP.');\n                    window.location.reload();\n                } else {\n                    alert('L\u1ed7i: ' + (d.message || 'Kh\u00f4ng th\u1ec3 reset Wi-Fi'));\n                }\n            } catch(e) {\n                alert('\u0110\u00e3 g\u1eedi l\u1ec7nh Reset! Thi\u1ebft b\u1ecb \u0111ang kh\u1edfi \u0111\u1ed9ng l\u1ea1i.');\n            }\n        }\n\n        // \u2500\u2500 RS485 & Connection Mode Functions \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n        function switchConnType(type) {\n            const msg = document.getElementById('conn-mode-msg');\n            const typeStr = (type === 2) ? 'RS485 Modbus' : (type === 1 ? 'Bluetooth (BLE)' : 'T\u1eaft C\u1ea3 2 (OFF)');\n            if (msg) msg.textContent = `\u23f3 \u0110ang l\u01b0u ch\u1ebf \u0111\u1ed9 ${typeStr} v\u00e0 kh\u1edfi \u0111\u1ed9ng l\u1ea1i...`;\n            fetch('/api/conn-type', {\n                method: 'POST',\n                headers: {'Content-Type': 'application/json'},\n                body: JSON.stringify({ conn_type: type })\n            })\n            .then(r => r.json())\n            .then(d => {\n                if (msg) msg.textContent = '\u2705 \u0110\u00e3 l\u01b0u! ESP32 \u0111ang kh\u1edfi \u0111\u1ed9ng l\u1ea1i...';\n                setTimeout(() => window.location.reload(), 4000);\n            })\n            .catch(e => {\n                if (msg) msg.textContent = '\u274c L\u1ed7i l\u01b0u ch\u1ebf \u0111\u1ed9 k\u1ebft n\u1ed1i';\n            });\n        }\n\n        function swapRs485Pins() {\n            const msg = document.getElementById('rs485-cfg-msg');\n            if (msg) msg.textContent = '\u23f3 \u0110ang \u0111\u1ea3o ch\u00e2n RX/TX...';\n            fetch('/api/rs485/swap', { method: 'POST' })\n            .then(r => r.json())\n            .then(d => {\n                if (msg) msg.textContent = `\u2705 \u0110\u00e3 \u0111\u1ed5i: RX=GPIO${d.rx_pin}, TX=GPIO${d.tx_pin}`;\n                const pinSt = document.getElementById('rs485-pin-status');\n                if (pinSt) pinSt.textContent = `RX: GPIO ${d.rx_pin} | TX: GPIO ${d.tx_pin}`;\n                setTimeout(fetchTelemetry, 1000);\n            })\n            .catch(e => {\n                if (msg) msg.textContent = '\u274c L\u1ed7i \u0111\u1ea3o ch\u00e2n';\n            });\n        }\n\n        function toggleRs485Baud() {\n            const msg = document.getElementById('rs485-cfg-msg');\n            const curBaudElem = document.getElementById('rs485-baud-status');\n            const curBaud = curBaudElem ? parseInt(curBaudElem.textContent) : 115200;\n            const newBaud = (curBaud === 115200) ? 9600 : 115200;\n            if (msg) msg.textContent = `\u23f3 \u0110ang \u0111\u1ed5i Baud sang ${newBaud}...`;\n            fetch('/api/rs485/config', {\n                method: 'POST',\n                headers: {'Content-Type': 'application/json'},\n                body: JSON.stringify({ baud: newBaud })\n            })\n            .then(r => r.json())\n            .then(d => {\n                if (msg) msg.textContent = `\u2705 \u0110\u00e3 chuy\u1ec3n sang ${d.baud} bps`;\n                if (curBaudElem) curBaudElem.textContent = d.baud;\n                setTimeout(fetchTelemetry, 1000);\n            })\n            .catch(e => {\n                if (msg) msg.textContent = '\u274c L\u1ed7i \u0111\u1ed5i Baud';\n            });\n        }\n\n        function autoDetectRs485() {\n            const msg = document.getElementById('rs485-cfg-msg');\n            if (msg) msg.textContent = '\ud83d\udd0d \u0110ang t\u1ef1 \u0111\u1ed9ng th\u1eed c\u00e1c ch\u00e2n RX/TX & Baud (9600/115200)...';\n            fetch('/api/rs485/auto-detect', { method: 'POST' })\n            .then(r => r.json())\n            .then(d => {\n                if (d.status === 'ok') {\n                    if (msg) msg.textContent = `\ud83c\udf89 T\u00ccM TH\u1ea4Y BMS! RX=GPIO${d.rx_pin}, TX=GPIO${d.tx_pin}, Baud=${d.baud}`;\n                } else {\n                    if (msg) msg.textContent = '\u26a0\ufe0f Kh\u00f4ng c\u00f3 ph\u1ea3n h\u1ed3i t\u1eeb BMS. Ki\u1ec3m tra d\u00e2y A/B & ngu\u1ed3n BMS.';\n                }\n                const pinSt = document.getElementById('rs485-pin-status');\n                if (pinSt) pinSt.textContent = `RX: GPIO ${d.rx_pin} | TX: GPIO ${d.tx_pin}`;\n                const baudSt = document.getElementById('rs485-baud-status');\n                if (baudSt) baudSt.textContent = d.baud;\n                setTimeout(fetchTelemetry, 1500);\n            })\n            .catch(e => {\n                if (msg) msg.textContent = '\u274c L\u1ed7i d\u00f2 t\u1ef1 \u0111\u1ed9ng';\n            });\n        }\n\n        // \u2500\u2500 Polling & Lifecycle \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n        let _pollTimer = null;\n        function schedulePoll() {\n            if (_pollTimer) clearTimeout(_pollTimer);\n            if (document.hidden) {\n                // When tab is hidden/minimized: STOP ALL POLLING completely to save 100% resources!\n                return;\n            }\n            const interval = (_consecutiveFailures > 0) ? 2000 : 600; // Realtime 600ms m\u01b0\u1ee3t m\u00e0 khi xem local\n            _pollTimer = setTimeout(async () => {\n                await fetchTelemetry();\n                schedulePoll();\n            }, interval);\n        }\n\n        function notifyInactive() {\n            try {\n                if (navigator.sendBeacon) {\n                    navigator.sendBeacon('/api/inactive');\n                }\n            } catch(e) {}\n            fetch('/api/inactive', { method: 'POST', keepalive: true }).catch(() => {});\n        }\n\n        document.addEventListener('visibilitychange', () => {\n            if (document.hidden) {\n                if (_pollTimer) clearTimeout(_pollTimer);\n                _pollActive = false;\n                notifyInactive();\n            } else {\n                fetch('/api/active', { method: 'POST', keepalive: true }).catch(() => {});\n                if (window._initialTelemetry) {\n                try {\n                    let d0 = window._initialTelemetry;\n                    if (d0.totalVoltage === undefined && d0.voltage !== undefined) d0.totalVoltage = d0.voltage;\n                    if (d0.deltaCellVoltage === undefined && d0.delta_cell_voltage !== undefined) d0.deltaCellVoltage = d0.delta_cell_voltage;\n                    if (d0.balanceCurrent === undefined && d0.balance_current !== undefined) d0.balanceCurrent = d0.balance_current;\n                    if (d0.balanceActive === undefined && d0.balance_active !== undefined) d0.balanceActive = d0.balance_active;\n                    if (d0.balanceActive === undefined && d0.balance !== undefined) d0.balanceActive = d0.balance;\n                    if (!d0.cells && d0.cell_voltages) d0.cells = d0.cell_voltages;\n                    if (!d0.cellResistances && d0.cell_resistances) d0.cellResistances = d0.cell_resistances;\n                    window._lastTelemetry = d0;\n                    updateUI(d0);\n                } catch(e) { console.error('Initial telemetry boot err:', e); }\n            }\n            fetchTelemetry();\n                schedulePoll();\n            }\n        });\n\n        window.addEventListener('pagehide', notifyInactive);\n        window.addEventListener('beforeunload', notifyInactive);\n\n        window.addEventListener('DOMContentLoaded', async () => {\n            fetch('/api/active', { method: 'POST', keepalive: true }).catch(() => {});\n            await fetchTelemetry();\n            schedulePoll();\n            if (window._lastTelemetry && (!window._lastTelemetry.wifi_ssid || window._lastTelemetry.wifi_ssid === \"Ch\u1ebf \u0111\u1ed9 Ph\u00e1t Wifi (SoftAP)\" || window._lastTelemetry.wifi_ssid === \"Ch\u01b0a k\u1ebft n\u1ed1i\")) {\n                showTab('tab-settings', document.getElementById('nav-sett'));\n                toggleWifiForm(true);\n            }\n        });\n    </script>\n</body>\n</html>\n";
+function BALANCER_DEVICE_HTML(d) {
+  const safeD = JSON.stringify(d || {}).replace(/</g, '\\u003c');
+  const inject = '<script>window._cloudDevId = ' + JSON.stringify(d?.device_id || '') + '; window._initialTelemetry = ' + safeD + ';</script></head>';
+  return BALANCER_HTML_TEMPLATE.replace('</head>', inject);
+}
+
 function CUSTOMER_DEVICE_HTML(d) {
   const online = d.online;
-  const bleConnected = d.connected && d.voltage > 0;
-  
-  const soc = bleConnected ? (d.soc !== undefined ? d.soc : '—') : '—';
-  const voltage = bleConnected ? (d.voltage ? d.voltage.toFixed(2) : '—') : '—';
-  const current = bleConnected ? (d.current !== undefined ? d.current.toFixed(2) : '—') : '—';
-  const power = bleConnected ? (d.power !== undefined ? Math.abs(d.power).toFixed(1) : (d.voltage && d.current ? Math.abs(d.voltage * d.current).toFixed(1) : '—')) : '—';
-  const mosTemp = bleConnected ? (d.mos_temp !== undefined ? d.mos_temp.toFixed(1) : '—') : '—';
-  const temp1 = bleConnected ? (d.temp1 !== undefined ? d.temp1.toFixed(1) : '—') : '—';
-  const temp2 = bleConnected ? (d.temp2 !== undefined ? d.temp2.toFixed(1) : '—') : '—';
-  const temp4 = '—';
-  const temp5 = '—';
-  const capacityAh = bleConnected ? (d.capacity_ah !== undefined ? d.capacity_ah.toFixed(1) : '—') : '—';
-  const totalCapacity = bleConnected ? (d.total_capacity !== undefined ? d.total_capacity.toFixed(1) : '—') : '—';
-  const cycleCount = bleConnected ? (d.cycle_count !== undefined ? d.cycle_count : '—') : '—';
-  const cycleCapacity = bleConnected ? (d.cycle_capacity !== undefined ? d.cycle_capacity.toFixed(1) : '—') : '—';
-  
-  const cellMin = bleConnected ? (d.cell_min !== undefined ? d.cell_min.toFixed(3) : '—') : '—';
-  const cellMax = bleConnected ? (d.cell_max !== undefined ? d.cell_max.toFixed(3) : '—') : '—';
-  const cellDelta = bleConnected ? (d.cell_delta !== undefined ? d.cell_delta.toFixed(3) : '—') : '—';
-  const aveCellVolt = bleConnected && d.voltage && d.cells && d.cells.length > 0 ? (d.voltage / d.cells.length).toFixed(3) : '—';
-  const cellMinNum = d.cell_min_num || '—';
-  const cellMaxNum = d.cell_max_num || '—';
-  const cells = d.cells || [];
-  const wireRes = d.wire_res || [];
+  const hasData = (d.voltage !== undefined && d.voltage > 0);
+  const nowMs = Date.now();
+  const timeSinceBms = d.lastBmsConnected ? (nowMs - d.lastBmsConnected) : 999999;
+  // 90s Grace Period: Cho phép ESP kết nối lại trong 90s mà không làm gián đoạn trạng thái Xanh
+  const bmsConnected = online && (d.connected === true || (hasData && timeSinceBms < 90000));
 
-  const chargeMos = bleConnected ? (d.charge_mos !== undefined ? d.charge_mos : false) : false;
-  const dischargeMos = bleConnected ? (d.discharge_mos !== undefined ? d.discharge_mos : false) : false;
-  const balance = bleConnected ? (d.balance !== undefined ? d.balance : false) : false;
+  const isBalancer = (d.conn_type === 'uart_lcd') || (d.conn_type === 'balancer') || (d.conn_type_num === 3) || (d.firmware_version && d.firmware_version.includes('BALANCER')) || (d.device_id && d.device_id.startsWith('JKBAL'));
+  const isModbus = !isBalancer && ((d.conn_type === 'ble' || d.conn_type_num === 1 || (d.firmware_version && d.firmware_version.includes('BLE')))
+    ? false
+    : ((d.conn_type === 'modbus') || (d.conn_type === 'rs485') || (d.conn_type_num === 2) || (d.firmware_version && d.firmware_version.includes('RS485')) || (d.active_bms_mac && String(d.active_bms_mac).startsWith('RS485'))));
 
-  const statusText = online ? 'WiFi Online' : 'WiFi Offline';
-  const statusColor = online ? '#3fb950' : '#f85149';
-  const bleText = bleConnected ? '🟢 Bluetooth Đã Kết Nối' : '🔴 Bluetooth Chưa Kết Nối BMS';
-  const bleColor = bleConnected ? '#3fb950' : '#f85149';
-  const rssiVal = d.rssi ? `${d.rssi} dBm` : 'Chưa có';
-  const reg = d.registeredAt ? new Date(d.registeredAt).toLocaleDateString('vi-VN') : '—';
+  const connProtocol = isBalancer ? 'JK Balancer UART (LCD Port)' : (isModbus ? 'RS485 Modbus RTU' : 'Bluetooth BLE');
+  const connBadgeHtml = isBalancer
+    ? `<span id="conn-type-badge" style="display:inline-block; font-size:0.65rem; padding:2px 7px; border-radius:4px; font-weight:800; background:rgba(16,185,129,0.18); color:#10b981; border:1px solid rgba(16,185,129,0.45); margin-left:6px; vertical-align:middle;">⚡ CÂN BẰNG JK</span>`
+    : (isModbus 
+      ? `<span id="conn-type-badge" style="display:inline-block; font-size:0.65rem; padding:2px 7px; border-radius:4px; font-weight:800; background:rgba(245,158,11,0.18); color:#f59e0b; border:1px solid rgba(245,158,11,0.45); margin-left:6px; vertical-align:middle;">🟠 MODBUS</span>`
+      : `<span id="conn-type-badge" style="display:inline-block; font-size:0.65rem; padding:2px 7px; border-radius:4px; font-weight:800; background:rgba(56,189,248,0.18); color:#38bdf8; border:1px solid rgba(56,189,248,0.45); margin-left:6px; vertical-align:middle;">🔵 BLUETOOTH</span>`);
 
-  // Render Cell Voltage Items
-  let cellItemsHtml = '';
-  if (bleConnected && cells.length > 0) {
-    cellItemsHtml = cells.map((v, i) => {
-      const num = (i + 1).toString().padStart(2, '0');
-      let color = '#3fb950';
-      if (i + 1 === cellMinNum) color = '#f85149';
-      const valStr = (typeof v === 'number' ? v : parseFloat(v)).toFixed(3);
-      return `<div class="cell-box"><span class="c-num">${num}</span><span class="c-val" style="color:${color};">${valStr}<sup>V</sup></span></div>`;
-    }).join('');
-  } else {
-    cellItemsHtml = '<div style="grid-column:1/-1;text-align:center;padding:16px;color:#8b949e;font-size:0.8rem;background:#081312;border-radius:8px;">⏳ Đang chờ kết nối Bluetooth để đọc dữ liệu Cell...</div>';
+  const soc      = (bmsConnected || hasData) ? (d.soc !== undefined ? d.soc : 0) : 0;
+  const voltage  = (bmsConnected || hasData) ? (d.voltage ? d.voltage.toFixed(2) : '—') : '—';
+  const current  = (bmsConnected || hasData) ? (d.current !== undefined ? d.current.toFixed(2) : '0.00') : '—';
+  const power    = (bmsConnected || hasData) ? (d.power !== undefined ? Math.abs(d.power).toFixed(1) : '0.0') : '—';
+  const mosTemp  = (bmsConnected || hasData) ? (d.mos_temp !== undefined ? d.mos_temp.toFixed(1) : '—') : '—';
+  const temp1    = (bmsConnected || hasData) && d.temp1 && d.temp1 > 0 ? d.temp1.toFixed(1) : null;
+  const temp2    = (bmsConnected || hasData) && d.temp2 && d.temp2 > 0 ? d.temp2.toFixed(1) : null;
+  const capAh    = (bmsConnected || hasData) ? (d.capacity_ah !== undefined ? d.capacity_ah.toFixed(1) : '—') : '—';
+  const remCap   = (bmsConnected || hasData) ? (d.remain_capacity_ah !== undefined ? d.remain_capacity_ah.toFixed(1) : '—') : '—';
+  const balCurr  = (bmsConnected || hasData) ? (d.balance_current !== undefined ? d.balance_current.toFixed(3) : '0.000') : '—';
+  const cycleCap = (bmsConnected || hasData) ? (d.cycle_capacity_ah !== undefined ? d.cycle_capacity_ah.toFixed(1) : '—') : '—';
+  const cycles   = (bmsConnected || hasData) ? (d.cycle_count !== undefined ? d.cycle_count : '—') : '—';
+  const detailLogs = (bmsConnected || hasData) ? (d.detail_logs_count !== undefined ? d.detail_logs_count : '—') : '—';
+  const chargeMos   = d.charge_mos !== undefined ? d.charge_mos : false;
+  const dischargeMos= d.discharge_mos !== undefined ? d.discharge_mos : false;
+  const balSw       = (d.balance !== undefined) ? !!d.balance : (d.balance_switch !== undefined ? !!d.balance_switch : !!d.balance_active);
+  const balAct      = (d.balance_active !== undefined) ? !!d.balance_active : (balSw && ((d.balance_current > 0.01) || (d.balanceCurrent > 0.01)));
+  const balance     = balSw;
+
+  // Cell voltages & internal resistances
+  const cells = Array.isArray(d.cell_voltages) ? d.cell_voltages : (Array.isArray(d.cells) ? d.cells : []);
+  const cellRes = Array.isArray(d.cell_resistances) ? d.cell_resistances : [];
+  const cellMinNum = d.min_cell_num || 0;
+  const cellMaxNum = d.max_cell_num || 0;
+  const activeCount = d.cell_count || (cells.length > 0 ? cells.length : 16);
+
+  let maxCellVal = (d.max_cell_voltage !== undefined && d.max_cell_voltage > 0) ? d.max_cell_voltage : 0;
+  let minCellVal = (d.min_cell_voltage !== undefined && d.min_cell_voltage > 0) ? d.min_cell_voltage : 999;
+  let foundMaxNum = cellMaxNum || 0, foundMinNum = cellMinNum || 0;
+
+  if (cells.length > 0) {
+    for (let i = 0; i < activeCount; i++) {
+      const v = (cells[i] !== undefined) ? (typeof cells[i] === 'number' ? cells[i] : parseFloat(cells[i])) : 0;
+      if (v > maxCellVal) { maxCellVal = v; if (!foundMaxNum) foundMaxNum = (i + 1); }
+      if (v > 0 && v < minCellVal) { minCellVal = v; if (!foundMinNum) foundMinNum = (i + 1); }
+    }
+  }
+  if (minCellVal === 999) minCellVal = 0;
+  if (!d.max_cell_voltage && maxCellVal > 0) d.max_cell_voltage = maxCellVal;
+  if (!d.min_cell_voltage && minCellVal > 0) d.min_cell_voltage = minCellVal;
+  if (d.delta_cell_voltage === undefined && maxCellVal > 0 && minCellVal > 0) {
+    d.delta_cell_voltage = parseFloat((maxCellVal - minCellVal).toFixed(3));
   }
 
-  // Render Wire Resistance Items
-  let wireItemsHtml = '';
-  if (bleConnected && wireRes.length > 0) {
-    wireItemsHtml = wireRes.map((r, i) => {
-      const num = (i + 1).toString().padStart(2, '0');
-      return `<div class="cell-box"><span class="c-num">${num}</span><span class="c-val" style="color:#3fb950;">${r.toFixed(3)}<sup>Ω</sup></span></div>`;
-    }).join('');
-  } else {
-    wireItemsHtml = '<div style="grid-column:1/-1;text-align:center;padding:16px;color:#8b949e;font-size:0.8rem;background:#081312;border-radius:8px;">⏳ Đang chờ kết nối Bluetooth để đo điện trở cáp...</div>';
+  const aveCellVolt = (bmsConnected || hasData) && d.min_cell_voltage && d.max_cell_voltage
+    ? (((d.min_cell_voltage||0) + (d.max_cell_voltage||0)) / 2).toFixed(3)
+    : (d.voltage && activeCount > 0 ? (d.voltage / activeCount).toFixed(3) : '—');
+  const cellDelta = (bmsConnected || hasData) ? (d.delta_cell_voltage !== undefined ? d.delta_cell_voltage.toFixed(3) : (maxCellVal && minCellVal ? (maxCellVal - minCellVal).toFixed(3) : '—')) : '—';
+  const statusColor = online ? (bmsConnected ? '#3fb950' : '#f59e0b') : '#f85149';
+  const statusText  = online ? (bmsConnected ? 'Online' : 'Đang kết nối lại...') : 'Offline';
+  const rssiVal     = d.rssi ? d.rssi + ' dBm' : '—';
+  const reg = d.activatedAtStr || '—';
+  const bmsDisplayName = (d.active_bms_name && d.active_bms_name !== 'JK_PB2A16S15P' && !d.active_bms_name.startsWith('JK-BMS [') ? d.active_bms_name : null) || d.active_pack_name || d.active_pack_alias || d.active_bms_name || 'JK-BMS';
+
+  // Pack Selector data
+  const packsSummary = (d.packs_summary && Array.isArray(d.packs_summary) && d.packs_summary.length > 1) ? d.packs_summary : null;
+  let activePackIdx = d.active_pack_idx !== undefined ? d.active_pack_idx : 0;
+  if (packsSummary && d.active_bms_mac) {
+    const curNormMac = d.active_bms_mac.toLowerCase().replace(/[:-]/g, '');
+    const matchedIdx = packsSummary.findIndex(p => (p.mac || '').toLowerCase().replace(/[:-]/g, '') === curNormMac);
+    if (matchedIdx >= 0) {
+      activePackIdx = matchedIdx;
+      packsSummary.forEach((p, idx) => {
+        p.active = (idx === matchedIdx);
+        if (idx === matchedIdx) {
+          p.connected = bmsConnected;
+          if (d.voltage > 0) p.voltage = d.voltage;
+          if (d.soc !== undefined) p.soc = d.soc;
+        } else if (p.connected && idx !== matchedIdx) {
+          p.connected = false;
+        }
+      });
+    }
   }
+  const packsSummaryJs = packsSummary ? JSON.stringify(packsSummary) : 'null';
+
+  const initSec = (d.total_runtime_s && d.total_runtime_s > 0) ? d.total_runtime_s : ((d.totalRuntimeSec && d.totalRuntimeSec > 0) ? d.totalRuntimeSec : ((d.uptime_s && d.uptime_s > 0) ? d.uptime_s : (d.uptimeSec || 0)));
+  const initDays = Math.floor(initSec / 86400);
+  const initHours = Math.floor((initSec % 86400) / 3600);
+  const initMins = Math.floor((initSec % 3600) / 60);
+  const initS = Math.floor(initSec % 60);
+  const runtimeStr = `${initDays}d ${initHours.toString().padStart(2,'0')}h ${initMins.toString().padStart(2,'0')}m ${initS.toString().padStart(2,'0')}s`;
+
+  const getParamVal = (reg, sKey, formatFn) => {
+    let val = undefined;
+    if (d.settings && d.settings[sKey] !== undefined) val = d.settings[sKey];
+    else if (d.params && d.params[reg] !== undefined) val = d.params[reg];
+    if (val !== undefined && val !== null && val !== '') {
+      return formatFn ? formatFn(val) : String(val);
+    }
+    return '';
+  };
+
+  const getCanProtocolName = (code) => {
+    if (code === undefined || code === null || code === '') return '—';
+    const c = parseInt(code);
+    const map = {
+      0: '000 User-defined',
+      1: '001 Deye',
+      2: '002 Pylontech',
+      3: '003 Growatt',
+      4: '004 Victron',
+      5: '005 Goodwe',
+      6: '006 SMA',
+      7: '007 Sofar',
+      8: '008 Solis',
+      9: '009 SRNE',
+      10: '010 Must',
+      11: '011 Luxpower',
+      12: '012 Voltronic',
+      13: '013 Schneider',
+      14: '014 TBB',
+      15: '015 Studer'
+    };
+    return map[c] || (String(c).padStart(3, '0') + ' Protocol');
+  };
+
+  const formatBmsAddress = (addr) => {
+    if (addr === undefined || addr === null || addr === '' || addr === '—') return 'ID 1 (Master)';
+    const num = Number(addr);
+    if (isNaN(num) || num <= 0) return 'ID 1 (Master / Mặc định)';
+    return `ID ${num}`;
+  };
+
+  // Pre-render Cells Grid (3 columns, authentic JK style)
+  let serverCellsHtml = '';
+  if (cells.length > 0) {
+    const rows = Math.ceil(activeCount / 3);
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < 3; c++) {
+        const i = r + c * rows;
+        if (i < activeCount) {
+          const num = i + 1;
+          const v = (cells[i] !== undefined) ? (typeof cells[i] === 'number' ? cells[i] : parseFloat(cells[i])) : 0;
+          const isMin = (num === cellMinNum || (!cellMinNum && num === foundMinNum));
+          const isMax = (num === cellMaxNum || (!cellMaxNum && num === foundMaxNum));
+          let cls = 'jk-val-txt';
+          let balTag = '';
+          if (isMin) { cls += ' min'; if (balAct) balTag = '<span class="jk-bal-tag">⚖️</span>'; }
+          else if (isMax) { cls += ' max'; if (balAct) balTag = '<span class="jk-bal-tag">⚖️</span>'; }
+          serverCellsHtml += '<div class="jk-cell-item">' +
+            '<span class="jk-num-badge">' + num + '</span>' +
+            '<span class="' + cls + '">' + v.toFixed(3) + '</span>' +
+            balTag +
+          '</div>';
+        } else {
+          serverCellsHtml += '<div class="jk-cell-item"></div>';
+        }
+      }
+    }
+  }
+
+  // Pre-render Wire Resistance Grid
+  let serverWireHtml = '';
+  if (cellRes.length > 0) {
+    const rows = Math.ceil(activeCount / 3);
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < 3; c++) {
+        const i = r + c * rows;
+        if (i < activeCount) {
+          const num = i + 1;
+          const rVal = cellRes[i] || 0;
+          const rNum = (typeof rVal === 'number' ? rVal : parseFloat(rVal));
+          serverWireHtml += '<div class="jk-cell-item">' +
+            '<span class="jk-num-badge">' + num + '</span>' +
+            '<span class="jk-val-txt">' + rNum.toFixed(3) + '</span>' +
+          '</div>';
+        } else {
+          serverWireHtml += '<div class="jk-cell-item"></div>';
+        }
+      }
+    }
+  }
+
+  // Pre-render Protection Grid
+  const PROT_ITEMS = [
+    { bit: 0, desc: 'Quá áp sạc cell' },
+    { bit: 1, desc: 'Dưới áp xả cell' },
+    { bit: 2, desc: 'Quá áp pack' },
+    { bit: 3, desc: 'Dưới áp pack' },
+    { bit: 4, desc: 'Quá dòng sạc' },
+    { bit: 5, desc: 'Quá dòng xả' },
+    { bit: 6, desc: 'Nhiệt độ MOS cao' },
+    { bit: 7, desc: 'Nhiệt độ cảm biến sạc cao' },
+    { bit: 8, desc: 'Nhiệt độ cảm biến xả cao' },
+    { bit: 9, desc: 'Nhiệt độ cảm biến thấp' },
+    { bit: 10, desc: 'Lệch áp cell quá lớn' }
+  ];
+  const errMask = d.raw_errors_bitmask || 0;
+  let serverProtHtml = '';
+  PROT_ITEMS.forEach(p => {
+    const isAlarm = (errMask & (1 << p.bit)) !== 0;
+    serverProtHtml += '<div class="prot-item"><span class="prot-lbl">' + p.desc + '</span><span class="prot-badge ' + (isAlarm ? 'alarm' : 'ok') + '">' + (isAlarm ? '⚠️ Báo động' : '✔ Chuẩn') + '</span></div>';
+  });
+
+  // SOC ring angle
+  const socNum = parseInt(soc) || 0;
+  const ringDash = Math.round(socNum * 2.513); // circumference ~251.3 for r=40
+  const initialOffset = (284.8 - (socNum / 100) * 284.8).toFixed(1);
 
   return `<!DOCTYPE html>
 <html lang="vi">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>JK-BMS Monitoring System - ${d.device_id}</title>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Share+Tech+Mono&display=swap" rel="stylesheet">
-<style>
-  *{margin:0;padding:0;box-sizing:border-box;}
-  body{font-family:'Inter',sans-serif;background:#0d1414;color:#e6edf3;min-height:100vh;padding-bottom:70px;}
-  
-  .header-bar{background:#081010;border-bottom:1px solid #162624;padding:8px 14px;display:flex;align-items:center;justify-content:space-between;font-size:0.75rem;color:#8b949e;font-weight:600;}
-  .header-switches{display:flex;gap:12px;color:#3fb950;font-family:monospace;}
-  .header-switches span{display:inline-flex;align-items:center;gap:4px;}
+    <meta charset="UTF-8">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="theme-color" content="#000000">
+    <title>JK BMS WiFi Monitor - ${d.device_id}</title>
+    <style>
+        :root {
+            --sat: env(safe-area-inset-top, 0px);
+            --sab: env(safe-area-inset-bottom, 0px);
+            --sal: env(safe-area-inset-left, 0px);
+            --sar: env(safe-area-inset-right, 0px);
+            --bg-black: #000000;
+            --card-bg: #121518;
+            --card-border: #1d252c;
+            --green: #00ff2b;
+            --cyan: #38bdf8;
+            --red: #ff3b30;
+            --yellow: #f59e0b;
+            --text-white: #ffffff;
+            --text-sub: #8e8e93;
+            --badge-bg: #0077b6;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; -webkit-tap-highlight-color: transparent; }
+        html {
+            background-color: var(--bg-black);
+            -webkit-text-size-adjust: 100%;
+            text-size-adjust: 100%;
+            overflow-x: hidden;
+            width: 100%;
+        }
+        body {
+            background-color: var(--bg-black);
+            color: var(--text-white);
+            min-height: 100vh;
+            min-height: -webkit-fill-available;
+            padding-bottom: calc(88px + var(--sab));
+            user-select: none;
+            -webkit-user-select: none;
+            overflow-x: hidden;
+            width: 100%;
+            max-width: 100vw;
+        }
+        .app {
+            max-width: 480px;
+            width: 100%;
+            margin: 0 auto;
+            min-height: 100vh;
+            position: relative;
+            background: #000;
+            padding-left: var(--sal);
+            padding-right: var(--sar);
+            overflow-x: hidden;
+        }
 
-  .hero-panel{background:linear-gradient(180deg,#0a1615 0%,#0d1c1a 100%);padding:18px 16px 14px;border-bottom:1px solid #19332e;text-align:center;}
-  .hero-main{display:flex;justify-content:space-around;align-items:baseline;max-width:380px;margin:0 auto 10px;}
-  .hero-val-v{font-family:'Share Tech Mono',monospace;font-size:2.8rem;font-weight:700;color:#3fb950;letter-spacing:-1px;}
-  .hero-val-v sup{font-size:1.2rem;top:-1em;}
-  .hero-val-a{font-family:'Share Tech Mono',monospace;font-size:2.8rem;font-weight:700;color:#3fb950;letter-spacing:-1px;}
-  .hero-val-a sup{font-size:1.2rem;top:-1em;}
+        /* Sticky Top Header with Safe Area Inset */
+        .app-header {
+            position: -webkit-sticky;
+            position: sticky;
+            top: 0;
+            z-index: 999;
+            background: rgba(0, 0, 0, 0.95);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border-bottom: 1px solid #181818;
+            padding-top: var(--sat);
+            width: 100%;
+            max-width: 100%;
+            overflow: hidden;
+        }
 
-  .nav-tabs{display:flex;background:#060d0d;border-bottom:1px solid #162624;position:sticky;top:0;z-index:100;}
-  .tab-btn{flex:1;padding:12px 0;text-align:center;font-size:0.82rem;font-weight:700;color:#8b949e;border:none;background:none;cursor:pointer;border-bottom:2px solid transparent;transition:all 0.2s;}
-  .tab-btn.active{color:#3fb950;border-bottom-color:#3fb950;background:rgba(63,185,80,0.06);}
+        /* Top Header Bar */
+        .top-bar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 12px 6px 12px;
+            background: transparent;
+            gap: 8px;
+            min-width: 0;
+        }
+        .top-bar-left {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            min-width: 0;
+            flex: 1;
+            overflow: hidden;
+        }
+        .top-bar-right {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            flex-shrink: 0;
+        }
+        .bt-status { display: flex; align-items: center; gap: 4px; font-size: 1.05rem; color: #555; flex-shrink: 0; }
+        .bt-status.active { color: var(--cyan); }
+        .uptime-txt { font-size: 0.78rem; font-weight: 500; color: #e5e5e5; letter-spacing: 0.2px; font-family: monospace; white-space: nowrap; }
+        .menu-btn { font-size: 1.25rem; color: #fff; cursor: pointer; border: none; background: transparent; padding: 4px; }
 
-  .tab-content{display:none;max-width:440px;margin:0 auto;padding:14px;}
-  .tab-content.active{display:block;}
+        /* MOS Control Top Bar */
+        .mos-bar {
+            display: flex;
+            justify-content: space-around;
+            align-items: center;
+            background: transparent;
+            padding: 5px 6px 6px 6px;
+            border-top: 1px solid rgba(255,255,255,0.05);
+            font-size: 0.8rem;
+            font-weight: 600;
+            gap: 4px;
+        }
+        .mos-item {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            cursor: pointer;
+            padding: 4px 8px;
+            border-radius: 6px;
+            background: rgba(255,255,255,0.03);
+            touch-action: manipulation;
+        }
+        .dot { width: 7px; height: 7px; border-radius: 50%; background: #444; flex-shrink: 0; }
+        .dot.on { background: var(--green); box-shadow: 0 0 6px var(--green); }
+        .dot.off { background: var(--red); box-shadow: 0 0 6px var(--red); }
+        .dot.standby { background: var(--cyan); box-shadow: 0 0 6px var(--cyan); }
+        .val-on { color: var(--green); font-weight: bold; }
+        .val-off { color: var(--red); font-weight: bold; }
+        .val-standby { color: var(--cyan); font-weight: bold; }
 
-  .data-list{background:#0a1615;border:1px solid #162a26;border-radius:12px;padding:6px 14px;margin-bottom:14px;}
-  .data-row{display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid rgba(255,255,255,0.04);font-size:0.82rem;}
-  .data-row:last-child{border-bottom:none;}
-  .data-key{color:#94a3b8;font-weight:500;}
-  .data-val{font-family:'Share Tech Mono',monospace;color:#3fb950;font-weight:700;}
+        /* Gauge Section */
+        .gauge-section { position: relative; width: 100%; text-align: center; padding: 10px 0 4px 0; overflow: hidden; }
+        .gauge-svg { width: 250px; height: 230px; margin: 0 auto; display: block; max-width: 100%; }
 
-  .section-header{font-size:0.85rem;font-weight:800;color:#38bdf8;text-align:center;margin:16px 0 10px;text-transform:uppercase;letter-spacing:0.05em;}
+        /* Notification Banner */
+        .status-banner { margin: 8px 12px; background: rgba(5,35,41,0.85); border: 1px solid #008b99; border-radius: 10px; padding: 8px 12px; display: flex; align-items: center; gap: 8px; font-size: 0.82rem; color: #e2e8f0; min-width: 0; }
+        .banner-icon { color: var(--green); font-size: 1.1rem; flex-shrink: 0; }
 
-  .cells-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:16px;}
-  .cell-box{background:#081312;border:1px solid #152b27;border-radius:8px;padding:7px 8px;display:flex;align-items:center;justify-content:space-between;}
-  .c-num{font-size:0.75rem;font-weight:700;color:#38bdf8;background:rgba(56,189,248,0.12);padding:2px 6px;border-radius:4px;font-family:monospace;}
-  .c-val{font-family:'Share Tech Mono',monospace;font-size:0.88rem;font-weight:700;}
-  .c-val sup{font-size:0.65rem;}
+        /* Quick BLE Bar */
+        .quick-ble-box { background: #131c22; border: 1px solid #222d35; border-radius: 10px; padding: 10px 12px; margin: 8px 12px 10px 12px; min-width: 0; }
 
-  .setting-group-title{font-size:0.8rem;font-weight:800;color:#38bdf8;text-align:center;margin:12px 0 8px;text-transform:uppercase;}
-  .setting-row{display:flex;justify-content:space-between;align-items:center;background:#0a1615;border:1px solid #162a26;border-radius:8px;padding:8px 12px;margin-bottom:6px;font-size:0.8rem;}
-  .setting-key{color:#94a3b8;}
-  .setting-box{display:flex;align-items:center;gap:6px;}
-  .setting-val{background:#060e0d;border:1px solid #1b3833;border-radius:6px;padding:4px 10px;color:#3fb950;font-family:monospace;font-weight:700;min-width:70px;text-align:right;}
-  .setting-ok{font-size:0.68rem;color:#3fb950;border:1px solid rgba(63,185,80,0.4);padding:3px 6px;border-radius:4px;}
+        /* Metrics Grids (4 columns - Responsive Non-overflowing) */
+        .metrics-grid-4 {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 2px;
+            margin: 8px 12px;
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 12px;
+            padding: 10px 4px;
+            text-align: center;
+        }
+        .metric-item {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            padding: 2px 0;
+            min-width: 0;
+            overflow: hidden;
+        }
+        .metric-item:not(:last-child)::after { content: ''; position: absolute; right: 0; top: 15%; height: 70%; width: 1px; background: #222d35; }
+        .metric-val {
+            font-size: 1.05rem;
+            font-weight: 800;
+            margin-bottom: 2px;
+            white-space: nowrap;
+            letter-spacing: -0.3px;
+            max-width: 100%;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .metric-lbl {
+            font-size: 0.62rem;
+            color: var(--text-sub);
+            white-space: nowrap;
+            max-width: 100%;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
 
-  .btn-reset{background:rgba(248,81,73,0.15);border:1px solid rgba(248,81,73,0.4);color:#f85149;padding:12px;border-radius:10px;font-size:0.85rem;font-weight:700;cursor:pointer;width:100%;transition:all 0.2s;}
+        /* Power & Status Card */
+        .info-card-box {
+            margin: 8px 12px;
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 12px;
+            padding: 10px 12px;
+            font-size: 0.84rem;
+            min-width: 0;
+        }
+        .card-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            padding: 5px 0;
+            gap: 8px;
+            min-width: 0;
+        }
+        .card-row > span:first-child {
+            color: #94a3b8;
+            font-size: 0.82rem;
+            flex-shrink: 0;
+            max-width: 48%;
+            line-height: 1.3;
+        }
+        .card-row > strong, .card-row > span:last-child {
+            text-align: right;
+            word-break: break-word;
+            overflow-wrap: anywhere;
+            min-width: 0;
+            font-size: 0.82rem;
+            line-height: 1.3;
+        }
+        .card-divider { height: 1px; background: #222d35; margin: 6px 0; }
 
-  .footer-nav{position:fixed;bottom:0;left:0;right:0;background:#060d0d;border-top:1px solid #162624;display:flex;justify-content:space-around;padding:8px 0;z-index:200;}
-  .f-btn{display:flex;flex-direction:column;align-items:center;color:#8b949e;font-size:0.68rem;font-weight:600;text-decoration:none;cursor:pointer;border:none;background:none;}
-  .f-btn.active{color:#3fb950;}
-  .f-icon{font-size:1.2rem;margin-bottom:2px;}
-</style>
+        /* Real-time Detailed Status List */
+        .realtime-title {
+            color: var(--green);
+            font-size: 0.88rem;
+            font-weight: 700;
+            margin: 12px 14px 8px 14px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .realtime-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 6px 12px;
+            margin: 0 12px;
+            font-size: 0.8rem;
+        }
+        .rt-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #141a20;
+            padding-bottom: 4px;
+            min-width: 0;
+            gap: 4px;
+        }
+        .rt-lbl {
+            color: #8fa0ab;
+            font-size: 0.75rem;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            min-width: 0;
+            flex-shrink: 1;
+        }
+        .rt-val {
+            color: var(--green);
+            font-weight: 700;
+            font-size: 0.78rem;
+            white-space: nowrap;
+            flex-shrink: 0;
+            text-align: right;
+        }
+        .unit-sup { font-size: 0.65rem; font-weight: normal; vertical-align: super; margin-left: 1px; }
+
+        /* Authentic JK App Styling for Cell Voltages & Wire Resistance */
+        .jk-bat-summary {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 4px 10px;
+            padding: 8px 14px 2px 14px;
+            font-size: 0.84rem;
+            font-weight: 700;
+            color: #ffffff;
+        }
+        .jk-bat-summary > span {
+            display: inline-flex;
+            align-items: center;
+        }
+        .jk-bat-summary .jk-dot, .jk-section-title .jk-dot {
+            display: inline-block;
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: #00ff2b;
+            box-shadow: 0 0 6px rgba(0, 255, 43, 0.6);
+            margin-right: 6px;
+            flex-shrink: 0;
+        }
+        .jk-bat-summary .unit, .jk-section-title .unit { color: #00ff2b; font-weight: 600; }
+        .jk-bat-summary .val { color: #00ff2b; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", monospace; font-size: 0.92rem; font-weight: 700; }
+        .jk-divider { height: 1px; background: #1c2630; margin: 8px 14px; }
+
+        .jk-section-title {
+            color: #ffffff;
+            font-size: 0.88rem;
+            font-weight: 700;
+            margin: 10px 14px 6px 14px;
+            display: flex;
+            align-items: center;
+            gap: 2px;
+        }
+        .jk-section-title .colon { color: #ffffff; margin-left: 2px; }
+
+        .jk-grid-3 {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            column-gap: 4px;
+            row-gap: 8px;
+            margin: 8px 10px 12px 10px;
+        }
+        .jk-cell-item {
+            display: flex;
+            align-items: center;
+            gap: 3px;
+            background: transparent;
+            border: none;
+            padding: 0;
+            min-height: 20px;
+            min-width: 0;
+            overflow: hidden;
+        }
+        .jk-num-badge {
+            background: #14556b;
+            color: #5eead4;
+            min-width: 18px;
+            height: 18px;
+            padding: 0 2px;
+            border-radius: 4px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.68rem;
+            font-weight: 700;
+            font-family: -apple-system, BlinkMacSystemFont, monospace;
+            flex-shrink: 0;
+        }
+        .jk-val-txt {
+            font-size: 0.88rem;
+            font-weight: 700;
+            color: #00ff2b;
+            font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", monospace;
+            font-variant-numeric: tabular-nums;
+            letter-spacing: -0.3px;
+            line-height: 1;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: clip;
+            flex-shrink: 1;
+            min-width: 0;
+        }
+        .jk-val-txt.min { color: #ff0033; }
+        .jk-val-txt.max { color: #00e5ff; }
+        .jk-bal-tag {
+            font-size: 0.58rem;
+            margin-left: 1px;
+            flex-shrink: 0;
+            white-space: nowrap;
+        }
+
+        /* Protection Grid - Chuẩn Zin JK-BMS */
+        .protection-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 6px;
+            margin: 8px 12px 14px 12px;
+        }
+        .prot-item {
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 8px;
+            padding: 6px 8px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            font-size: 0.74rem;
+            min-width: 0;
+            gap: 4px;
+        }
+        .prot-lbl {
+            color: #aaa;
+            font-size: 0.72rem;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            min-width: 0;
+        }
+        .prot-badge {
+            padding: 2px 5px;
+            border-radius: 4px;
+            font-size: 0.66rem;
+            font-weight: 700;
+            flex-shrink: 0;
+            white-space: nowrap;
+        }
+        .prot-badge.ok { background: rgba(0, 255, 43, 0.15); color: var(--green); border: 1px solid rgba(0,255,43,0.3); }
+        .prot-badge.alarm { background: rgba(255, 59, 48, 0.25); color: var(--red); border: 1px solid var(--red); animation: pulseAlert 1s infinite; }
+        @keyframes pulseAlert { 0%, 100% { opacity: 0.7; } 50% { opacity: 1; } }
+
+        /* Tab Content Display */
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+
+        /* Settings Card Elements */
+        .sett-card {
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 12px;
+            padding: 12px;
+            margin: 10px 12px;
+            min-width: 0;
+        }
+        .form-group { margin-bottom: 12px; }
+        label { display: block; font-size: 0.8rem; color: var(--text-sub); margin-bottom: 4px; }
+        input, select { width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid #2a343d; background: #090c0e; color: #fff; font-size: 0.9rem; }
+        button.btn { width: 100%; padding: 11px; border: none; border-radius: 8px; background: linear-gradient(135deg, #0284c7, #0369a1); color: #fff; font-weight: bold; cursor: pointer; font-size: 0.9rem; margin-top: 6px; }
+        button.btn-sec { background: rgba(255,255,255,0.08); border: 1px solid #2a343d; }
+        .list-item { display: flex; justify-content: space-between; align-items: center; padding: 10px; background: #090c0e; border-radius: 8px; margin-bottom: 8px; border: 1px solid #1e262c; min-width: 0; gap: 8px; }
+
+        /* Parameter Form Controls */
+        .param-section-title { font-size: 0.92rem; font-weight: 700; color: var(--cyan); margin-bottom: 6px; display: flex; align-items: center; gap: 6px; }
+        .param-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }
+        .param-col { display: flex; flex-direction: column; }
+        .param-col label { font-size: 0.73rem; color: #8fa0ab; margin-bottom: 4px; line-height: 1.2; }
+        .param-input-wrap { position: relative; display: flex; align-items: center; }
+        .param-input-wrap input { width: 100%; padding: 8px 32px 8px 10px; font-family: monospace; font-size: 0.88rem; font-weight: 600; color: #fff; background: #0c1115; border: 1px solid #232d36; border-radius: 6px; outline: none; box-sizing: border-box; }
+        .param-input-wrap input:focus { border-color: var(--cyan); box-shadow: 0 0 6px rgba(0,229,255,0.25); }
+        .param-unit { position: absolute; right: 8px; font-size: 0.72rem; color: var(--cyan); pointer-events: none; font-weight: 700; }
+        .btn-param-save { width: 100%; padding: 11px; border: none; border-radius: 8px; background: linear-gradient(135deg, #059669, #10b981); color: #fff; font-weight: 700; cursor: pointer; font-size: 0.85rem; margin-top: 6px; box-shadow: 0 2px 8px rgba(16,185,129,0.2); }
+        .btn-param-save:hover { background: linear-gradient(135deg, #047857, #059669); }
+        .btn-param-save:active { transform: scale(0.98); }
+        .param-toast { padding: 8px 12px; border-radius: 6px; font-size: 0.78rem; font-weight: 600; margin-top: 8px; display: none; text-align: center; }
+        .param-toast.ok { background: rgba(0,255,43,0.15); color: var(--green); border: 1px solid rgba(0,255,43,0.3); display: block; }
+        .param-toast.err { background: rgba(255,59,48,0.2); color: var(--red); border: 1px solid var(--red); display: block; }
+
+        /* Official App Style Parameter Rows */
+        .param-row-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            background: #090c0e;
+            border: 1px solid #1e262c;
+            border-radius: 8px;
+            padding: 8px 10px;
+            margin-bottom: 6px;
+            gap: 8px;
+            min-width: 0;
+            transition: border-color 0.2s, background 0.2s;
+        }
+        .param-row-item:hover, .param-row-item:focus-within {
+            border-color: rgba(56, 189, 248, 0.4);
+            background: #0d1217;
+        }
+        .param-row-label {
+            flex: 1;
+            font-size: 0.8rem;
+            font-weight: 600;
+            color: #e2e8f0;
+            line-height: 1.25;
+            min-width: 0;
+            word-break: break-word;
+        }
+        .param-row-ctrls {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            flex-shrink: 0;
+        }
+        .param-row-ctrls .param-input-wrap {
+            width: 86px;
+            margin: 0;
+            position: relative;
+        }
+        .param-row-ctrls .param-input-wrap input {
+            width: 100%;
+            height: 34px;
+            padding: 4px 22px 4px 6px;
+            font-size: 0.86rem;
+            font-weight: 700;
+            text-align: right;
+            background: #050708;
+            border: 1px solid #232d36;
+            border-radius: 6px;
+            color: #fff;
+            outline: none;
+            box-sizing: border-box;
+        }
+        .param-row-ctrls .param-input-wrap input:focus {
+            border-color: var(--cyan);
+            box-shadow: 0 0 6px rgba(56, 189, 248, 0.3);
+        }
+        .param-row-ctrls .param-unit {
+            position: absolute;
+            right: 6px;
+            font-size: 0.68rem;
+            color: var(--cyan);
+            pointer-events: none;
+            font-weight: 700;
+        }
+        .btn-param-ok {
+            background: linear-gradient(135deg, #00d2ff, #00ff2b);
+            color: #000;
+            border: none;
+            border-radius: 6px;
+            font-weight: 800;
+            font-size: 0.76rem;
+            padding: 0 8px;
+            height: 34px;
+            min-width: 40px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.15s ease;
+            box-shadow: 0 2px 6px rgba(0, 255, 43, 0.2);
+            flex-shrink: 0;
+        }
+        .btn-param-ok:hover {
+            filter: brightness(1.1);
+        }
+        .btn-param-ok:active {
+            transform: scale(0.92);
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        /* Bottom Nav Bar with Safe Area Inset */
+        .bottom-nav {
+            position: fixed;
+            bottom: 0;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 100%;
+            max-width: 480px;
+            background: rgba(0, 0, 0, 0.95);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border-top: 1px solid #1a1a1a;
+            display: flex;
+            justify-content: space-around;
+            padding-top: 8px;
+            padding-bottom: calc(10px + var(--sab));
+            padding-left: var(--sal);
+            padding-right: var(--sar);
+            z-index: 1000;
+        }
+        .nav-btn { display: flex; flex-direction: column; align-items: center; color: #666; font-size: 0.72rem; font-weight: 600; cursor: pointer; border: none; background: transparent; width: 33%; }
+        .nav-btn.active { color: var(--green); }
+        .nav-icon { font-size: 1.25rem; margin-bottom: 2px; }
+    </style>
 </head>
 <body>
+    <div class="app">
+        <!-- STICKY TOP HEADER (PROTECTED FROM PHONE STATUS BAR) -->
+        <header class="app-header">
+            <!-- TOP HEADER BAR -->
+            <div class="top-bar">
+                <div class="top-bar-left">
+                    <div id="bt-icon-head" class="bt-status ${bmsConnected ? 'active' : ''}" title="${isModbus ? 'Modbus RS485' : 'Bluetooth BLE'}">${isModbus ? '🔌' : '⚡'}</div>
+                    <div style="min-width:0; flex:1; overflow:hidden;">
+                        <div id="head-bms-name" style="font-weight:bold; font-size:0.92rem; color:#fff; line-height:1.2; display:flex; align-items:center; gap:5px; min-width:0;">
+                            <span id="head-bms-title" style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:145px; display:inline-block;">${bmsDisplayName}</span>
+                            ${connBadgeHtml}
+                        </div>
+                        <div id="head-sn" style="font-size:0.68rem; color:var(--text-sub); font-family:monospace; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${isModbus ? (d.active_bms_mac ? `ID: ${d.active_bms_mac}` : 'RS485 Modbus') : (d.active_bms_mac ? `MAC: ${d.active_bms_mac}` : 'Chưa chọn Pack')}</div>
+                        <div id="esp-online-badge" style="font-size:0.68rem; font-weight:700; color:${statusColor}; display:flex; align-items:center; gap:4px; margin-top:2px;">
+                            <span id="esp-online-dot" style="display:inline-block; width:6px; height:6px; border-radius:50%; background:${statusColor}; box-shadow:0 0 5px ${statusColor};"></span>
+                            <span id="esp-online-txt">${statusText}</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="top-bar-right">
+                    <div id="uptime-display" class="uptime-txt">${runtimeStr}</div>
+                    <button class="menu-btn" onclick="showTab('tab-settings', document.getElementById('nav-sett'))">☰</button>
+                </div>
+            </div>
 
-<div class="header-bar">
-  <div class="header-switches">
-    <span>Charge: <strong style="color:${chargeMos?'#3fb950':'#f85149'}">${chargeMos?'ON':'OFF'}</strong></span>
-    <span>Discharge: <strong style="color:${dischargeMos?'#3fb950':'#f85149'}">${dischargeMos?'ON':'OFF'}</strong></span>
-    <span>Balance: <strong style="color:${balance?'#3fb950':'#f85149'}">${balance?'ON':'OFF'}</strong></span>
-  </div>
-  <div style="font-family:monospace;font-size:0.7rem;color:#38bdf8;">TIME: 1Y229D14H17M</div>
-</div>
+            <!-- MOS CONTROLS TOP BAR -->
+            <div class="mos-bar">
+                <div class="mos-item" onclick="toggleMos('charge_mos')">
+                    <span>Charge</span>
+                    <div id="dot-charge" class="dot ${chargeMos ? 'on' : 'off'}"></div>
+                    <span id="txt-charge" class="${chargeMos ? 'val-on' : 'val-off'}">${chargeMos ? 'ON' : 'OFF'}</span>
+                </div>
+                <div style="color:#333;">|</div>
+                <div class="mos-item" onclick="toggleMos('discharge_mos')">
+                    <span>Dsg</span>
+                    <div id="dot-discharge" class="dot ${dischargeMos ? 'on' : 'off'}"></div>
+                    <span id="txt-discharge" class="${dischargeMos ? 'val-on' : 'val-off'}">${dischargeMos ? 'ON' : 'OFF'}</span>
+                </div>
+                <div style="color:#333;">|</div>
+                <div class="mos-item" onclick="toggleMos('balance')">
+                    <span>Bal.</span>
+                    <div id="dot-balance" class="dot ${!balSw ? 'off' : (balAct ? 'on' : 'standby')}"></div>
+                    <span id="txt-balance" class="${!balSw ? 'val-off' : (balAct ? 'val-on' : 'val-standby')}">${!balSw ? 'OFF' : (balAct ? 'ĐANG CÂN' : 'CHỜ CÂN')}</span>
+                </div>
+            </div>
+        </header>
 
-<div class="hero-panel">
-  <div class="hero-main">
-    <div class="hero-val-v">${voltage}<sup>V</sup></div>
-    <div class="hero-val-a">${current}<sup>A</sup></div>
-  </div>
-  <div style="font-size:0.75rem;color:#8b949e;display:flex;justify-content:center;gap:14px;font-weight:600;">
-    <span>📶 WiFi: <strong style="color:#3fb950;">${statusText}</strong></span>
-    <span>ID: <strong style="color:#e6edf3;">${d.device_id}</strong></span>
-    <span>RSSI: <strong style="color:#38bdf8;">${rssiVal}</strong></span>
-  </div>
-</div>
+        <!-- ================== PACK SELECTOR TABS (Multi-Pack) ================== -->
+        <div id="pack-selector" style="${(packsSummary && packsSummary.length > 0) ? 'display:flex;' : 'display:none;'} align-items:center; gap:6px; padding:8px 12px 6px; overflow-x:auto; background:var(--bg-card); border-bottom:1px solid #1e2d3a; scrollbar-width:none; -webkit-overflow-scrolling:touch;">
+          <span style="font-size:0.72rem; color:var(--text-sub); align-self:center; white-space:nowrap; padding-right:2px;">Pack:</span>
+          <div id="pack-tabs-container" style="display:flex; gap:8px;">
+          ${packsSummary ? packsSummary.map((p, i) => {
+            const pName = (p.name && p.name.length > 0) ? p.name : `Pack ${i+1}`;
+            const pVolt = p.voltage > 0 ? p.voltage.toFixed(1)+'V' : '?V';
+            const pSoc  = p.soc > 0 ? p.soc+'%' : '?%';
+            const isAct = p.idx === activePackIdx;
+            return `<div id="pack-tab-${p.idx}" onclick="switchPack(${p.idx})" style="
+              position:relative; display:flex; flex-direction:column; align-items:center; padding:5px 12px; border-radius:8px; cursor:pointer; white-space:nowrap; min-width:76px; transition:all 0.2s;
+              background:${isAct ? 'linear-gradient(135deg,#0ea5e9,#22d3ee)' : '#1a2a35'};
+              color:${isAct ? '#fff' : 'var(--text-sub)'};
+              box-shadow:${isAct ? '0 0 8px rgba(14,165,233,0.5)' : 'none'};
+              font-weight:${isAct ? '700' : '400'};
+            ">
+              <span style="font-size:0.75rem; font-weight:700;">${pName.length > 10 ? pName.slice(0,10)+'..' : pName}</span>
+              <span style="font-size:0.68rem; opacity:0.85;">${pVolt} · ${pSoc}</span>
+              <span style="font-size:0.6rem; margin-top:1px;">${p.connected ? '● Online' : '○ Cached'}</span>
+              <button onclick="event.stopPropagation(); deletePack(${p.idx})" title="Xóa pack này khỏi danh sách" style="position:absolute; top:-5px; right:-5px; background:rgba(239,68,68,0.9); color:#fff; border:1px solid rgba(255,255,255,0.4); border-radius:50%; width:16px; height:16px; font-size:10px; line-height:14px; text-align:center; cursor:pointer; padding:0; display:flex; align-items:center; justify-content:center; box-shadow:0 1px 3px rgba(0,0,0,0.5); opacity:0.85;">✕</button>
+            </div>`;
+          }).join('') : ''}
+          </div>
+          <button id="btn-clear-packs" onclick="clearAllPacks()" title="Xóa toàn bộ danh sách Pack" style="background:rgba(239,68,68,0.15); border:1px solid rgba(239,68,68,0.35); color:#f87171; border-radius:8px; padding:6px 10px; font-size:0.72rem; font-weight:700; cursor:pointer; white-space:nowrap; display:flex; align-items:center; gap:4px; margin-left:4px;">
+            <span>🗑️</span><span>Xóa DS</span>
+          </button>
+        </div>
 
-<!-- TABS NAVIGATION -->
-<div class="nav-tabs">
-  <button class="tab-btn active" onclick="showTab('status')">📊 Status</button>
-  <button class="tab-btn" onclick="showTab('settings')">⚙️ Settings</button>
-  <button class="tab-btn" onclick="showTab('control')">🎛️ Control</button>
-</div>
+        <!-- ==================== TAB 1: HOME (DASHBOARD) ==================== -->
+        <div id="tab-home" class="tab-content active">
+            <!-- CIRCULAR GAUGE WIDGET -->
+            <div class="gauge-section">
+                <svg class="gauge-svg" viewBox="0 0 200 185">
+                    <defs>
+                        <linearGradient id="gaugeGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                            <stop offset="0%" stop-color="#00e5ff"/>
+                            <stop offset="100%" stop-color="#00ff2b"/>
+                        </linearGradient>
+                        <filter id="neonGlow" x="-20%" y="-20%" width="140%" height="140%">
+                            <feGaussianBlur stdDeviation="2.5" result="blur"/>
+                            <feMerge>
+                                <feMergeNode in="blur"/>
+                                <feMergeNode in="SourceGraphic"/>
+                            </feMerge>
+                        </filter>
+                    </defs>
+                    <!-- Background Track Arc (240 deg, R=68) -->
+                    <path d="M 41.1,110 A 68,68 0 1,1 158.9,110" fill="none" stroke="#141c22" stroke-width="12" stroke-linecap="round"/>
+                    <!-- Dotted Guide Ring -->
+                    <circle cx="100" cy="76" r="54" fill="none" stroke="#222f38" stroke-width="1" stroke-dasharray="2 4"/>
+                    <!-- Active SOC Arc (Length = 284.8) -->
+                    <path id="gauge-arc" d="M 41.1,110 A 68,68 0 1,1 158.9,110" fill="none" stroke="${(bmsConnected || hasData) && socNum > 50 ? 'url(#gaugeGrad)' : ((bmsConnected || hasData) ? '#00ff2b' : '#556570')}" stroke-width="12" stroke-linecap="round" stroke-dasharray="284.8 350" stroke-dashoffset="${(bmsConnected || hasData) ? initialOffset : '284.8'}" style="transition: stroke-dashoffset 0.6s ease;" filter="url(#neonGlow)"/>
 
-<!-- TAB 1: STATUS -->
-<div id="tab-status" class="tab-content active">
-  <div class="data-list">
-    <div class="data-row"><span class="data-key">Battery Power:</span><span class="data-val">${power} W</span></div>
-    <div class="data-row"><span class="data-key">Ave. Cell Volt.:</span><span class="data-val">${aveCellVolt} V</span></div>
-    <div class="data-row"><span class="data-key">Battery Capacity:</span><span class="data-val">${totalCapacity} Ah</span></div>
-    <div class="data-row"><span class="data-key">Cell Volt. Diff.:</span><span class="data-val" style="color:#e3b341;">${cellDelta} V</span></div>
-    <div class="data-row"><span class="data-key">Remain Capacity:</span><span class="data-val">${capacityAh} Ah</span></div>
-    <div class="data-row"><span class="data-key">Balance Curr.:</span><span class="data-val">-1.703 A</span></div>
-    <div class="data-row"><span class="data-key">Remain Battery:</span><span class="data-val" style="color:#3fb950;">${soc} %</span></div>
-    <div class="data-row"><span class="data-key">MOS Temp.:</span><span class="data-val" style="color:#e3b341;">${mosTemp} °C</span></div>
-    <div class="data-row"><span class="data-key">Cycle Count:</span><span class="data-val">${cycleCount}</span></div>
-    <div class="data-row"><span class="data-key">Cycle Capacity:</span><span class="data-val">${cycleCapacity} Ah</span></div>
-    <div class="data-row"><span class="data-key">Battery T1:</span><span class="data-val" style="color:#38bdf8;">${temp1} °C</span></div>
-    <div class="data-row"><span class="data-key">Battery T2:</span><span class="data-val" style="color:#38bdf8;">${temp2} °C</span></div>
-    <div class="data-row"><span class="data-key">Battery T4 / T5:</span><span class="data-val" style="color:#38bdf8;">${temp4} °C / ${temp5} °C</span></div>
-    <div class="data-row"><span class="data-key">Heat Current / Status:</span><span class="data-val">0.000 A / OFF</span></div>
-    <div class="data-row"><span class="data-key">Detail Logs Count:</span><span class="data-val">2369</span></div>
-    <div class="data-row"><span class="data-key">Time Enter Sleep:</span><span class="data-val">86400 s</span></div>
-    <div class="data-row"><span class="data-key">Cell Type:</span><span class="data-val">LFP</span></div>
-    <div class="data-row"><span class="data-key">LCD Buzzer / DRY Alarms:</span><span class="data-val">OFF</span></div>
-  </div>
+                    <!-- Center SOC % Text -->
+                    <text id="home-soc-txt" x="100" y="68" text-anchor="middle" dominant-baseline="central" fill="${(bmsConnected || hasData) ? '#00ff2b' : '#556570'}" font-size="38" font-weight="900" font-family="-apple-system, sans-serif" filter="url(#neonGlow)">${(bmsConnected || hasData) ? socNum + '%' : '0%'}</text>
 
-  <div class="section-header">Cells Voltage</div>
-  <div class="cells-grid">
-    ${cellItemsHtml}
-  </div>
+                    <!-- Pill 1: Voltage Badge -->
+                    <g transform="translate(100, 126)">
+                        <rect x="-65" y="-12" width="130" height="24" rx="12" fill="#000000" stroke="#00ff2b" stroke-width="1.8"/>
+                        <text id="home-v-pill" x="0" y="1" text-anchor="middle" dominant-baseline="central" fill="#00ff2b" font-size="14" font-weight="800" font-family="-apple-system, sans-serif">${voltage}${voltage !== '—' ? 'V' : ''}</text>
+                    </g>
 
-  <div class="section-header">Cells Wire Resistance</div>
-  <div class="cells-grid">
-    ${wireItemsHtml}
-  </div>
-</div>
+                    <!-- Pill 2: Current Badge -->
+                    <g transform="translate(100, 156)">
+                        <rect x="-65" y="-12" width="130" height="24" rx="12" fill="#000000" stroke="#00ff2b" stroke-width="1.8"/>
+                        <text id="home-a-pill" x="0" y="1" text-anchor="middle" dominant-baseline="central" fill="#00ff2b" font-size="14" font-weight="800" font-family="-apple-system, sans-serif">${current}${current !== '—' ? 'A' : ''}</text>
+                    </g>
+                </svg>
+            </div>
 
-<!-- TAB 2: SETTINGS -->
-<div id="tab-settings" class="tab-content">
-  <div class="setting-group-title">Basic Settings</div>
-  <div class="setting-row"><span class="setting-key">Cell Count:</span><div class="setting-box"><span class="setting-val">16</span><span class="setting-ok">OK</span></div></div>
-  <div class="setting-row"><span class="setting-key">Battery Capacity(Ah):</span><div class="setting-box"><span class="setting-val">280</span><span class="setting-ok">OK</span></div></div>
-  <div class="setting-row"><span class="setting-key">Balance Trig. Volt.(V):</span><div class="setting-box"><span class="setting-val">0.003</span><span class="setting-ok">OK</span></div></div>
-  <div class="setting-row"><span class="setting-key">Calibrating Volt.(V):</span><div class="setting-box"><span class="setting-val">${voltage}</span><span class="setting-ok">OK</span></div></div>
-  <div class="setting-row"><span class="setting-key">Calibrating Curr.(A):</span><div class="setting-box"><span class="setting-val">${current}</span><span class="setting-ok">OK</span></div></div>
+            <!-- STATUS NOTIFICATION BANNER -->
+            <div id="status-banner" class="status-banner" style="${bmsConnected ? '' : 'border-color:rgba(245,158,11,0.5);background:rgba(40,30,5,0.85);'}">
+                <span id="banner-icon" class="banner-icon" style="${bmsConnected ? '' : 'color:var(--yellow);'}">${bmsConnected ? '✔' : (isModbus ? '🔌' : '📡')}</span>
+                <span id="banner-msg">${bmsConnected ? `Đang kết nối với ${bmsDisplayName} • Pin hoạt động bình thường` : (isModbus ? (hasData ? `Đang kết nối lại RS485 với ${bmsDisplayName}...` : 'Đang chờ tín hiệu RS485 Modbus...') : (d.active_bms_mac ? `Đang tìm & kết nối BLE tới ${bmsDisplayName}...` : 'BMS chưa kết nối Bluetooth'))}</span>
+            </div>
 
-  <div class="setting-group-title">Advance Settings</div>
-  <div class="setting-row"><span class="setting-key">Start Balance Volt.(V):</span><div class="setting-box"><span class="setting-val">2.80</span><span class="setting-ok">OK</span></div></div>
-  <div class="setting-row"><span class="setting-key">Max Balance Cur.(A):</span><div class="setting-box"><span class="setting-val">1.8</span><span class="setting-ok">OK</span></div></div>
-  <div class="setting-row"><span class="setting-key">Cell OVP(V):</span><div class="setting-box"><span class="setting-val">3.500</span><span class="setting-ok">OK</span></div></div>
-  <div class="setting-row"><span class="setting-key">Vol. Cell RCV(V):</span><div class="setting-box"><span class="setting-val">3.480</span><span class="setting-ok">OK</span></div></div>
-  <div class="setting-row"><span class="setting-key">SOC-100% Volt.(V):</span><div class="setting-box"><span class="setting-val">3.450</span><span class="setting-ok">OK</span></div></div>
-  <div class="setting-row"><span class="setting-key">Cell OVPR(V):</span><div class="setting-box"><span class="setting-val">3.430</span><span class="setting-ok">OK</span></div></div>
-  <div class="setting-row"><span class="setting-key">Power Off Vol.(V):</span><div class="setting-box"><span class="setting-val">2.600</span><span class="setting-ok">OK</span></div></div>
-  <div class="setting-row"><span class="setting-key">Continued Charge Curr.(A):</span><div class="setting-box"><span class="setting-val">90.0</span><span class="setting-ok">OK</span></div></div>
-  <div class="setting-row"><span class="setting-key">Continued Discharge Curr.(A):</span><div class="setting-box"><span class="setting-val">100.0</span><span class="setting-ok">OK</span></div></div>
-  <div class="setting-row"><span class="setting-key">Discharge OTP(°C):</span><div class="setting-box"><span class="setting-val">70.0</span><span class="setting-ok">OK</span></div></div>
+            <!-- QUICK BLUETOOTH SCAN & CONNECT BAR (HOME SCREEN - ONLY FOR BLE) -->
+            <div class="quick-ble-box" id="home-ble-box" style="${isModbus ? 'display:none;' : ''}">
+                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+                    <div style="display:flex; align-items:center; gap:8px;">
+                        <span style="font-size:1.1rem;">📡</span>
+                        <div>
+                            <div style="font-size:0.85rem; font-weight:700; color:#fff;" id="home-ble-name">${bmsConnected ? `<span style="color:var(--green);">🟢</span> ${bmsDisplayName} <span style="font-size:0.75rem; color:var(--green);">(Đang kết nối)</span>` : (d.active_bms_mac ? `<span style="color:var(--yellow);">🟡</span> ${bmsDisplayName} <span style="font-size:0.75rem; color:var(--yellow);">(Đang tìm kiếm...)</span>` : `<span style="color:var(--text-sub);">⚪</span> Chưa kết nối BMS`)}</div>
+                            <div style="font-size:0.72rem; color:var(--text-sub);" id="home-ble-mac">${d.active_bms_mac ? `MAC: ${d.active_bms_mac}` : 'Chưa có MAC • Hãy bấm Quét Bluetooth'}</div>
+                        </div>
+                    </div>
+                    <div>
+                        <button class="btn" id="btn-home-ble-scan" style="width:auto; padding:7px 16px; font-size:0.82rem; font-weight:700; background:linear-gradient(135deg,#00d2ff,#00ff2b); color:#000; margin:0;" onclick="scanBLE()">🔍 Quét Bluetooth</button>
+                    </div>
+                </div>
+                <div id="home-ble-status" style="font-size:0.75rem; color:var(--cyan); display:none; margin-top:8px; font-weight:600;"></div>
+                <div id="home-ble-list" style="margin-top:8px;"></div>
+            </div>
 
-  <div class="setting-group-title">Protocol & Inverter Settings</div>
-  <div class="setting-row"><span class="setting-key">User Data 2:</span><div class="setting-box"><span class="setting-val" style="color:#38bdf8;">JK-BMS</span><span class="setting-ok">OK</span></div></div>
-  <div class="setting-row"><span class="setting-key">UART1 Protocol No.:</span><div class="setting-box"><span class="setting-val" style="color:#38bdf8;">001-JK BMS</span><span class="setting-ok">OK</span></div></div>
-  <div class="setting-row"><span class="setting-key">UART2 Protocol No.:</span><div class="setting-box"><span class="setting-val" style="color:#38bdf8;">001-JK BMS</span><span class="setting-ok">OK</span></div></div>
-  <div class="setting-row"><span class="setting-key">CAN Protocol No.:</span><div class="setting-box"><span class="setting-val" style="color:#38bdf8;">011-Luxpower</span><span class="setting-ok">OK</span></div></div>
-</div>
+            <!-- KEY METRICS GRID 1 (4 Columns) -->
+            <div class="metrics-grid-4">
+                <div class="metric-item">
+                    <div id="m-high-v" class="metric-val" style="color:var(--cyan);">${(bmsConnected || hasData) && d.max_cell_voltage ? d.max_cell_voltage.toFixed(3) : (maxCellVal > 0 ? maxCellVal.toFixed(3) : '0.000')}</div>
+                    <div class="metric-lbl">High Cell(V):</div>
+                </div>
+                <div class="metric-item">
+                    <div id="m-low-v" class="metric-val" style="color:var(--red);">${(bmsConnected || hasData) && d.min_cell_voltage ? d.min_cell_voltage.toFixed(3) : (minCellVal > 0 ? minCellVal.toFixed(3) : '0.000')}</div>
+                    <div class="metric-lbl">Low Cell(V):</div>
+                </div>
+                <div class="metric-item">
+                    <div id="m-diff-v" class="metric-val" style="color:var(--green);">${cellDelta}</div>
+                    <div class="metric-lbl">Volt.-Diff(V):</div>
+                </div>
+                <div class="metric-item">
+                    <div id="m-bal-a" class="metric-val" style="color:var(--green);">${balCurr}</div>
+                    <div class="metric-lbl">Bal.-Curr.(A):</div>
+                </div>
+            </div>
 
-<!-- TAB 3: CONTROL -->
-<div id="tab-control" class="tab-content">
-  <!-- BLE Manager Card -->
-  <div style="background:rgba(15,23,42,0.6);border:1px solid rgba(56,189,248,0.25);border-radius:12px;padding:14px;margin-bottom:14px;">
-    <div style="font-size:0.85rem;font-weight:700;color:#38bdf8;margin-bottom:10px;">📡 Kết Nối Bluetooth BMS</div>
-    <div style="display:flex;justify-content:space-between;padding:8px 0;font-size:0.78rem;border-bottom:1px solid rgba(56,189,248,0.1);"><span style="color:#94a3b8;">BMS đang kết nối:</span><span id="bms-connected-status" style="font-weight:700;color:${bleConnected?'#3fb950':'#f85149'};">${bleConnected ? (d.active_bms_name||'JK-BMS') : 'Chưa kết nối BMS'}</span></div>
-    <div style="display:flex;justify-content:space-between;padding:8px 0;font-size:0.78rem;border-bottom:1px solid rgba(56,189,248,0.1);"><span style="color:#94a3b8;">Địa chỉ MAC:</span><span id="bms-mac-status" style="font-family:monospace;font-size:0.72rem;">${d.active_bms_mac||'—'}</span></div>
-    <button onclick="scanBle()" id="btn-server-scan" style="background:linear-gradient(135deg,#38bdf8,#0284c7);color:#070d14;border:none;padding:11px 18px;border-radius:10px;font-size:0.82rem;font-weight:800;cursor:pointer;width:100%;margin-top:10px;box-shadow:0 4px 14px rgba(56,189,248,0.3);">🔍 Quét Bluetooth BMS Xung Quanh</button>
-    <div id="scan-status" style="font-size:0.74rem;padding:8px 10px;border-radius:6px;margin-top:8px;display:none;font-weight:600;"></div>
-    <div id="ble-devices-list" style="margin-top:10px;display:none;"><div id="ble-devices-grid"></div></div>
-  </div>
+            <!-- KEY METRICS GRID 2 (4 Columns) -->
+            <div class="metrics-grid-4">
+                <div class="metric-item">
+                    <div id="m-cap-ah" class="metric-val" style="color:var(--green);">${capAh}</div>
+                    <div class="metric-lbl">Capacity(Ah):</div>
+                </div>
+                <div class="metric-item">
+                    <div id="m-rem-ah" class="metric-val" style="color:var(--green);">${remCap}</div>
+                    <div class="metric-lbl">Rem. Cap(Ah):</div>
+                </div>
+                <div class="metric-item">
+                    <div id="m-cell-avg" class="metric-val" style="color:var(--green);">${aveCellVolt}</div>
+                    <div class="metric-lbl">Cell AVG(V):</div>
+                </div>
+                <div class="metric-item">
+                    <div id="m-soh" class="metric-val" style="color:var(--green);">${d.soh ? d.soh + '%' : '100%'}</div>
+                    <div class="metric-lbl">SOH:</div>
+                </div>
+            </div>
 
-  <div class="data-list">
-    <div class="data-row"><span class="data-key">Charge MOSFET Switch:</span><span class="data-val" style="color:${chargeMos?'#3fb950':'#f85149'}">${chargeMos?'ENABLED':'DISABLED'}</span></div>
-    <div class="data-row"><span class="data-key">Discharge MOSFET Switch:</span><span class="data-val" style="color:${dischargeMos?'#3fb950':'#f85149'}">${dischargeMos?'ENABLED':'DISABLED'}</span></div>
-    <div class="data-row"><span class="data-key">Active Balancer Switch:</span><span class="data-val" style="color:${balance?'#3fb950':'#f85149'}">${balance?'ENABLED':'DISABLED'}</span></div>
-    <div class="data-row"><span class="data-key">IP Local:</span><span class="data-val">${d.local_ip || '—'}</span></div>
-    <div class="data-row"><span class="data-key">Wi-Fi SSID:</span><span class="data-val">${d.ssid || '—'}</span></div>
-    <div class="data-row"><span class="data-key">Firmware Version:</span><span class="data-val">v${d.firmware_version || '2.4.0'}</span></div>
-  </div>
+            <!-- POWER & STATUS CARD -->
+            <div class="info-card-box">
+                <div class="card-row">
+                    <span>🟢 Current: <strong id="card-curr-val" style="color:var(--green); margin-left:4px;">${current} A</strong></span>
+                    <span>⚡ Power: <strong id="card-power-val" style="color:var(--green); margin-left:4px;">${power} W</strong></span>
+                </div>
+                <div class="card-divider"></div>
+                <div class="card-row">
+                    <span>🌡️ MOS Temp: <strong id="card-mos-temp" style="color:var(--green)">${mosTemp} °C</strong></span>
+                    <span>🌡️ T1 / T2: <strong id="card-probes" style="color:var(--green)">${temp1||'0.0'} / ${temp2||'0.0'} °C</strong></span>
+                </div>
+                <div class="card-divider"></div>
+                <div class="card-row">
+                    <span>🕒 Status: <strong id="card-status-txt" style="color:var(--green)">${bmsConnected ? (parseFloat(current) > 0.1 ? 'Charging (Đang sạc)' : (parseFloat(current) < -0.1 ? 'Discharging (Đang xả)' : 'Standby (Chờ)')) : 'Disconnected'}</strong></span>
+                    <span>⏱️ Time Left: <strong id="card-time-left" style="color:var(--green)">--:--</strong></span>
+                </div>
+            </div>
+        </div>
 
-  <div style="margin-top:20px;text-align:center;">
-    <button class="btn-reset" onclick="resetWifi()">🔄 Reset Cấu Hình Wi-Fi (AP Setup)</button>
-    <div id="reset-msg" style="font-size:0.78rem;margin-top:10px;display:none;font-weight:600;"></div>
-  </div>
-</div>
+        <!-- ==================== TAB 2: STATUS (REALTIME & CELLS) ==================== -->
+        <div id="tab-status" class="tab-content">
+            <div class="realtime-title">🟢 • Real-time Operations</div>
+            <div class="realtime-grid">
+                <div class="rt-row"><span class="rt-lbl">Bat. Power:</span><span class="rt-val"><span id="rt-power">${power}</span><span class="unit-sup">W</span></span></div>
+                <div class="rt-row"><span class="rt-lbl">Cell AVG:</span><span class="rt-val"><span id="rt-avg">${aveCellVolt}</span><span class="unit-sup">V</span></span></div>
+                <div class="rt-row"><span class="rt-lbl">Capacity:</span><span class="rt-val"><span id="rt-cap">${capAh}</span><span class="unit-sup">Ah</span></span></div>
+                <div class="rt-row"><span class="rt-lbl">Volt.-Diff:</span><span class="rt-val"><span id="rt-diff">${cellDelta}</span><span class="unit-sup">V</span></span></div>
+                <div class="rt-row"><span class="rt-lbl">Rem. Cap:</span><span class="rt-val"><span id="rt-rem">${remCap}</span><span class="unit-sup">Ah</span></span></div>
+                <div class="rt-row"><span class="rt-lbl">Bal. Current:</span><span class="rt-val"><span id="rt-balcurr">${balCurr}</span><span class="unit-sup">A</span></span></div>
+                <div class="rt-row"><span class="rt-lbl">CMOS Temp.:</span><span class="rt-val"><span id="rt-mos">${mosTemp}</span><span class="unit-sup">°C</span></span></div>
+                <div class="rt-row"><span class="rt-lbl">Cycle Count:</span><span class="rt-val"><span id="rt-cyc">${d.cycle_count||0}</span><span class="unit-sup">T</span></span></div>
+                <div class="rt-row"><span class="rt-lbl">Battery T1:</span><span class="rt-val"><span id="rt-t1">${temp1||'0.0'}</span><span class="unit-sup">°C</span></span></div>
+                <div class="rt-row"><span class="rt-lbl">Cycle Cap.:</span><span class="rt-val"><span id="rt-cyccap">${d.cycle_capacity_ah ? d.cycle_capacity_ah.toFixed(1) : '0.0'}</span><span class="unit-sup">A</span></span></div>
+                <div class="rt-row"><span class="rt-lbl">Battery T2:</span><span class="rt-val"><span id="rt-t2">${temp2||'0.0'}</span><span class="unit-sup">°C</span></span></div>
+                <div class="rt-row"><span class="rt-lbl">Battery T4:</span><span class="rt-val"><span id="rt-t4">${d.temp4 ? d.temp4.toFixed(1) : '0.0'}</span><span class="unit-sup">°C</span></span></div>
+                <div class="rt-row"><span class="rt-lbl">Battery T5:</span><span class="rt-val"><span id="rt-t5">${d.temp5 ? d.temp5.toFixed(1) : '0.0'}</span><span class="unit-sup">°C</span></span></div>
+                <div class="rt-row"><span class="rt-lbl">Heater Curr.:</span><span class="rt-val"><span id="rt-heatcurr">${d.heat_curr ? d.heat_curr.toFixed(1) : '0.0'}</span><span class="unit-sup">A</span></span></div>
+                <div class="rt-row"><span class="rt-lbl">Heater:</span><span id="rt-heater" class="rt-val">${d.heating_active ? 'ON' : 'OFF'}</span></div>
+                <div class="rt-row"><span class="rt-lbl">Emerg. Timer:</span><span class="rt-val"><span id="rt-emerg">0</span><span class="unit-sup">s</span></span></div>
+                <div class="rt-row"><span class="rt-lbl">Details Log:</span><span id="rt-logs" class="rt-val">${d.detail_logs_count||0}</span></div>
+                <div class="rt-row"><span class="rt-lbl">Runtime:</span><span class="rt-val" id="rt-runtime">${runtimeStr}</span></div>
+                <div class="rt-row"><span class="rt-lbl">SOH:</span><span class="rt-val"><span id="rt-soh">${d.soh||100}</span><span class="unit-sup">%</span></span></div>
+                <div class="rt-row"><span class="rt-lbl">Cell Type:</span><span id="rt-type" class="rt-val">${d.battery_type||'LFP'}</span></div>
+                <div class="rt-row"><span class="rt-lbl">Charge Mode:</span><span id="rt-chg-mode" class="rt-val">${d.charge_status||'Bulk'}</span></div>
+                <div class="rt-row"><span class="rt-lbl">Balancer:</span><span id="rt-balancer" class="rt-val">${!balSw ? 'TẮT (OFF)' : (balAct ? 'BẬT (Đang cân)' : 'BẬT (Chờ cân)')}</span></div>
+            </div>
 
-<!-- FOOTER NAVIGATION BAR -->
-<div class="footer-nav">
-  <button class="f-btn active" id="f-status" onclick="showTab('status')"><span class="f-icon">📈</span>Status</button>
-  <button class="f-btn" id="f-settings" onclick="showTab('settings')"><span class="f-icon">⚙️</span>Settings</button>
-  <button class="f-btn" id="f-control" onclick="showTab('control')"><span class="f-icon">🎛️</span>Control</button>
-</div>
+            <div class="jk-bat-summary">
+                <span><span class="jk-dot"></span>Bat. Voltage<span class="unit">(V)</span>: <span class="val" id="rt-bat-v-sum">${voltage}</span></span>
+                <span><span class="jk-dot"></span>Bat. Current<span class="unit">(A)</span>: <span class="val" id="rt-bat-i-sum">${current}</span></span>
+            </div>
+            <div class="jk-divider"></div>
 
-<script>
-  function showTab(name) {
-    document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
-    document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
-    document.querySelectorAll('.f-btn').forEach(el => el.classList.remove('active'));
+            <div class="jk-section-title"><span class="jk-dot"></span>Cell Voltages <span class="unit">(V)</span> <span class="colon">:</span></div>
+            <div id="cells-grid-3" class="jk-grid-3">${serverCellsHtml}</div>
 
-    document.getElementById('tab-' + name).classList.add('active');
-    if (name === 'status') {
-      document.querySelectorAll('.tab-btn')[0].classList.add('active');
-      document.getElementById('f-status').classList.add('active');
-    } else if (name === 'settings') {
-      document.querySelectorAll('.tab-btn')[1].classList.add('active');
-      document.getElementById('f-settings').classList.add('active');
-    } else if (name === 'control') {
-      document.querySelectorAll('.tab-btn')[2].classList.add('active');
-      document.getElementById('f-control').classList.add('active');
+            <div class="jk-divider"></div>
+
+            <div class="jk-section-title"><span class="jk-dot"></span>Balance Wire Resistance <span class="unit">(Ω)</span> <span class="colon">:</span></div>
+            <div id="wire-grid-3" class="jk-grid-3">${serverWireHtml}</div>
+
+            <div class="jk-divider"></div>
+
+            <div class="realtime-title" style="margin-top:18px;">🛡️ • Protection & Safety Status :</div>
+            <div id="protection-grid" class="protection-grid">${serverProtHtml}</div>
+
+            <div class="realtime-title" style="margin-top:18px;">📋 • Device Information :</div>
+            <div class="info-card-box" style="margin-bottom:16px;">
+                <div class="card-row"><span>Tên Bộ Pin (Pack):</span><strong id="dev-info-pack-name" style="color:var(--cyan)">${bmsDisplayName}</strong></div>
+                <div class="card-row"><span>Mã Model BMS:</span><strong id="dev-info-model" style="color:#fff; font-family:monospace;">${(d.modelName && d.modelName !== '—' && d.modelName !== bmsDisplayName) ? d.modelName : (d.protocol_version || 'JK02_32S')}</strong></div>
+                <div class="card-row"><span>Serial Number:</span><strong id="dev-info-sn" style="color:#fff; font-family:monospace;">${d.serialNumber||d.bmsSerialNumber||'—'}</strong></div>
+                <div class="card-row"><span>Hardware Version:</span><strong id="dev-info-hw" style="color:#fff">${d.bmsHwVersion||d.hwVersionStr||'—'}</strong></div>
+                <div class="card-row"><span>Software Version:</span><strong id="dev-info-sw" style="color:#fff">${d.bmsSwVersion||d.swVersionStr||'—'}</strong></div>
+                <div class="card-row"><span>Protocol Family:</span><strong id="dev-info-family" style="color:var(--green)">${d.protocol_version ? d.protocol_version + (d.bmsFamilyStr ? ' (' + d.bmsFamilyStr + ')' : '') : 'JK02_32S'}</strong></div>
+                <div class="card-row"><span>CAN Protocol:</span><strong id="dev-info-can" style="color:var(--cyan)">${getCanProtocolName(d.can_protocol !== undefined ? d.can_protocol : d.canProtocol)}</strong></div>
+                <div class="card-row"><span>Address ID:</span><strong id="dev-info-addr" style="color:var(--green); font-family:monospace;">${formatBmsAddress(d.address_id !== undefined ? d.address_id : d.rs485DeviceId)}</strong></div>
+                <div class="card-row" id="row-dev-info-mac"><span>${isModbus ? 'Cổng Giao Tiếp:' : 'Bluetooth MAC:'}</span><strong id="dev-info-mac" style="color:var(--cyan); font-family:monospace;">${isModbus ? 'RS485 Modbus RTU' : (d.active_bms_mac||'—')}</strong></div>
+                <div class="card-row" id="row-dev-info-ble-rssi" style="display:${isModbus ? 'none' : 'flex'};"><span>Tín Hiệu BLE:</span><strong id="dev-info-ble-rssi" style="color:var(--cyan); font-family:monospace;">${(d.ble_rssi && d.ble_rssi !== 0) ? d.ble_rssi + ' dBm' : '—'}</strong></div>
+                ${isModbus ? `
+                <div class="card-row" id="row-dev-info-pin"><span>Mã PIN BMS:</span><strong id="dev-info-pin" style="color:#fff; font-family:monospace;">${d.devicePasscode||'—'}</strong></div>
+                <div class="card-row" id="row-dev-info-setup-pin"><span>Mật Khẩu Cài Đặt:</span><strong id="dev-info-setup-pin" style="color:var(--green); font-family:monospace;">${d.setup_passcode||d.setupPasscode||'—'}</strong></div>
+                ` : ''}
+                <div class="card-row"><span>Kích Hoạt:</span><strong id="dev-info-act" style="color:var(--green); font-size:0.75rem;">${reg}</strong></div>
+            </div>
+        </div>
+
+        <!-- ==================== TAB 3: SETTINGS (RS485 & BMS CONFIG) ==================== -->
+        <div id="tab-settings" class="tab-content">
+            <!-- PACK CONNECTION CONFIG (RS485 / BLE) -->
+            ${isModbus ? `
+            <div class="sett-card" id="rs485-card">
+                <h3 style="color:var(--cyan); margin-bottom:10px; font-size:1rem;">🔌 Quản Lý Cổng RS485 Modbus RTU</h3>
+                <div id="rs485-connected-view" style="display:block;">
+                    <div class="list-item" style="display:flex; justify-content:space-between; align-items:center; padding:12px; margin-bottom:10px; border-left:4px solid ${bmsConnected ? 'var(--green)' : 'var(--red)'}; background:rgba(15,23,42,0.7);">
+                        <div>
+                            <div style="font-weight:700; font-size:0.95rem; color:#fff;" id="lbl-rs485-name">🔋 ${bmsConnected ? bmsDisplayName : 'Chưa kết nối BMS'}</div>
+                            <div style="font-size:0.8rem; color:var(--text-sub); margin-top:3px;">Giao thức: <span style="color:var(--cyan); font-family:monospace;">RS485 Modbus RTU (Slave ID ${d.address_id || 1})</span></div>
+                        </div>
+                        <div style="text-align:right;">
+                            <span class="cell-badge" style="background:${bmsConnected ? 'rgba(63,185,80,0.2)' : 'rgba(255,59,48,0.2)'}; color:${bmsConnected ? 'var(--green)' : 'var(--red)'}; border:1px solid ${bmsConnected ? 'var(--green)' : 'var(--red)'}; width:auto; padding:3px 8px; font-size:0.75rem; border-radius:12px;" id="lbl-rs485-status">${bmsConnected ? '● Đang kết nối' : '○ Mất kết nối'}</span>
+                        </div>
+                    </div>
+                    <button class="btn" onclick="queryBmsSettings(true)" style="margin-bottom:8px; background:linear-gradient(135deg, #0284c7, #0369a1); font-weight:700;">🔄 Đọc Lại Toàn Bộ Cài Đặt Từ BMS (RS485)</button>
+                </div>
+            </div>
+            ` : `
+            <div class="sett-card" id="ble-card">
+                <h3 style="color:var(--cyan); margin-bottom:10px; font-size:1rem;">📶 Quản Lý Bluetooth JK-BMS</h3>
+                <div id="ble-connected-view" style="display:block;">
+                    <div class="list-item" style="display:flex; justify-content:space-between; align-items:center; padding:12px; margin-bottom:10px; border-left:4px solid ${bmsConnected ? 'var(--green)' : 'var(--red)'}; background:rgba(15,23,42,0.7);">
+                        <div>
+                            <div style="font-weight:700; font-size:0.95rem; color:#fff;" id="lbl-ble-name">🔋 ${bmsConnected ? bmsDisplayName : 'Chưa kết nối BMS'}</div>
+                            <div style="font-size:0.8rem; color:var(--text-sub); margin-top:3px;">MAC: <span id="lbl-ble-mac" style="color:var(--cyan); font-family:monospace;">${d.active_bms_mac||'—'}</span></div>
+                        </div>
+                        <div style="text-align:right;">
+                            <span class="cell-badge" style="background:${bmsConnected ? 'rgba(63,185,80,0.2)' : 'rgba(255,59,48,0.2)'}; color:${bmsConnected ? 'var(--green)' : 'var(--red)'}; border:1px solid ${bmsConnected ? 'var(--green)' : 'var(--red)'}; width:auto; padding:3px 8px; font-size:0.75rem; border-radius:12px;" id="lbl-ble-status">${bmsConnected ? '● Đang kết nối' : '○ Chưa kết nối'}</span>
+                        </div>
+                    </div>
+                    <div style="display:flex; gap:8px; margin-bottom:8px;">
+                        <button class="btn" onclick="scanBLE()" style="flex:1; margin:0;">🔍 Quét Thiết Bị BLE Xung Quanh</button>
+                        <button class="btn btn-sec" onclick="clearAllPacks()" style="width:auto; margin:0; border-color:var(--red); color:var(--red); font-weight:700; padding:8px 12px;" title="Xóa toàn bộ danh sách Pack đã lưu">🗑️ Xóa DS Pack</button>
+                    </div>
+                    <div id="ble-status" style="margin-top:6px; font-size:0.8rem; color:var(--text-sub);"></div>
+                    <div id="ble-list" style="margin-top:8px;"></div>
+                </div>
+            </div>
+            `}
+
+            <!-- SYNC STATUS & QUERY BAR -->
+            <div style="display:flex; justify-content:space-between; align-items:center; margin:12px 14px 4px 14px; flex-wrap:wrap; gap:8px;">
+                <span id="settings-sync-badge" class="cell-badge" style="background:${(d.settings || d.params) ? 'rgba(0,255,43,0.15)' : 'rgba(255,184,0,0.15)'}; color:${(d.settings || d.params) ? 'var(--green)' : 'var(--yellow)'}; border:1px solid ${(d.settings || d.params) ? 'var(--green)' : 'var(--yellow)'}; width:auto; padding:4px 10px; font-size:0.75rem; border-radius:12px; font-weight:700;">${(d.settings || d.params) ? '● Đã đồng bộ từ BMS' : '○ Đang chờ BMS truyền dữ liệu...'}</span>
+                <button onclick="queryBmsSettings(true)" class="btn btn-sec" style="width:auto; margin:0; padding:6px 12px; font-size:0.75rem; border-color:var(--cyan); color:var(--cyan); font-weight:700;">🔄 Đọc Lại Từ BMS</button>
+            </div>
+
+            <!-- CÀI ĐẶT DÒNG SẠC / XẢ & DUNG LƯỢNG -->
+            <!-- CÀI ĐẶT DÒNG SẠC / XẢ & DUNG LƯỢNG -->
+            <div class="sett-card" id="current-card">
+                <div class="param-section-title">⚡ Cài Đặt Dòng Sạc / Xả & Dung Lượng</div>
+                <div style="font-size:0.73rem; color:var(--text-sub); margin-bottom:12px;">Chỉnh sửa từng thông số rồi bấm nút <b>OK</b> bên cạnh để ghi trực tiếp vào BMS.</div>
+
+                <div class="param-row-item">
+                    <span class="param-row-label">Dòng Sạc Tối Đa</span>
+                    <div class="param-row-ctrls">
+                        <div class="param-input-wrap">
+                            <input type="number" id="p_max_chg_curr" step="0.1" min="1" max="300" value="${getParamVal('12', 'max_chg_curr', v => Number(v).toFixed(1))}" placeholder="...">
+                            <span class="param-unit">A</span>
+                        </div>
+                        <button class="btn-param-ok" onclick="saveSingleParam('p_max_chg_curr', 0x0C, 'Dòng Sạc Tối Đa', 'A', this)">OK</button>
+                    </div>
+                </div>
+
+                <div class="param-row-item">
+                    <span class="param-row-label">Dòng Xả Tối Đa</span>
+                    <div class="param-row-ctrls">
+                        <div class="param-input-wrap">
+                            <input type="number" id="p_max_dsg_curr" step="0.1" min="1" max="350" value="${getParamVal('15', 'max_dsg_curr', v => Number(v).toFixed(1))}" placeholder="...">
+                            <span class="param-unit">A</span>
+                        </div>
+                        <button class="btn-param-ok" onclick="saveSingleParam('p_max_dsg_curr', 0x0F, 'Dòng Xả Tối Đa', 'A', this)">OK</button>
+                    </div>
+                </div>
+
+                <div class="param-row-item">
+                    <span class="param-row-label">Dòng Cân Bằng</span>
+                    <div class="param-row-ctrls">
+                        <div class="param-input-wrap">
+                            <input type="number" id="p_max_bal_curr" step="0.1" min="0.1" max="2.0" value="${getParamVal('19', 'max_bal_curr', v => Number(v).toFixed(1))}" placeholder="...">
+                            <span class="param-unit">A</span>
+                        </div>
+                        <button class="btn-param-ok" onclick="saveSingleParam('p_max_bal_curr', 0x13, 'Dòng Cân Bằng', 'A', this)">OK</button>
+                    </div>
+                </div>
+
+                <div class="param-row-item">
+                    <span class="param-row-label">Dung Lượng Pin</span>
+                    <div class="param-row-ctrls">
+                        <div class="param-input-wrap">
+                            <input type="number" id="p_battery_cap" step="1" min="10" max="2000" value="${getParamVal('32', 'battery_cap', v => Math.round(Number(v)))}" placeholder="...">
+                            <span class="param-unit">Ah</span>
+                        </div>
+                        <button class="btn-param-ok" onclick="saveSingleParam('p_battery_cap', 0x20, 'Dung Lượng Pin', 'Ah', this)">OK</button>
+                    </div>
+                </div>
+
+                <div class="param-row-item">
+                    <span class="param-row-label">Số Cell Nối Tiếp</span>
+                    <div class="param-row-ctrls">
+                        <div class="param-input-wrap">
+                            <input type="number" id="p_cell_count" step="1" min="3" max="32" value="${getParamVal('28', 'cell_count', v => parseInt(v))}" placeholder="...">
+                            <span class="param-unit">S</span>
+                        </div>
+                        <button class="btn-param-ok" onclick="saveSingleParam('p_cell_count', 0x1C, 'Số Cell Nối Tiếp', 'S', this)">OK</button>
+                    </div>
+                </div>
+
+                <div class="param-row-item">
+                    <span class="param-row-label">Trễ Quá Dòng Sạc</span>
+                    <div class="param-row-ctrls">
+                        <div class="param-input-wrap">
+                            <input type="number" id="p_chg_ocp_delay" step="1" min="1" max="60" value="${getParamVal('13', 'chg_ocp_delay', v => parseInt(v))}" placeholder="...">
+                            <span class="param-unit">s</span>
+                        </div>
+                        <button class="btn-param-ok" onclick="saveSingleParam('p_chg_ocp_delay', 0x0D, 'Trễ Quá Dòng Sạc', 's', this)">OK</button>
+                    </div>
+                </div>
+
+                <div class="param-row-item">
+                    <span class="param-row-label">Phục Hồi Quá Dòng Sạc</span>
+                    <div class="param-row-ctrls">
+                        <div class="param-input-wrap">
+                            <input type="number" id="p_chg_ocpr_time" step="1" min="5" max="300" value="${getParamVal('14', 'chg_ocpr_time', v => parseInt(v))}" placeholder="...">
+                            <span class="param-unit">s</span>
+                        </div>
+                        <button class="btn-param-ok" onclick="saveSingleParam('p_chg_ocpr_time', 0x0E, 'Phục Hồi Quá Dòng Sạc', 's', this)">OK</button>
+                    </div>
+                </div>
+
+                <div class="param-row-item">
+                    <span class="param-row-label">Trễ Quá Dòng Xả</span>
+                    <div class="param-row-ctrls">
+                        <div class="param-input-wrap">
+                            <input type="number" id="p_dsg_ocp_delay" step="1" min="1" max="60" value="${getParamVal('16', 'dsg_ocp_delay', v => parseInt(v))}" placeholder="...">
+                            <span class="param-unit">s</span>
+                        </div>
+                        <button class="btn-param-ok" onclick="saveSingleParam('p_dsg_ocp_delay', 0x10, 'Trễ Quá Dòng Xả', 's', this)">OK</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- CÀI ĐẶT ĐIỆN ÁP CELL -->
+            <div class="sett-card" id="voltage-card">
+                <div class="param-section-title">🔋 Cài Đặt Ngưỡng Điện Áp Cell (Protection & Bal.)</div>
+                <div style="font-size:0.73rem; color:var(--text-sub); margin-bottom:12px;">Chỉnh sửa từng thông số rồi bấm nút <b>OK</b> bên cạnh để ghi trực tiếp vào BMS.</div>
+
+                <div class="param-row-item">
+                    <span class="param-row-label">Ngắt Quá Áp Cell</span>
+                    <div class="param-row-ctrls">
+                        <div class="param-input-wrap">
+                            <input type="number" id="p_cell_ovp" step="0.001" min="2.0" max="4.5" value="${getParamVal('4', 'cell_ovp', v => Number(v).toFixed(3))}" placeholder="...">
+                            <span class="param-unit">V</span>
+                        </div>
+                        <button class="btn-param-ok" onclick="saveSingleParam('p_cell_ovp', 0x04, 'Ngắt Quá Áp Cell', 'V', this)">OK</button>
+                    </div>
+                </div>
+
+                <div class="param-row-item">
+                    <span class="param-row-label">Phục Hồi Quá Áp Cell</span>
+                    <div class="param-row-ctrls">
+                        <div class="param-input-wrap">
+                            <input type="number" id="p_cell_ovpr" step="0.001" min="2.0" max="4.5" value="${getParamVal('5', 'cell_ovpr', v => Number(v).toFixed(3))}" placeholder="...">
+                            <span class="param-unit">V</span>
+                        </div>
+                        <button class="btn-param-ok" onclick="saveSingleParam('p_cell_ovpr', 0x05, 'Phục Hồi Quá Áp Cell', 'V', this)">OK</button>
+                    </div>
+                </div>
+
+                <div class="param-row-item">
+                    <span class="param-row-label">Ngắt Thấp Áp Cell</span>
+                    <div class="param-row-ctrls">
+                        <div class="param-input-wrap">
+                            <input type="number" id="p_cell_uvp" step="0.001" min="1.5" max="3.5" value="${getParamVal('2', 'cell_uvp', v => Number(v).toFixed(3))}" placeholder="...">
+                            <span class="param-unit">V</span>
+                        </div>
+                        <button class="btn-param-ok" onclick="saveSingleParam('p_cell_uvp', 0x02, 'Ngắt Thấp Áp Cell', 'V', this)">OK</button>
+                    </div>
+                </div>
+
+                <div class="param-row-item">
+                    <span class="param-row-label">Phục Hồi Thấp Áp Cell</span>
+                    <div class="param-row-ctrls">
+                        <div class="param-input-wrap">
+                            <input type="number" id="p_cell_uvpr" step="0.001" min="1.5" max="3.5" value="${getParamVal('3', 'cell_uvpr', v => Number(v).toFixed(3))}" placeholder="...">
+                            <span class="param-unit">V</span>
+                        </div>
+                        <button class="btn-param-ok" onclick="saveSingleParam('p_cell_uvpr', 0x03, 'Phục Hồi Thấp Áp Cell', 'V', this)">OK</button>
+                    </div>
+                </div>
+
+                <div class="param-row-item">
+                    <span class="param-row-label">Khởi Động Cân Bằng</span>
+                    <div class="param-row-ctrls">
+                        <div class="param-input-wrap">
+                            <input type="number" id="p_bal_start_v" step="0.001" min="2.0" max="4.0" value="${getParamVal('38', 'bal_start_v', v => Number(v).toFixed(3))}" placeholder="...">
+                            <span class="param-unit">V</span>
+                        </div>
+                        <button class="btn-param-ok" onclick="saveSingleParam('p_bal_start_v', 0x26, 'Khởi Động Cân Bằng', 'V', this)">OK</button>
+                    </div>
+                </div>
+
+                <div class="param-row-item">
+                    <span class="param-row-label">Độ Lệch Áp Cân Bằng</span>
+                    <div class="param-row-ctrls">
+                        <div class="param-input-wrap">
+                            <input type="number" id="p_bal_delta_v" step="0.001" min="0.001" max="0.100" value="${getParamVal('6', 'bal_delta_v', v => Number(v).toFixed(3))}" placeholder="...">
+                            <span class="param-unit">V</span>
+                        </div>
+                        <button class="btn-param-ok" onclick="saveSingleParam('p_bal_delta_v', 0x06, 'Độ Lệch Áp Cân Bằng', 'V', this)">OK</button>
+                    </div>
+                </div>
+
+                <div class="param-row-item">
+                    <span class="param-row-label">Áp Yêu Cầu Sạc (RCV)</span>
+                    <div class="param-row-ctrls">
+                        <div class="param-input-wrap">
+                            <input type="number" id="p_req_chg_v" step="0.001" min="2.0" max="4.5" value="${getParamVal('9', 'req_chg_v', v => Number(v).toFixed(3))}" placeholder="...">
+                            <span class="param-unit">V</span>
+                        </div>
+                        <button class="btn-param-ok" onclick="saveSingleParam('p_req_chg_v', 0x09, 'Áp Yêu Cầu Sạc (RCV)', 'V', this)">OK</button>
+                    </div>
+                </div>
+
+                <div class="param-row-item">
+                    <span class="param-row-label">Áp Sạc Thả Nổi (RFV)</span>
+                    <div class="param-row-ctrls">
+                        <div class="param-input-wrap">
+                            <input type="number" id="p_req_float_v" step="0.001" min="2.0" max="4.5" value="${getParamVal('10', 'req_float_v', v => Number(v).toFixed(3))}" placeholder="...">
+                            <span class="param-unit">V</span>
+                        </div>
+                        <button class="btn-param-ok" onclick="saveSingleParam('p_req_float_v', 0x0A, 'Áp Sạc Thả Nổi (RFV)', 'V', this)">OK</button>
+                    </div>
+                </div>
+
+                <div class="param-row-item">
+                    <span class="param-row-label">Điện Áp 100% SOC</span>
+                    <div class="param-row-ctrls">
+                        <div class="param-input-wrap">
+                            <input type="number" id="p_soc100_v" step="0.001" min="2.0" max="4.5" value="${getParamVal('7', 'soc100_v', v => Number(v).toFixed(3))}" placeholder="...">
+                            <span class="param-unit">V</span>
+                        </div>
+                        <button class="btn-param-ok" onclick="saveSingleParam('p_soc100_v', 0x07, 'Điện Áp 100% SOC', 'V', this)">OK</button>
+                    </div>
+                </div>
+
+                <div class="param-row-item">
+                    <span class="param-row-label">Điện Áp 0% SOC</span>
+                    <div class="param-row-ctrls">
+                        <div class="param-input-wrap">
+                            <input type="number" id="p_soc0_v" step="0.001" min="1.5" max="3.5" value="${getParamVal('8', 'soc0_v', v => Number(v).toFixed(3))}" placeholder="...">
+                            <span class="param-unit">V</span>
+                        </div>
+                        <button class="btn-param-ok" onclick="saveSingleParam('p_soc0_v', 0x08, 'Điện Áp 0% SOC', 'V', this)">OK</button>
+                    </div>
+                </div>
+
+                <div class="param-row-item">
+                    <span class="param-row-label">Áp Ngủ Thông Minh</span>
+                    <div class="param-row-ctrls">
+                        <div class="param-input-wrap">
+                            <input type="number" id="p_sleep_v" step="0.001" min="1.5" max="3.5" value="${getParamVal('1', 'smart_sleep_v', v => Number(v).toFixed(3))}" placeholder="...">
+                            <span class="param-unit">V</span>
+                        </div>
+                        <button class="btn-param-ok" onclick="saveSingleParam('p_sleep_v', 0x01, 'Áp Ngủ Thông Minh', 'V', this)">OK</button>
+                    </div>
+                </div>
+
+                <div class="param-row-item">
+                    <span class="param-row-label">Ngắt Tắt Nguồn</span>
+                    <div class="param-row-ctrls">
+                        <div class="param-input-wrap">
+                            <input type="number" id="p_power_off_v" step="0.001" min="1.5" max="3.5" value="${getParamVal('11', 'power_off_v', v => Number(v).toFixed(3))}" placeholder="...">
+                            <span class="param-unit">V</span>
+                        </div>
+                        <button class="btn-param-ok" onclick="saveSingleParam('p_power_off_v', 0x0B, 'Ngắt Tắt Nguồn', 'V', this)">OK</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- CẤU HÌNH GIAO TIẾP CAN PROTOCOL & ADDRESS ID -->
+            <div class="sett-card" id="comm-card">
+                <div class="param-section-title">🔌 Cấu Hình Giao Tiếp Inverter (CAN & Address ID)</div>
+                <div style="font-size:0.73rem; color:var(--text-sub); margin-bottom:12px;">Được đồng bộ tự động trực tiếp từ gói tin cài đặt của JK BMS.</div>
+
+                <div class="param-row-item">
+                    <span class="param-row-label">Giao Thức CAN (CAN Protocol)</span>
+                    <div class="param-row-ctrls">
+                        <select id="p_can_protocol" style="background:#0a1017; color:var(--cyan); border:1px solid #1e293b; border-radius:8px; font-weight:700; font-size:0.78rem; padding:4px 6px; width:160px; height:32px; outline:none;">
+                            ${[
+                                [0,'000 User-defined (250K)'],
+                                [1,'001 Deye'],
+                                [2,'002 Pylontech'],
+                                [3,'003 Growatt'],
+                                [4,'004 Victron'],
+                                [5,'005 Goodwe'],
+                                [6,'006 SMA'],
+                                [7,'007 Sofar'],
+                                [8,'008 Solis'],
+                                [9,'009 SRNE'],
+                                [10,'010 Must'],
+                                [11,'011 Luxpower'],
+                                [12,'012 Voltronic'],
+                                [13,'013 Schneider'],
+                                [14,'014 TBB'],
+                                [15,'015 Studer']
+                            ].map(([code, name]) => {
+                                const curCode = Number(d.can_protocol !== undefined ? d.can_protocol : (d.canProtocol !== undefined ? d.canProtocol : 0));
+                                const sel = curCode === code ? ' selected' : '';
+                                return `<option value="${code}"${sel}>${name}</option>`;
+                            }).join('')}
+                        </select>
+                        <button class="btn-param-ok" onclick="saveSingleParam('p_can_protocol', 0xA6, 'Giao Thức CAN', '', this)">OK</button>
+                    </div>
+                </div>
+
+                <div class="param-row-item">
+                    <span class="param-row-label">Địa Chỉ Khối Pin (Address ID)</span>
+                    <div class="param-row-ctrls">
+                        <span id="sett-addr-badge" style="background:rgba(0,255,43,0.12); color:var(--green); border:1px solid rgba(0,255,43,0.3); border-radius:6px; padding:4px 10px; font-weight:700; font-family:monospace; font-size:0.85rem;">
+                            ${formatBmsAddress(d.address_id !== undefined ? d.address_id : d.rs485DeviceId)}
+                        </span>
+                    </div>
+                </div>
+                <div style="font-size:0.72rem; color:var(--text-sub); margin-top:-4px; margin-bottom:12px; line-height:1.4;">
+                    📌 Địa chỉ ID phần cứng được gạt bằng công tắc DIP (1-4) trên mặt pin (0000 = ID 1 Master, 1000 = ID 1/2...). BMS tự động nhận diện và gửi lên Cloud.
+                </div>
+            </div>
+
+            <!-- WIFI & DEVICE INFO -->
+            <div class="sett-card" id="wifi-card">
+                <h3 style="color:var(--cyan); margin-bottom:10px; font-size:1rem;">📡 Thông Tin Thiết Bị ESP32</h3>
+                <div class="info-card-box" style="margin:0; background:transparent; border:none; padding:0;">
+                    <div class="card-row"><span>Device ID:</span><strong style="color:var(--cyan); font-family:monospace;">${d.device_id}</strong></div>
+                    <div class="card-row"><span>Kiểu Kết Nối:</span><strong style="color:${isModbus ? '#f59e0b' : 'var(--cyan)'};" id="lbl-conn-proto">${connProtocol}</strong></div>
+                    <div class="card-row"><span>IP Local:</span><strong style="color:#fff;" id="lbl-wifi-ip">${d.local_ip||'—'}</strong></div>
+                    <div class="card-row"><span>Wi-Fi SSID:</span><strong style="color:#fff;" id="lbl-wifi-ssid">${d.ssid||'—'}</strong></div>
+                    <div class="card-row"><span>Wi-Fi RSSI:</span><strong style="color:var(--cyan);" id="lbl-wifi-rssi">${d.rssi ? d.rssi + ' dBm' : '—'}</strong></div>
+                    <div class="card-row"><span>Firmware:</span><strong style="color:var(--green);">${(d.firmware_version && d.firmware_version.startsWith('v')) ? d.firmware_version : ('v' + (d.firmware_version||'—'))}</strong></div>
+                    <div class="card-row"><span>Ngày Kích Hoạt:</span><strong style="color:var(--green); font-size:0.75rem;">${reg}</strong></div>
+                </div>
+                <button onclick="resetWifi()" class="btn btn-sec" style="border-color:var(--red); color:var(--red); margin-top:14px;">♻️ Reset Cài Đặt Wi-Fi ESP32</button>
+            </div>
+        </div>
+
+        <!-- BOTTOM NAVIGATION BAR -->
+        <div class="bottom-nav">
+            <button id="nav-status" class="nav-btn" onclick="showTab('tab-status', this)">
+                <span class="nav-icon">🎛️</span>
+                <span>Status</span>
+            </button>
+            <button id="nav-home" class="nav-btn active" onclick="showTab('tab-home', this)">
+                <span class="nav-icon">🏠</span>
+                <span>Home</span>
+            </button>
+            <button id="nav-sett" class="nav-btn" onclick="showTab('tab-settings', this)">
+                <span class="nav-icon">⚙️</span>
+                <span>Settings</span>
+            </button>
+        </div>
+    </div>
+
+    <script>
+    let mosStates = {
+        charge_mos: ${chargeMos ? 'true' : 'false'},
+        discharge_mos: ${dischargeMos ? 'true' : 'false'},
+        balance: ${balSw ? 'true' : 'false'}
+    };
+    let isScanning = false;
+    let scanTimer = null;
+    let liveTimer = null;
+
+    function getCanProtocolName(code) {
+        if (code === undefined || code === null || code === '') return '—';
+        const c = parseInt(code);
+        const map = {
+            0: '000 User-defined',
+            1: '001 Deye',
+            2: '002 Pylontech',
+            3: '003 Growatt',
+            4: '004 Victron',
+            5: '005 Goodwe',
+            6: '006 SMA',
+            7: '007 Sofar',
+            8: '008 Solis',
+            9: '009 SRNE',
+            10: '010 Must',
+            11: '011 Luxpower',
+            12: '012 Voltronic',
+            13: '013 Schneider',
+            14: '014 TBB',
+            15: '015 Studer'
+        };
+        return map[c] || (String(c).padStart(3, '0') + ' Protocol');
     }
-  }
 
-  async function resetWifi() {
-    if (!confirm('Bạn có chắc chắn muốn Reset Cấu Hình Wi-Fi của thiết bị ${d.device_id}? ESP32 sẽ xóa Wi-Fi và phát lại điểm truy cập cài đặt.')) return;
-    const msgEl = document.getElementById('reset-msg');
-    msgEl.style.display = 'block';
-    msgEl.style.color = '#e3b341';
-    msgEl.textContent = '⏳ Đang gửi lệnh Reset Wi-Fi tới thiết bị...';
-    try {
-      const res = await fetch('/api/send-command', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ device_id: '${d.device_id}', cmd: { cmd: 'reset_wifi' } })
-      });
-      const data = await res.json();
-      if (data.status === 'ok') {
-        msgEl.style.color = '#3fb950';
-        msgEl.textContent = '✅ Đã gửi lệnh! ESP32 đang xóa Wi-Fi và khởi động lại...';
-      } else {
-        msgEl.style.color = '#f85149';
-        msgEl.textContent = '❌ Lỗi khi gửi lệnh reset!';
-      }
-    } catch(e) {
-      msgEl.style.color = '#f85149';
-      msgEl.textContent = '❌ Lỗi kết nối máy chủ!';
+    function formatBmsAddress(addr) {
+        if (addr === undefined || addr === null || addr === '' || addr === '—') return 'ID 1 (Master)';
+        const num = Number(addr);
+        if (isNaN(num) || num <= 0) return 'ID 1 (Master / Mặc định)';
+        return 'ID ' + num;
     }
-  }
 
-  function updateScanStatus(msg, color, devices) {
-    const el = document.getElementById('scan-status');
-    if (el) { el.style.display='block'; el.style.color=color||'#e3b341'; el.textContent=msg; }
-    if (devices && devices.length > 0) {
-      const listEl = document.getElementById('ble-devices-list');
-      const gridEl = document.getElementById('ble-devices-grid');
-      if (listEl && gridEl) {
-        listEl.style.display = 'block';
-        gridEl.innerHTML = devices.map(dev => {
-          const mac = dev.mac||dev.address||'—';
-          const name = dev.name||'JK-BMS';
-          const rssi = dev.rssi ? dev.rssi + ' dBm' : '';
-          return '<div style="background:rgba(15,23,42,0.7);border:1px solid rgba(56,189,248,0.2);border-radius:8px;padding:9px 12px;display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;"><div><div style="font-size:0.82rem;font-weight:800;color:#00ffaa;">📟 '+name+'</div><div style="font-size:0.7rem;color:#94a3b8;font-family:monospace;margin-top:2px;">MAC: '+mac+' • 📶 '+rssi+'</div></div><button onclick="connectBms(\''+mac+'\',\''+name+'\')" style="background:rgba(16,185,129,.2);border:1px solid #10b981;color:#10b981;padding:6px 14px;border-radius:6px;font-size:0.75rem;font-weight:700;cursor:pointer;">⚡ Kết Nối</button></div>';
-        }).join('');
-      }
+    function showTab(id, btn) {
+        const tabs = ['tab-home', 'tab-status', 'tab-settings'];
+        tabs.forEach(tId => {
+            const el = document.getElementById(tId);
+            if (el) {
+                el.style.display = 'none';
+                el.classList.remove('active');
+            }
+        });
+        document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+
+        const targetEl = document.getElementById(id);
+        if (targetEl) {
+            targetEl.style.display = 'block';
+            targetEl.classList.add('active');
+        }
+        if (btn) btn.classList.add('active');
+        if (id === 'tab-settings') {
+            updateSettingsForm(window._lastDevData || {});
+            if (!window._lastDevData || (!window._lastDevData.settings && !window._lastDevData.params)) {
+                queryBmsSettings(false);
+            }
+        }
+        window.scrollTo({ top: 0, behavior: 'instant' });
     }
-  }
 
-  async function scanBle() {
-    updateScanStatus('⏳ Đang gửi lệnh quét Bluetooth tới ESP32...', '#38bdf8');
-    const listEl = document.getElementById('ble-devices-list');
-    if (listEl) listEl.style.display = 'none';
-    try {
-      await fetch('/api/send-command', {
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({device_id:'${d.device_id}', cmd:{cmd:'scan_ble'}})
-      });
-      let attempts = 0;
-      const timer = setInterval(async () => {
-        attempts++;
-        updateScanStatus('⏳ ESP32 đang bật Bluetooth & quét xung quanh... (' + (attempts*2) + 's / max 30s)', '#e3b341');
+    const $ = id => document.getElementById(id);
+    const _el = {};
+    function _c(id) { return _el[id] || (_el[id] = $(id)); }
+    function _set(id, val) {
+        const el = _c(id);
+        if (el) {
+            const s = String(val);
+            if (el.textContent !== s) el.textContent = s;
+        }
+    }
+
+    const PROT_ITEMS = [
+        { bit: 0,  desc: "Lệch trở dây" },
+        { bit: 1,  desc: "Quá nhiệt MOS" },
+        { bit: 2,  desc: "Lệch số cell" },
+        { bit: 4,  desc: "Pin đã sạc đầy" },
+        { bit: 5,  desc: "Quá áp pack" },
+        { bit: 6,  desc: "Quá dòng sạc" },
+        { bit: 7,  desc: "Ngắn mạch sạc" },
+        { bit: 8,  desc: "Quá nhiệt sạc" },
+        { bit: 9,  desc: "Quá lạnh sạc" },
+        { bit: 11, desc: "Thấp áp cell" },
+        { bit: 12, desc: "Thấp áp pack" },
+        { bit: 13, desc: "Quá dòng xả" },
+        { bit: 14, desc: "Ngắn mạch xả" },
+        { bit: 15, desc: "Quá nhiệt xả" },
+        { bit: 19, desc: "Mật khẩu mặc định" },
+        { bit: 27, desc: "Quá lạnh xả" }
+    ];
+
+    function updateMosDot(type, isOn, isAct = false) {
+        mosStates[type] = isOn;
+        const key = type.replace('_mos','');
+        const dot = document.getElementById('dot-' + key);
+        const txt = document.getElementById('txt-' + key);
+        if (dot && txt) {
+            if (key === 'balance') {
+                if (!isOn) {
+                    dot.className = 'dot off';
+                    txt.className = 'val-off';
+                    txt.innerText = 'OFF';
+                } else if (isAct) {
+                    dot.className = 'dot on';
+                    txt.className = 'val-on';
+                    txt.innerText = 'ĐANG CÂN';
+                } else {
+                    dot.className = 'dot standby';
+                    txt.className = 'val-standby';
+                    txt.innerText = 'CHỜ CÂN';
+                }
+            } else {
+                dot.className = 'dot ' + (isOn ? 'on' : 'off');
+                txt.className = isOn ? 'val-on' : 'val-off';
+                txt.innerText = isOn ? 'ON' : 'OFF';
+            }
+        }
+    }
+
+    // ── Pack Selector: chuyển pack đang stream ──────────────────────────────
+    let isSwitchingPack = false;
+    let PACKS_DATA = ${packsSummaryJs};
+
+    async function switchPack(idx) {
+        if (isSwitchingPack) return;
+        isSwitchingPack = true;
+        // Highlight tab đang chọn ngay lập tức
+        const packs = window.PACKS_DATA || PACKS_DATA;
+        let targetMac = '';
+        let targetName = '';
+        if (packs && Array.isArray(packs)) {
+            const found = packs.find(p => p.idx === idx);
+            if (found) {
+                targetMac = found.mac || '';
+                targetName = found.name || '';
+            }
+            packs.forEach(p => {
+                const tab = document.getElementById('pack-tab-' + p.idx);
+                if (!tab) return;
+                const isNew = (p.idx === idx);
+                tab.style.background = isNew ? 'linear-gradient(135deg,#0ea5e9,#22d3ee)' : '#1a2a35';
+                tab.style.color = isNew ? '#fff' : 'var(--text-sub)';
+                tab.style.boxShadow = isNew ? '0 0 8px rgba(14,165,233,0.5)' : 'none';
+                tab.style.fontWeight = isNew ? '700' : '400';
+            });
+        }
         try {
-          const res = await fetch('/api/scanned-ble?device_id=${d.device_id}');
-          const data = await res.json();
-          if (data.devices && data.devices.length > 0) {
-            clearInterval(timer);
-            updateScanStatus('✅ Đã tìm thấy '+data.devices.length+' thiết bị Bluetooth JK-BMS!', '#3fb950', data.devices);
-          } else if (attempts >= 15) {
-            clearInterval(timer);
-            updateScanStatus('❌ Không tìm thấy JK-BMS nào ở gần hoặc BMS chưa bật nguồn.', '#f85149');
-          }
+            await fetch('/api/set-active-pack', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ device_id: '${d.device_id}', idx: idx, mac: targetMac, name: targetName })
+            });
+            setTimeout(() => { refreshLiveData(); }, 600);
+            setTimeout(() => { refreshLiveData(); }, 1800);
+        } catch(e) {}
+        setTimeout(() => { isSwitchingPack = false; }, 1200);
+    }
+
+    async function deletePack(idx) {
+        const pack = (window.PACKS_DATA || []).find(p => p.idx === idx) || {};
+        const mac = pack.mac || '';
+        const packLabel = pack.name || ('Pack ' + (idx + 1));
+        if (!confirm('Xác nhận XÓA [' + packLabel + '] (' + (mac || 'Không có MAC') + ') khỏi danh sách quản lý?')) return;
+        try {
+            const res = await fetch('/api/delete-pack', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ device_id: '${d.device_id}', idx: idx, mac: mac })
+            });
+            const data = await res.json();
+            if (data.status === 'ok') {
+                if (data.packs_summary) {
+                    window.PACKS_DATA = data.packs_summary;
+                    PACKS_DATA = data.packs_summary;
+                    updatePackTabs(data.packs_summary, data.active_pack_idx || 0, true);
+                }
+                refreshLiveData();
+            } else {
+                alert('Không thể xóa pack: ' + (data.error || 'Lỗi không xác định'));
+            }
+        } catch(e) {
+            alert('Lỗi kết nối khi xóa pack: ' + e.message);
+        }
+    }
+
+    async function clearAllPacks() {
+        if (!confirm('Xác nhận XÓA TOÀN BỘ danh sách pack đã lưu? ESP32 sẽ xóa trắng danh sách để bạn kết nối pin mới.')) return;
+        try {
+            const res = await fetch('/api/clear-packs', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ device_id: '${d.device_id}' })
+            });
+            const data = await res.json();
+            if (data.status === 'ok') {
+                window.PACKS_DATA = [];
+                PACKS_DATA = [];
+                const container = document.getElementById('pack-selector');
+                if (container) container.style.display = 'none';
+                showParamToast('✅ Đã xóa toàn bộ danh sách Pack thành công!');
+                setTimeout(() => { refreshLiveData(); }, 1200);
+            } else {
+                alert('Không thể xóa danh sách pack: ' + (data.error || 'Lỗi không xác định'));
+            }
+        } catch(e) {
+            alert('Lỗi kết nối khi xóa danh sách pack: ' + e.message);
+        }
+    }
+
+    function updatePackTabs(packsSummary, activeIdx, forceRebuild = false) {
+        if (!packsSummary || !Array.isArray(packsSummary) || packsSummary.length <= 1) {
+            const container = document.getElementById('pack-selector');
+            if (container) container.style.display = 'none';
+            return;
+        }
+        window.PACKS_DATA = packsSummary;
+        PACKS_DATA = packsSummary;
+        const container = document.getElementById('pack-selector');
+        if (!container) return;
+        container.style.display = 'flex';
+
+        // Kiểm tra xem đã có đủ tabs chưa hoặc cần bắt buộc build lại
+        let needsRebuild = forceRebuild;
+        if (!needsRebuild) {
+            const curTabs = container.querySelectorAll('[id^="pack-tab-"]');
+            if (curTabs.length !== packsSummary.length) needsRebuild = true;
+            packsSummary.forEach(p => {
+                if (!document.getElementById('pack-tab-' + p.idx)) needsRebuild = true;
+            });
+        }
+
+        if (needsRebuild) {
+            let html = '';
+            packsSummary.forEach((p, i) => {
+                const pName = (p.name && p.name.length > 0) ? p.name : ('Pack ' + (i + 1));
+                const pVolt = p.voltage > 0 ? (p.voltage.toFixed(1) + 'V') : '?V';
+                const pSoc  = p.soc > 0 ? (p.soc + '%') : '?%';
+                const isAct = (p.idx === activeIdx);
+                const bg = isAct ? 'linear-gradient(135deg,#0ea5e9,#22d3ee)' : '#1a2a35';
+                const color = isAct ? '#fff' : 'var(--text-sub)';
+                const shadow = isAct ? '0 0 8px rgba(14,165,233,0.5)' : 'none';
+                const fw = isAct ? '700' : '400';
+                const displayName = pName.length > 10 ? (pName.slice(0, 10) + '..') : pName;
+                const statusTxt = p.connected ? '● Online' : '○ Cached';
+
+                html += '<div id="pack-tab-' + p.idx + '" style="' +
+                  'position:relative; display:flex; flex-direction:column; align-items:center; padding:5px 12px; border-radius:8px; cursor:pointer; white-space:nowrap; min-width:76px; transition:all 0.2s;' +
+                  'background:' + bg + '; color:' + color + '; box-shadow:' + shadow + '; font-weight:' + fw + ';" ' +
+                  'onclick="switchPack(' + p.idx + ')">' +
+                  '<span style="font-size:0.75rem; font-weight:700;">' + displayName + '</span>' +
+                  '<span style="font-size:0.68rem; opacity:0.85;">' + pVolt + ' · ' + pSoc + '</span>' +
+                  '<span style="font-size:0.6rem; margin-top:1px;">' + statusTxt + '</span>' +
+                  '<button onclick="event.stopPropagation(); deletePack(' + p.idx + ')" ' +
+                    'title="Xóa pack này khỏi danh sách" ' +
+                    'style="position:absolute; top:-5px; right:-5px; background:rgba(239,68,68,0.9); color:#fff; border:1px solid rgba(255,255,255,0.4); border-radius:50%; width:16px; height:16px; font-size:10px; line-height:14px; text-align:center; cursor:pointer; padding:0; display:flex; align-items:center; justify-content:center; box-shadow:0 1px 3px rgba(0,0,0,0.5); opacity:0.8;">✕</button>' +
+                '</div>';
+            });
+            const spanLabel = '<span style="font-size:0.72rem; color:var(--text-sub); align-self:center; white-space:nowrap; padding-right:2px;">Pack:</span>';
+            const clearBtn = '<button id="btn-clear-packs" onclick="clearAllPacks()" title="Xóa toàn bộ danh sách Pack" style="background:rgba(239,68,68,0.15); border:1px solid rgba(239,68,68,0.35); color:#f87171; border-radius:8px; padding:6px 10px; font-size:0.72rem; font-weight:700; cursor:pointer; white-space:nowrap; display:flex; align-items:center; gap:4px; margin-left:4px;"><span>🗑️</span><span>Xóa DS</span></button>';
+            container.innerHTML = spanLabel + '<div id="pack-tabs-container" style="display:flex; gap:8px;">' + html + '</div>' + clearBtn;
+            return;
+        }
+
+        // Cập nhật tabs hiện có
+        packsSummary.forEach(p => {
+            const tab = document.getElementById('pack-tab-' + p.idx);
+            if (!tab) return;
+            const isAct = (p.idx === activeIdx);
+            tab.style.background = isAct ? 'linear-gradient(135deg,#0ea5e9,#22d3ee)' : '#1a2a35';
+            tab.style.color = isAct ? '#fff' : 'var(--text-sub)';
+            tab.style.boxShadow = isAct ? '0 0 8px rgba(14,165,233,0.5)' : 'none';
+            tab.style.fontWeight = isAct ? '700' : '400';
+            const spans = tab.querySelectorAll('span');
+            const pName = (p.name && p.name.length > 0) ? p.name : ('Pack ' + (p.idx + 1));
+            const displayName = pName.length > 10 ? (pName.slice(0, 10) + '..') : pName;
+            if (spans[0]) spans[0].innerText = displayName;
+            if (spans.length >= 2) {
+                if (p.voltage > 0) {
+                    spans[1].innerText = p.voltage.toFixed(1) + 'V · ' + (p.soc || 0) + '%';
+                }
+                if (spans[2]) spans[2].innerText = p.connected ? '● Online' : '○ Cached';
+            }
+        });
+    }
+
+    async function toggleMos(type) {
+        const key = type === 'charge_mos' ? 'charge_mos' : (type === 'discharge_mos' ? 'discharge_mos' : 'balance');
+        const newState = !mosStates[key];
+        updateMosDot(key, newState);
+        try {
+            await fetch('/api/send-command', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    device_id: '${d.device_id}',
+                    cmd: { cmd: 'set_' + key, enable: newState }
+                })
+            });
+        } catch(e) {}
+    }
+
+    function closeScannedList() {
+        const elHome = document.getElementById('home-ble-list');
+        const elSett = document.getElementById('ble-list');
+        const statHome = document.getElementById('home-ble-status');
+        const statSett = document.getElementById('ble-status');
+        if (elHome) elHome.innerHTML = '';
+        if (elSett) elSett.innerHTML = '';
+        if (statHome) statHome.style.display = 'none';
+        if (statSett) statSett.style.display = 'none';
+        if (scanTimer) { clearInterval(scanTimer); scanTimer = null; }
+        isScanning = false;
+        const btnHome = document.getElementById('btn-home-ble-scan');
+        if (btnHome) { btnHome.disabled = false; btnHome.innerText = '🔍 Quét Bluetooth'; }
+    }
+
+    function renderScannedDevices(devices) {
+        const elHome = document.getElementById('home-ble-list');
+        const elSett = document.getElementById('ble-list');
+        if (!devices || devices.length === 0) {
+            const emptyHtml = '<div style="text-align:center; padding:10px; font-size:0.8rem; color:var(--text-sub); border:1px dashed #222d35; border-radius:8px;">Không tìm thấy thiết bị BLE nào. Hãy đảm bảo BMS đang bật Bluetooth và ở gần ESP32.</div>';
+            if (elHome) elHome.innerHTML = emptyHtml;
+            if (elSett) elSett.innerHTML = emptyHtml;
+            return;
+        }
+
+        let headerHtml = '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; padding:2px 4px;">' +
+                         '<span style="font-size:0.8rem; color:var(--text-sub);">Tìm thấy ' + devices.length + ' thiết bị BLE:</span>' +
+                         '<button type="button" onclick="closeScannedList()" style="background:rgba(255,59,48,0.15); border:1px solid rgba(255,59,48,0.3); color:#ff6b6b; font-size:0.75rem; cursor:pointer; font-weight:700; padding:2px 8px; border-radius:4px;">✕ Đóng</button>' +
+                         '</div>';
+
+        let html = headerHtml;
+        devices.forEach(d => {
+            const isJK = d.is_jkbms || (d.name && (d.name.toLowerCase().includes('jk') || d.name.toLowerCase().includes('bms') || d.name.toLowerCase().includes('blue')));
+            const borderColor = isJK ? 'rgba(0,255,43,0.4)' : 'rgba(56,189,248,0.3)';
+            const bgColor = isJK ? 'rgba(0,255,43,0.05)' : 'rgba(15,23,42,0.6)';
+            const safeName = (d.name || '').replace(/'/g, "\\\\'");
+            const displayName = (d.name && d.name !== '(Không có tên)') ? d.name : 'Thiết bị BLE';
+            const rssiVal = d.rssi !== undefined ? d.rssi : -70;
+            html += '<div class="list-item" style="border:1px solid ' + borderColor + '; background:' + bgColor + '; padding:10px 12px; margin-bottom:8px; border-radius:8px;">' +
+                    '<div>' +
+                        '<div style="font-weight:700; font-size:0.9rem; color:' + (isJK ? 'var(--green)' : '#fff') + '; display:flex; align-items:center; gap:6px;">' +
+                            '<span>' + (isJK ? '🔋' : '📡') + '</span>' +
+                            '<span>' + displayName + '</span>' +
+                            (isJK ? '<span style="font-size:0.65rem; background:rgba(0,255,43,0.18); color:var(--green); border:1px solid var(--green); padding:1px 6px; border-radius:4px;">JK-BMS</span>' : '') +
+                        '</div>' +
+                        '<div style="font-size:0.75rem; color:var(--text-sub); font-family:monospace; margin-top:2px;">MAC: ' + d.mac + ' | Tín hiệu: ' + rssiVal + ' dBm</div>' +
+                    '</div>' +
+                    '<button class="btn" style="width:auto; padding:6px 14px; font-size:0.78rem; font-weight:700; background:linear-gradient(135deg,#00d2ff,#00ff2b); color:#000; margin:0;" onclick="connectBms(\\'' + d.mac + '\\', \\'' + safeName + '\\')">⚡ Kết Nối & Lưu</button>' +
+                '</div>';
+        });
+
+        if (elHome) elHome.innerHTML = html;
+        if (elSett) elSett.innerHTML = html;
+    }
+
+    async function scanBLE() {
+        const btnHome = document.getElementById('btn-home-ble-scan');
+        const statHome = document.getElementById('home-ble-status');
+        const statSett = document.getElementById('ble-status');
+
+        const setStatus = (msg, isErr=false) => {
+            const color = isErr ? 'var(--red)' : 'var(--cyan)';
+            if (statHome) { statHome.style.display = 'block'; statHome.style.color = color; statHome.innerText = msg; }
+            if (statSett) { statSett.style.display = 'block'; statSett.style.color = color; statSett.innerText = msg; }
+        };
+
+        if (btnHome) { btnHome.disabled = true; btnHome.innerText = '⏳ Đang quét...'; }
+        setStatus('📡 Đang gửi lệnh quét Bluetooth tới ESP32...');
+
+        try {
+            await fetch('/api/send-command', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ device_id: '${d.device_id}', cmd: { cmd: 'scan_ble' } })
+            });
+
+            isScanning = true;
+            let attempts = 0;
+            if (scanTimer) clearInterval(scanTimer);
+            scanTimer = setInterval(async () => {
+                attempts++;
+                setStatus('⏳ ESP32 đang quét Bluetooth xung quanh... (' + (attempts * 2) + 's / max 50s)');
+                try {
+                    const res = await fetch('/api/scanned-ble?device_id=${d.device_id}&_t=' + Date.now());
+                    const data = await res.json();
+                    if (data.status === 'done' || (data.devices && data.devices.length > 0)) {
+                        clearInterval(scanTimer);
+                        isScanning = false;
+                        if (btnHome) { btnHome.disabled = false; btnHome.innerText = '🔍 Quét Bluetooth'; }
+                        if (data.devices && data.devices.length > 0) {
+                            setStatus('✅ Đã tìm thấy ' + data.devices.length + ' thiết bị Bluetooth!');
+                            renderScannedDevices(data.devices);
+                        } else {
+                            setStatus('ℹ️ Quét hoàn tất. Không phát hiện thêm thiết bị phát sóng xung quanh.');
+                        }
+                    } else if (attempts >= 25) {
+                        clearInterval(scanTimer);
+                        isScanning = false;
+                        if (btnHome) { btnHome.disabled = false; btnHome.innerText = '🔍 Quét Bluetooth'; }
+                        setStatus('❌ Hết thời gian chờ phản hồi từ ESP32.', true);
+                    }
+                } catch(e) {}
+            }, 2000);
+        } catch(e) {
+            if (btnHome) { btnHome.disabled = false; btnHome.innerText = '🔍 Quét Bluetooth'; }
+            setStatus('❌ Lỗi kết nối máy chủ!', true);
+        }
+    }
+
+    async function connectBms(mac, name) {
+        if (!confirm('Kết nối ESP32 tới BMS ' + name + ' (' + mac + ')?')) return;
+        const statHome = document.getElementById('home-ble-status');
+        if (statHome) { statHome.style.display = 'block'; statHome.style.color = 'var(--yellow)'; statHome.innerText = '⏳ Đang gửi lệnh kết nối tới ESP32...'; }
+        try {
+            await fetch('/api/send-command', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    device_id: '${d.device_id}',
+                    cmd: [
+                        { cmd: 'connect_bms', mac: mac, name: name, pin: '1234' },
+                        { cmd: 'send_heartbeat_now' }
+                    ]
+                })
+            });
+            // Tự động đóng danh sách quét Bluetooth sau khi bấm kết nối
+            closeScannedList();
+            showParamToast('✅ Đã yêu cầu kết nối tới ' + name + '!');
+            setTimeout(() => {
+                showTab('tab-home', document.getElementById('nav-home'));
+                refreshLiveData();
+            }, 2500);
+        } catch(e) {
+            if (statHome) { statHome.style.color = 'var(--red)'; statHome.innerText = '❌ Lỗi gửi lệnh!'; }
+            showParamToast('❌ Lỗi kết nối: ' + e.message, true);
+        }
+    }
+
+    async function resetWifi() {
+        if (!confirm('Xác nhận Reset Wi-Fi thiết bị ${d.device_id}? ESP32 sẽ xóa cấu hình Wi-Fi và phát lại mạng AP Setup.')) return;
+        try {
+            await fetch('/api/send-command', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ device_id: '${d.device_id}', cmd: { cmd: 'reset_wifi' } })
+            });
+            alert('✅ Đã gửi lệnh Reset Wi-Fi! Vui lòng kết nối vào mạng AP của ESP32 để cài đặt lại.');
+        } catch(e) { alert('❌ Lỗi gửi lệnh!'); }
+    }
+
+    let toastTimer = null;
+    function showParamToast(msg, isErr = false) {
+        let toast = document.getElementById('floating-toast');
+        if (!toast) {
+            toast = document.createElement('div');
+            toast.id = 'floating-toast';
+            toast.style.cssText = 'position:fixed; bottom:74px; left:50%; transform:translateX(-50%); z-index:99999; padding:10px 18px; border-radius:24px; font-size:0.83rem; font-weight:700; box-shadow:0 6px 24px rgba(0,0,0,0.7); transition:all 0.3s cubic-bezier(0.4,0,0.2,1); pointer-events:none; max-width:92%; text-align:center;';
+            document.body.appendChild(toast);
+        }
+        toast.style.background = isErr ? 'rgba(239,68,68,0.95)' : 'rgba(15,23,42,0.95)';
+        toast.style.color = isErr ? '#fff' : '#00ff2b';
+        toast.style.border = isErr ? '1px solid #ef4444' : '1px solid #00ff2b';
+        toast.textContent = msg;
+        toast.style.opacity = '1';
+        toast.style.transform = 'translateX(-50%) translateY(0)';
+
+        if (toastTimer) clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => {
+            if (toast) {
+                toast.style.opacity = '0';
+                toast.style.transform = 'translateX(-50%) translateY(10px)';
+            }
+        }, 3500);
+    }
+
+    const pendingParamUpdates = {};
+
+    async function saveSingleParam(inputId, reg, name, unit, btnEl) {
+        const input = document.getElementById(inputId);
+        if (!input) return;
+        const rawVal = input.value.trim().replace(',', '.');
+        const numVal = parseFloat(rawVal);
+        if (isNaN(numVal)) {
+            alert('Vui lòng nhập giá trị hợp lệ cho ' + name);
+            return;
+        }
+
+        // Khóa không cho dữ liệu đọc ngầm ghi đè thông số vừa nhập trong 25 giây
+        pendingParamUpdates[inputId] = { val: numVal, expireAt: Date.now() + 25000 };
+
+        // Cập nhật lạc quan vào bộ nhớ cache local để tránh giật giao diện
+        if (window._lastDevData) {
+            if (!window._lastDevData.settings) window._lastDevData.settings = {};
+            if (!window._lastDevData.params) window._lastDevData.params = {};
+            window._lastDevData.params[String(reg)] = numVal;
+            const regToKey = {
+                1: 'smart_sleep_v', 2: 'cell_uvp', 3: 'cell_uvpr', 4: 'cell_ovp', 5: 'cell_ovpr',
+                6: 'bal_delta_v', 7: 'soc100_v', 8: 'soc0_v', 9: 'req_chg_v', 10: 'req_float_v',
+                11: 'power_off_v', 12: 'max_chg_curr', 13: 'chg_ocp_delay', 14: 'chg_ocpr_time',
+                15: 'max_dsg_curr', 16: 'dsg_ocp_delay', 19: 'max_bal_curr', 28: 'cell_count',
+                32: 'battery_cap', 38: 'bal_start_v', 166: 'can_protocol'
+            };
+            if (regToKey[reg]) window._lastDevData.settings[regToKey[reg]] = numVal;
+            if (reg === 0xA6 || reg === 166) {
+                window._lastDevData.can_protocol = numVal;
+                window._lastDevData.canProtocol = numVal;
+                const devCan = document.getElementById('dev-info-can');
+                if (devCan) devCan.textContent = getCanProtocolName(numVal);
+            }
+        }
+
+        const originalText = btnEl ? btnEl.innerHTML : 'OK';
+        if (btnEl) {
+            btnEl.disabled = true;
+            btnEl.innerHTML = '<span class="loading-spin"></span>';
+        }
+
+        try {
+            const res = await fetch('/api/send-command', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    device_id: '${d.device_id}',
+                    cmd: {
+                        cmd: 'set_param',
+                        reg: reg,
+                        val: numVal,
+                        slave_id: (window._lastDevData && window._lastDevData.address_id) ? window._lastDevData.address_id : 1
+                    }
+                })
+            });
+            const data = await res.json();
+            if (data.status === 'ok') {
+                if (btnEl) {
+                    btnEl.innerHTML = '✓';
+                    btnEl.style.background = '#00ff2b';
+                    btnEl.style.color = '#000';
+                    setTimeout(() => {
+                        btnEl.innerHTML = originalText;
+                        btnEl.style.background = '';
+                        btnEl.style.color = '';
+                        btnEl.disabled = false;
+                    }, 2000);
+                }
+                const displayUnit = unit ? (' ' + unit) : '';
+                showParamToast('✅ Đã ghi ' + name + ' (' + numVal + displayUnit + ') thành công qua Modbus!');
+            } else {
+                delete pendingParamUpdates[inputId];
+                throw new Error(data.error || 'Lỗi gửi lệnh');
+            }
+        } catch (e) {
+            delete pendingParamUpdates[inputId];
+            if (btnEl) {
+                btnEl.innerHTML = '✕';
+                btnEl.style.background = '#ff3b30';
+                btnEl.style.color = '#fff';
+                setTimeout(() => {
+                    btnEl.innerHTML = originalText;
+                    btnEl.style.background = '';
+                    btnEl.style.color = '';
+                    btnEl.disabled = false;
+                }, 2000);
+            }
+            showParamToast('❌ Lỗi ghi ' + name + ': ' + e.message, true);
+        }
+    }
+
+    async function queryBmsSettings(showToast = true) {
+        const badge = document.getElementById('settings-sync-badge');
+        if (badge) {
+            badge.style.background = 'rgba(0,229,255,0.15)';
+            badge.style.color = 'var(--cyan)';
+            badge.style.borderColor = 'var(--cyan)';
+            badge.innerText = '⏳ Đang đồng bộ thông số từ BMS qua Modbus...';
+        }
+        try {
+            await fetch('/api/send-command', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    device_id: '${d.device_id}',
+                    cmd: { 
+                        cmd: 'query_settings',
+                        slave_id: (window._lastDevData && window._lastDevData.address_id) ? window._lastDevData.address_id : 1
+                    }
+                })
+            });
+            if (showToast) showParamToast('✅ Đã gửi lệnh yêu cầu đọc lại cài đặt từ BMS qua Modbus!');
+        } catch(e) {}
+    }
+
+    function updateSettingsForm(dev) {
+        if (!dev) return;
+        const s = dev.settings || {};
+        const p = dev.params || {};
+        const isFocused = document.activeElement && (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'SELECT');
+        if (isFocused) return;
+
+        const setVal = (id, val) => {
+            const el = document.getElementById(id);
+            if (!el) return;
+            if (pendingParamUpdates[id]) {
+                if (Date.now() < pendingParamUpdates[id].expireAt) {
+                    if (Math.abs(parseFloat(val) - parseFloat(pendingParamUpdates[id].val)) < 0.001) {
+                        delete pendingParamUpdates[id];
+                    } else {
+                        return; // Giữ giá trị người dùng vừa sửa, không cho đè giá trị cũ từ cloud
+                    }
+                } else {
+                    delete pendingParamUpdates[id];
+                }
+            }
+            if (val !== undefined && val !== null && val !== '') {
+                el.value = val;
+            }
+        };
+
+        const maxChg = s.max_chg_curr !== undefined ? s.max_chg_curr : p['12'];
+        const maxDsg = s.max_dsg_curr !== undefined ? s.max_dsg_curr : p['15'];
+        const maxBal = s.max_bal_curr !== undefined ? s.max_bal_curr : p['19'];
+        const batCap = s.battery_cap !== undefined ? s.battery_cap : (p['32'] !== undefined ? p['32'] : dev.capacity_ah);
+        const cellCnt = s.cell_count !== undefined ? s.cell_count : (p['28'] !== undefined ? p['28'] : dev.cell_count);
+        const chgDelay = s.chg_ocp_delay !== undefined ? s.chg_ocp_delay : p['13'];
+        const chgRcvr = s.chg_ocpr_time !== undefined ? s.chg_ocpr_time : p['14'];
+        const dsgDelay = s.dsg_ocp_delay !== undefined ? s.dsg_ocp_delay : p['16'];
+
+        const ovp = s.cell_ovp !== undefined ? s.cell_ovp : p['4'];
+        const ovpr = s.cell_ovpr !== undefined ? s.cell_ovpr : p['5'];
+        const uvp = s.cell_uvp !== undefined ? s.cell_uvp : p['2'];
+        const uvpr = s.cell_uvpr !== undefined ? s.cell_uvpr : p['3'];
+        const balStart = s.bal_start_v !== undefined ? s.bal_start_v : p['38'];
+        const balDelta = s.bal_delta_v !== undefined ? s.bal_delta_v : p['6'];
+        const reqChg = s.req_chg_v !== undefined ? s.req_chg_v : p['9'];
+        const reqFloat = s.req_float_v !== undefined ? s.req_float_v : p['10'];
+        const soc100 = s.soc100_v !== undefined ? s.soc100_v : p['7'];
+        const soc0 = s.soc0_v !== undefined ? s.soc0_v : p['8'];
+        const sleepV = s.smart_sleep_v !== undefined ? s.smart_sleep_v : p['1'];
+        const pwrOff = s.power_off_v !== undefined ? s.power_off_v : p['11'];
+
+        if (maxChg !== undefined) setVal('p_max_chg_curr', Number(maxChg).toFixed(1));
+        if (maxDsg !== undefined) setVal('p_max_dsg_curr', Number(maxDsg).toFixed(1));
+        if (maxBal !== undefined) setVal('p_max_bal_curr', Number(maxBal).toFixed(1));
+        if (batCap !== undefined && Number(batCap) > 0) setVal('p_battery_cap', Math.round(Number(batCap)));
+        if (cellCnt !== undefined && Number(cellCnt) > 0) setVal('p_cell_count', cellCnt);
+        if (chgDelay !== undefined) setVal('p_chg_ocp_delay', chgDelay);
+        if (chgRcvr !== undefined) setVal('p_chg_ocpr_time', chgRcvr);
+        if (dsgDelay !== undefined) setVal('p_dsg_ocp_delay', dsgDelay);
+
+        if (ovp !== undefined && Number(ovp) > 0) setVal('p_cell_ovp', Number(ovp).toFixed(3));
+        if (ovpr !== undefined && Number(ovpr) > 0) setVal('p_cell_ovpr', Number(ovpr).toFixed(3));
+        if (uvp !== undefined && Number(uvp) > 0) setVal('p_cell_uvp', Number(uvp).toFixed(3));
+        if (uvpr !== undefined && Number(uvpr) > 0) setVal('p_cell_uvpr', Number(uvpr).toFixed(3));
+        if (balStart !== undefined && Number(balStart) > 0) setVal('p_bal_start_v', Number(balStart).toFixed(3));
+        if (balDelta !== undefined && Number(balDelta) > 0) setVal('p_bal_delta_v', Number(balDelta).toFixed(3));
+        if (reqChg !== undefined && Number(reqChg) > 0) setVal('p_req_chg_v', Number(reqChg).toFixed(3));
+        if (reqFloat !== undefined && Number(reqFloat) > 0) setVal('p_req_float_v', Number(reqFloat).toFixed(3));
+        if (soc100 !== undefined && Number(soc100) > 0) setVal('p_soc100_v', Number(soc100).toFixed(3));
+        if (soc0 !== undefined && Number(soc0) > 0) setVal('p_soc0_v', Number(soc0).toFixed(3));
+        if (sleepV !== undefined && Number(sleepV) > 0) setVal('p_sleep_v', Number(sleepV).toFixed(3));
+        if (pwrOff !== undefined && Number(pwrOff) > 0) setVal('p_power_off_v', Number(pwrOff).toFixed(3));
+
+        const canVal = dev.can_protocol !== undefined ? dev.can_protocol : dev.canProtocol;
+        const addrVal = dev.address_id !== undefined ? dev.address_id : (dev.rs485DeviceId !== undefined ? dev.rs485DeviceId : dev.rs485_device_id);
+        if (canVal !== undefined && canVal !== null && canVal !== '') {
+            const el = document.getElementById('p_can_protocol');
+            if (el) {
+                if (pendingParamUpdates['p_can_protocol']) {
+                    if (Date.now() < pendingParamUpdates['p_can_protocol'].expireAt) {
+                        if (parseInt(canVal) === parseInt(pendingParamUpdates['p_can_protocol'].val)) {
+                            delete pendingParamUpdates['p_can_protocol'];
+                        }
+                    } else {
+                        delete pendingParamUpdates['p_can_protocol'];
+                    }
+                }
+                if (!pendingParamUpdates['p_can_protocol']) {
+                    el.value = String(canVal);
+                }
+            }
+        }
+        if (addrVal !== undefined && addrVal !== null && addrVal !== '') {
+            const badgeAddr = document.getElementById('sett-addr-badge');
+            if (badgeAddr) badgeAddr.innerText = formatBmsAddress(addrVal);
+        }
+
+        const hasAny = (s.cell_ovp !== undefined || (p['4'] !== undefined && Number(p['4']) > 0) || (maxChg !== undefined && Number(maxChg) > 0));
+        const badge = document.getElementById('settings-sync-badge');
+        if (badge) {
+            if (hasAny) {
+                badge.style.background = 'rgba(0,255,43,0.15)';
+                badge.style.color = 'var(--green)';
+                badge.style.borderColor = 'var(--green)';
+                badge.innerText = '● Đã đồng bộ từ BMS';
+            } else {
+                badge.style.background = 'rgba(255,184,0,0.15)';
+                badge.style.color = 'var(--yellow)';
+                badge.style.borderColor = 'var(--yellow)';
+                badge.innerText = '○ Đang chờ nạp thông số từ BMS...';
+            }
+        }
+    }
+
+    async function refreshLiveData() {
+        if (window._isRefreshing) return;
+        window._isRefreshing = true;
+        try {
+            const res = await fetch('/api/devices?device_id=${d.device_id}&watch=1&_t=' + Date.now());
+            if (!res.ok) return;
+            const devices = await res.json();
+            const dev = devices.find(item => item.device_id === '${d.device_id}');
+            if (!dev) return;
+
+            window._lastDevData = dev;
+            const settTab = document.getElementById('tab-settings');
+            if (settTab && settTab.classList.contains('active')) {
+                updateSettingsForm(dev);
+            }
+
+            if (dev.packs_summary && Array.isArray(dev.packs_summary) && dev.packs_summary.length > 1) {
+                let actIdx = dev.active_pack_idx !== undefined ? dev.active_pack_idx : 0;
+                if (dev.active_bms_mac) {
+                    const norm = dev.active_bms_mac.toLowerCase().replace(/[:-]/g, '');
+                    const f = dev.packs_summary.findIndex(p => (p.mac || '').toLowerCase().replace(/[:-]/g, '') === norm);
+                    if (f >= 0) actIdx = f;
+                }
+                updatePackTabs(dev.packs_summary, actIdx);
+            } else {
+                const container = document.getElementById('pack-selector');
+                if (container) container.style.display = 'none';
+            }
+
+            const curCan = dev.can_protocol !== undefined ? dev.can_protocol : dev.canProtocol;
+            const curAddr = dev.address_id !== undefined ? dev.address_id : (dev.rs485DeviceId !== undefined ? dev.rs485DeviceId : dev.rs485_device_id);
+            if (curCan !== undefined && curCan !== null && curCan !== '') _set('dev-info-can', getCanProtocolName(curCan));
+            if (curAddr !== undefined && curAddr !== null && curAddr !== '') _set('dev-info-addr', formatBmsAddress(curAddr));
+            // Update Device Info card fields
+            const bmsPackName = (dev.active_pack_alias || dev.active_pack_name || dev.bms_name || dev.device_name || dev.active_bms_name || 'JK-BMS');
+            _set('dev-info-pack-name', bmsPackName);
+            const rawModel = dev.modelName || dev.model_name || '';
+            const bmsModel = (rawModel && rawModel !== '—' && rawModel !== bmsPackName) ? rawModel : (dev.protocol_version || 'JK02_32S');
+            _set('dev-info-model', bmsModel);
+            if (dev.serialNumber && dev.serialNumber !== '—') _set('dev-info-sn', dev.serialNumber);
+            else if (dev.bmsSerialNumber && dev.bmsSerialNumber !== '—') _set('dev-info-sn', dev.bmsSerialNumber);
+            if (dev.bmsHwVersion && dev.bmsHwVersion !== '—') _set('dev-info-hw', dev.bmsHwVersion);
+            else if (dev.hwVersionStr && dev.hwVersionStr !== '—') _set('dev-info-hw', dev.hwVersionStr);
+            if (dev.bmsSwVersion && dev.bmsSwVersion !== '—') _set('dev-info-sw', dev.bmsSwVersion);
+            else if (dev.swVersionStr && dev.swVersionStr !== '—') _set('dev-info-sw', dev.swVersionStr);
+            if (dev.protocol_version) _set('dev-info-family', dev.protocol_version + (dev.bmsFamilyStr ? ' (' + dev.bmsFamilyStr + ')' : ''));
+            const isBalancer = (dev.conn_type === 'uart_lcd') || (dev.conn_type === 'balancer') || (dev.conn_type_num === 3) || (dev.firmware_version && dev.firmware_version.includes('BALANCER')) || (dev.device_id && dev.device_id.startsWith('JKBAL'));
+            const isMod = !isBalancer && ((dev.conn_type === 'ble' || dev.conn_type_num === 1 || (dev.firmware_version && dev.firmware_version.includes('BLE')))
+                ? false
+                : ((dev.conn_type === 'modbus') || (dev.conn_type === 'rs485') || (dev.conn_type_num === 2) || (dev.firmware_version && dev.firmware_version.includes('RS485')) || (dev.active_bms_mac && String(dev.active_bms_mac).startsWith('RS485'))));
+            if (isBalancer) {
+                _set('dev-info-mac', 'JK Balancer UART TTL (Cổng LCD)');
+                const rowBle = document.getElementById('row-dev-info-ble-rssi');
+                if (rowBle) rowBle.style.display = 'none';
+                const rowPin = document.getElementById('row-dev-info-pin');
+                if (rowPin) rowPin.style.display = 'none';
+                const rowSetupPin = document.getElementById('row-dev-info-setup-pin');
+                if (rowSetupPin) rowSetupPin.style.display = 'none';
+                const hBox = document.getElementById('home-ble-box');
+                if (hBox) hBox.style.display = 'none';
+            } else if (isMod) {
+                _set('dev-info-mac', 'RS485 Modbus RTU');
+                const rowBle = document.getElementById('row-dev-info-ble-rssi');
+                if (rowBle) rowBle.style.display = 'none';
+                const rowPin = document.getElementById('row-dev-info-pin');
+                if (rowPin) { rowPin.style.display = 'flex'; _set('dev-info-pin', dev.devicePasscode || '—'); }
+                const rowSetupPin = document.getElementById('row-dev-info-setup-pin');
+                if (rowSetupPin) { rowSetupPin.style.display = 'flex'; _set('dev-info-setup-pin', dev.setup_passcode || dev.setupPasscode || '—'); }
+                const hBox = document.getElementById('home-ble-box');
+                if (hBox) hBox.style.display = 'none';
+            } else {
+                _set('dev-info-mac', dev.active_bms_mac || '—');
+                const bleRssiStr = (dev.ble_rssi && dev.ble_rssi !== 0) ? dev.ble_rssi + ' dBm' : '—';
+                _set('dev-info-ble-rssi', bleRssiStr);
+                const rowBle = document.getElementById('row-dev-info-ble-rssi');
+                if (rowBle) rowBle.style.display = 'flex';
+                const hBox = document.getElementById('home-ble-box');
+                if (hBox) hBox.style.display = 'block';
+            }
+
+            const isOnline = !!(dev.online || (dev.lastSeen && (Date.now() - dev.lastSeen < 60000)));
+            const hasData = dev.voltage !== undefined && dev.voltage > 0;
+
+            // ── 90s BMS Reconnection Grace Period ─────────────────────────────
+            // Khi ESP đang kết nối lại (hoặc mất tạm thời do sóng yếu/quét/round-robin),
+            // giữ nguyên trạng thái kết nối Xanh trong 90 giây để khách hàng xem không bị khó chịu!
+            if (dev.connected === true) {
+                window._lastBmsConnOkTime = Date.now();
+            } else if (hasData && !window._lastBmsConnOkTime) {
+                window._lastBmsConnOkTime = dev.lastBmsConnected || Date.now();
+            }
+            const bmsGraceElapsed = window._lastBmsConnOkTime ? (Date.now() - window._lastBmsConnOkTime) : 999999;
+            const isConn = isOnline && (dev.connected === true || (hasData && bmsGraceElapsed < 90000));
+
+            // Online Badge
+            const dot = _c('esp-online-dot');
+            const txt = _c('esp-online-txt');
+            const badge = _c('esp-online-badge');
+            if (dot && txt && badge) {
+                const badgeColor = isOnline ? (isConn ? '#00ff2b' : '#f59e0b') : '#ff3b30';
+                dot.style.background = badgeColor;
+                dot.style.boxShadow = '0 0 5px ' + badgeColor;
+                txt.textContent = isOnline ? (isConn ? 'ESP Online • BMS Đang kết nối' : 'ESP Online • Đang đợi BMS') : 'ESP Offline';
+                badge.style.color = badgeColor;
+            }
+
+            // BT / Modbus Icon
+            const btIcon = _c('bt-icon-head');
+            if (btIcon) {
+                if (isConn) btIcon.className = 'bt-status active';
+                else btIcon.className = 'bt-status';
+            }
+
+            // Runtime Display (match Local Web)
+            const rtSec = (dev.total_runtime_s && dev.total_runtime_s > 0) ? dev.total_runtime_s : ((dev.totalRuntimeSec && dev.totalRuntimeSec > 0) ? dev.totalRuntimeSec : ((dev.uptime_s && dev.uptime_s > 0) ? dev.uptime_s : (dev.uptimeSec || 0)));
+            const rtDays = Math.floor(rtSec / 86400);
+            const rtHours = Math.floor((rtSec % 86400) / 3600);
+            const rtMins = Math.floor((rtSec % 3600) / 60);
+            const rtS = Math.floor(rtSec % 60);
+            const curRuntimeStr = rtDays + 'd ' + rtHours.toString().padStart(2, '0') + 'h ' + rtMins.toString().padStart(2, '0') + 'm ' + rtS.toString().padStart(2, '0') + 's';
+            _set('uptime-display', curRuntimeStr);
+            _set('rt-runtime', curRuntimeStr);
+
+            // Name & Protocol Live Update
+            const bmsName = (dev.active_bms_name && dev.active_bms_name !== 'JK_PB2A16S15P' && !dev.active_bms_name.startsWith('JK-BMS [') ? dev.active_bms_name : null) || dev.active_pack_name || dev.active_pack_alias || dev.active_bms_name || (isBalancer ? 'JK Active Balancer' : (isMod ? 'JK-PB Modbus' : 'JK-BMS'));
+            _set('head-bms-title', (isConn || hasData) ? bmsName : (dev.active_bms_mac ? bmsName : (isBalancer ? 'JK Active Balancer' : 'Chưa kết nối BMS')));
+            const badgeEl = _c('conn-type-badge');
+            if (badgeEl) {
+                badgeEl.textContent = isBalancer ? '⚡ CÂN BẰNG JK' : (isMod ? '🟠 MODBUS' : '🔵 BLUETOOTH');
+                badgeEl.style.color = isBalancer ? '#10b981' : (isMod ? '#f59e0b' : '#38bdf8');
+                badgeEl.style.background = isBalancer ? 'rgba(16,185,129,0.18)' : (isMod ? 'rgba(245,158,11,0.18)' : 'rgba(56,189,248,0.18)');
+                badgeEl.style.borderColor = isBalancer ? 'rgba(16,185,129,0.45)' : (isMod ? 'rgba(245,158,11,0.45)' : 'rgba(56,189,248,0.45)');
+            }
+            const iconHead = _c('bt-icon-head');
+            if (iconHead) {
+                iconHead.textContent = isBalancer ? '⚡' : (isMod ? '🔌' : '📡');
+                iconHead.title = isBalancer ? 'Cân bằng JK UART' : (isMod ? 'Modbus RS485' : 'Bluetooth BLE');
+            }
+            _set('head-sn', isBalancer ? 'UART TTL (Cổng LCD)' : (isMod ? (dev.active_bms_mac ? ('ID: ' + dev.active_bms_mac) : 'RS485 Modbus') : (dev.active_bms_mac ? ('MAC: ' + dev.active_bms_mac) : 'Chưa chọn Pack')));
+            _set('lbl-conn-proto', isBalancer ? 'JK Balancer UART (LCD Port)' : (isMod ? 'RS485 Modbus RTU' : 'Bluetooth BLE'));
+
+            // Gauge: ALWAYS preserve valid battery reading, NEVER drop to 0!
+            const socVal = (isConn || hasData) ? (dev.soc !== undefined ? dev.soc : 0) : 0;
+            _set('home-soc-txt', socVal + '%');
+            const arc = _c('gauge-arc');
+            if (arc) {
+                const offset = (284.8 - (socVal / 100.0) * 284.8).toFixed(1);
+                arc.style.strokeDashoffset = offset;
+                const socColor = ((!isConn && !hasData) || socVal <= 0) ? '#556570' : (socVal > 50 ? '#00ff2b' : (socVal > 20 ? '#ffb800' : '#ff3b30'));
+                arc.setAttribute('stroke', (isConn && socVal > 50) ? 'url(#gaugeGrad)' : socColor);
+                const socTxt = _c('home-soc-txt');
+                if (socTxt) socTxt.setAttribute('fill', socColor);
+            }
+
+            const vStr = (isConn || hasData) && dev.voltage !== undefined ? dev.voltage.toFixed(2) + 'V' : '0.00V';
+            _set('home-v-pill', vStr);
+            const aStr = (isConn || hasData) && dev.current !== undefined ? dev.current.toFixed(2) + 'A' : '0.00A';
+            _set('home-a-pill', aStr);
+
+            // Banner
+            const sBanner = _c('status-banner');
+            const bMsg = _c('banner-msg');
+            const bIcon = _c('banner-icon');
+            if (sBanner && bMsg && bIcon) {
+                if (isConn) {
+                    bMsg.innerText = 'Đang kết nối với ' + bmsName + ' • Pin hoạt động bình thường';
+                    bIcon.innerText = '✔'; bIcon.style.color = 'var(--green)';
+                    sBanner.style.borderColor = '#008b99'; sBanner.style.background = 'rgba(5,35,41,0.85)';
+                } else if (hasData) {
+                    const statusDetail = dev.ble_status_msg ? (' • ' + dev.ble_status_msg) : '';
+                    bMsg.innerText = isBalancer ? ('Đang kết nối lại Cân Bằng...' + statusDetail) : (isMod ? ('Đang kết nối lại RS485 với ' + bmsName + statusDetail) : ('Đang kết nối lại Bluetooth với ' + bmsName + statusDetail));
+                    bIcon.innerText = isBalancer ? '⚡' : (isMod ? '🔌' : '📡'); bIcon.style.color = 'var(--yellow)';
+                    sBanner.style.borderColor = 'rgba(245,158,11,0.5)'; sBanner.style.background = 'rgba(40,30,5,0.85)';
+                } else if (dev.active_bms_mac) {
+                    const statusDetail = dev.ble_status_msg ? (' • ' + dev.ble_status_msg) : '';
+                    bMsg.innerText = isBalancer ? ('Đang tìm & nhận tín hiệu UART Balancer...' + statusDetail) : (isMod ? ('Đang tìm & kết nối RS485 tới ' + bmsName + statusDetail) : ('Đang tìm & kết nối BLE tới ' + bmsName + statusDetail));
+                    bIcon.innerText = isBalancer ? '⚡' : (isMod ? '🔌' : '📡'); bIcon.style.color = 'var(--yellow)';
+                    sBanner.style.borderColor = 'rgba(245,158,11,0.5)'; sBanner.style.background = 'rgba(40,30,5,0.85)';
+                } else {
+                    bMsg.innerText = isBalancer ? 'Chưa nhận được tín hiệu UART từ Cân Bằng JK' : (isMod ? 'BMS chưa kết nối RS485' : 'BMS chưa kết nối Bluetooth');
+                    bIcon.innerText = isBalancer ? '⚡' : (isMod ? '🔌' : '📡'); bIcon.style.color = 'var(--red)';
+                    sBanner.style.borderColor = 'rgba(255,59,48,0.5)'; sBanner.style.background = 'rgba(40,5,5,0.85)';
+                }
+            }
+
+            // Quick BLE Bar Home
+            const hBleName = _c('home-ble-name');
+            const hBleMac = _c('home-ble-mac');
+            if (hBleName) {
+                if (isConn) hBleName.innerHTML = '<span style="color:var(--green);">🟢</span> ' + bmsName + ' <span style="font-size:0.75rem; color:var(--green);">(Đang kết nối)</span>';
+                else if (hasData) hBleName.innerHTML = '<span style="color:var(--yellow);">🟡</span> ' + bmsName + ' <span style="font-size:0.75rem; color:var(--yellow);">(Đang kết nối lại...)</span>';
+                else if (dev.active_bms_mac) hBleName.innerHTML = '<span style="color:var(--yellow);">🟡</span> ' + bmsName + ' <span style="font-size:0.75rem; color:var(--yellow);">(Đang tìm kiếm...)</span>';
+                else hBleName.innerHTML = '<span style="color:var(--text-sub);">⚪</span> Chưa kết nối BMS';
+            }
+            if (hBleMac) hBleMac.innerText = dev.active_bms_mac ? ('MAC: ' + dev.active_bms_mac) : 'Chưa có MAC • Hãy bấm Quét Bluetooth';
+
+            // Cells Grid (3 columns, column-major authentic JK style)
+            const cellsArr = Array.isArray(dev.cell_voltages) ? dev.cell_voltages : (Array.isArray(dev.cells) ? dev.cells : []);
+            const cellResArr = Array.isArray(dev.cell_resistances) ? dev.cell_resistances : [];
+            const minNum = dev.min_cell_num || 0;
+            const maxNum = dev.max_cell_num || 0;
+            const cellCount = dev.cell_count || (cellsArr.length > 0 ? cellsArr.length : 16);
+
+            let computedMax = (dev.max_cell_voltage !== undefined && dev.max_cell_voltage > 0) ? dev.max_cell_voltage : 0;
+            let computedMin = (dev.min_cell_voltage !== undefined && dev.min_cell_voltage > 0) ? dev.min_cell_voltage : 999;
+            let foundMaxNum = maxNum, foundMinNum = minNum;
+
+            if (cellsArr.length > 0) {
+                for (let i = 0; i < cellCount; i++) {
+                    const v = (cellsArr[i] !== undefined) ? (typeof cellsArr[i] === 'number' ? cellsArr[i] : parseFloat(cellsArr[i])) : 0;
+                    if (v > computedMax) { computedMax = v; if (!foundMaxNum) foundMaxNum = (i + 1); }
+                    if (v > 0 && v < computedMin) { computedMin = v; if (!foundMinNum) foundMinNum = (i + 1); }
+                }
+            }
+            if (computedMin === 999) computedMin = 0;
+            if (!dev.max_cell_voltage && computedMax > 0) dev.max_cell_voltage = computedMax;
+            if (!dev.min_cell_voltage && computedMin > 0) dev.min_cell_voltage = computedMin;
+            if (dev.delta_cell_voltage === undefined && computedMax > 0 && computedMin > 0) {
+                dev.delta_cell_voltage = parseFloat((computedMax - computedMin).toFixed(3));
+            }
+
+            // Metrics: ALWAYS show valid numbers, NEVER reset to 0!
+            _set('m-high-v', (isConn || hasData) && dev.max_cell_voltage ? dev.max_cell_voltage.toFixed(3) : (computedMax > 0 ? computedMax.toFixed(3) : '0.000'));
+            _set('m-low-v', (isConn || hasData) && dev.min_cell_voltage ? dev.min_cell_voltage.toFixed(3) : (computedMin > 0 ? computedMin.toFixed(3) : '0.000'));
+            _set('m-diff-v', (isConn || hasData) && dev.delta_cell_voltage !== undefined ? dev.delta_cell_voltage.toFixed(3) : (computedMax && computedMin ? (computedMax - computedMin).toFixed(3) : '0.000'));
+            _set('m-bal-a', (isConn || hasData) && dev.balance_current !== undefined ? dev.balance_current.toFixed(3) : '0.000');
+            _set('m-cap-ah', (isConn || hasData) && dev.capacity_ah !== undefined ? Math.round(dev.capacity_ah) : '0');
+            _set('m-rem-ah', (isConn || hasData) && dev.remain_capacity_ah !== undefined ? dev.remain_capacity_ah.toFixed(1) : '0.0');
+            const avgV = ((isConn || hasData) && dev.min_cell_voltage && dev.max_cell_voltage) ? (((dev.min_cell_voltage||0) + (dev.max_cell_voltage||0)) / 2).toFixed(3) : (dev.voltage && cellCount > 0 ? (dev.voltage / cellCount).toFixed(3) : '0.000');
+            _set('m-cell-avg', avgV);
+            _set('m-soh', (isConn || hasData) && dev.soh ? (dev.soh + '%') : '100%');
+
+            const isChg = dev.current > 0.1;
+            const isDsg = dev.current < -0.1;
+            _set('card-curr-val', (isConn || hasData) && dev.current !== undefined ? ((dev.current > 0 ? '+' : '') + dev.current.toFixed(2) + ' A') : '0.00 A');
+            _set('card-power-val', (isConn || hasData) && dev.power !== undefined ? (Math.abs(dev.power).toFixed(1) + ' W') : '0.0 W');
+            _set('card-mos-temp', (isConn || hasData) && dev.mos_temp !== undefined ? (dev.mos_temp.toFixed(1) + ' °C') : '0.0 °C');
+            _set('card-probes', ((isConn || hasData) && dev.temp1 ? dev.temp1.toFixed(1) : '0.0') + ' / ' + ((isConn || hasData) && dev.temp2 ? dev.temp2.toFixed(1) : '0.0') + ' °C');
+            _set('card-status-txt', isConn ? (isChg ? 'Charging (Đang sạc)' : (isDsg ? 'Discharging (Đang xả)' : 'Standby (Chờ)')) : (hasData ? 'Reconnecting (Đang kết nối lại)' : 'Disconnected'));
+
+            // MOS indicators
+            if (dev.charge_mos !== undefined) updateMosDot('charge_mos', dev.charge_mos);
+            if (dev.discharge_mos !== undefined) updateMosDot('discharge_mos', dev.discharge_mos);
+            const isDevBalSw = (dev.balance !== undefined) ? !!dev.balance : (dev.balance_switch !== undefined ? !!dev.balance_switch : !!dev.balance_active);
+            const isDevBalAct = (dev.balance_active !== undefined) ? !!dev.balance_active : (isDevBalSw && dev.balance_current > 0.01);
+            updateMosDot('balance', isDevBalSw, isDevBalAct);
+
+            // Real-time tab
+            _set('rt-power', (isConn || hasData) && dev.power !== undefined ? Math.abs(dev.power).toFixed(1) : '0.0');
+            _set('rt-avg', avgV);
+            _set('rt-cap', (isConn || hasData) && dev.capacity_ah ? Math.round(dev.capacity_ah) : '0');
+            _set('rt-diff', (isConn || hasData) && dev.delta_cell_voltage ? dev.delta_cell_voltage.toFixed(3) : (computedMax && computedMin ? (computedMax - computedMin).toFixed(3) : '0.000'));
+            _set('rt-rem', (isConn || hasData) && dev.remain_capacity_ah ? dev.remain_capacity_ah.toFixed(1) : '0.0');
+            _set('rt-balcurr', (isConn || hasData) && dev.balance_current ? dev.balance_current.toFixed(3) : '0.000');
+            _set('rt-mos', (isConn || hasData) && dev.mos_temp ? dev.mos_temp.toFixed(1) : '0.0');
+            _set('rt-cyc', (isConn || hasData) && dev.cycle_count !== undefined ? dev.cycle_count : '0');
+            _set('rt-t1', (isConn || hasData) && dev.temp1 ? dev.temp1.toFixed(1) : '0.0');
+            _set('rt-t2', (isConn || hasData) && dev.temp2 ? dev.temp2.toFixed(1) : '0.0');
+            _set('rt-t4', (isConn || hasData) && dev.temp4 ? dev.temp4.toFixed(1) : '0.0');
+            _set('rt-t5', (isConn || hasData) && dev.temp5 ? dev.temp5.toFixed(1) : '0.0');
+            _set('rt-heatcurr', (isConn || hasData) && dev.heat_curr ? dev.heat_curr.toFixed(1) : '0.0');
+            _set('rt-heater', dev.heating_active ? 'ON' : 'OFF');
+            _set('rt-logs', dev.detail_logs_count || 0);
+            _set('rt-soh', (isConn || hasData) && dev.soh ? dev.soh : 100);
+            _set('rt-balancer', !isDevBalSw ? 'TẮT (OFF)' : (isDevBalAct ? 'BẬT (Đang cân)' : 'BẬT (Chờ cân)'));
+            _set('rt-bat-v-sum', (isConn || hasData) && dev.voltage !== undefined ? dev.voltage.toFixed(2) : '--');
+            _set('rt-bat-i-sum', (isConn || hasData) && dev.current !== undefined ? dev.current.toFixed(2) : '--');
+
+            let html = '';
+            if (cellsArr.length > 0) {
+                const rows = Math.ceil(cellCount / 3);
+                for (let r = 0; r < rows; r++) {
+                    for (let c = 0; c < 3; c++) {
+                        const i = r + c * rows;
+                        if (i < cellCount) {
+                            const num = i + 1;
+                            const v = (cellsArr[i] !== undefined) ? (typeof cellsArr[i] === 'number' ? cellsArr[i] : parseFloat(cellsArr[i])) : 0;
+                            const isMin = (num === minNum || (!minNum && num === foundMinNum));
+                            const isMax = (num === maxNum || (!maxNum && num === foundMaxNum));
+
+                            let cls = 'jk-val-txt';
+                            let balTag = '';
+                            if (isMin) {
+                                cls += ' min';
+                                if (dev.balance_active) balTag = '<span class="jk-bal-tag">⚖️</span>';
+                            } else if (isMax) {
+                                cls += ' max';
+                                if (dev.balance_active) balTag = '<span class="jk-bal-tag">⚖️</span>';
+                            }
+
+                            html += '<div class="jk-cell-item">' +
+                                        '<span class="jk-num-badge">' + num + '</span>' +
+                                        '<span class="' + cls + '">' + v.toFixed(3) + '</span>' +
+                                        balTag +
+                                    '</div>';
+                        } else {
+                            html += '<div class="jk-cell-item"></div>';
+                        }
+                    }
+                }
+            }
+            const cGridHome = _c('cells-grid-home');
+            if (cGridHome && html && cGridHome.innerHTML !== html) cGridHome.innerHTML = html;
+            const cGrid = _c('cells-grid-3');
+            if (cGrid && html && cGrid.innerHTML !== html) cGrid.innerHTML = html;
+
+            if (isBalancer) {
+                _set('card-mos-temp', '—');
+                _set('card-probes', '—');
+                _set('rt-mos', '—');
+                _set('rt-t1', '—');
+                _set('rt-t2', '—');
+                _set('rt-t4', '—');
+                _set('rt-t5', '—');
+            }
+
+            // Wire Resistance Grid (3 columns, column-major authentic JK style)
+            const wGrid = _c('wire-grid-3');
+            if (wGrid && cellResArr.length > 0) {
+                const rows = Math.ceil(cellCount / 3);
+                let wHtml = '';
+                for (let r = 0; r < rows; r++) {
+                    for (let c = 0; c < 3; c++) {
+                        const i = r + c * rows;
+                        if (i < cellCount) {
+                            const num = i + 1;
+                            const rVal = cellResArr[i] || 0;
+                            let rNum = (typeof rVal === 'number' ? rVal : parseFloat(rVal));
+                            if (rNum > 1.0) rNum = rNum / 1000.0;
+                            wHtml += '<div class="jk-cell-item">' +
+                                        '<span class="jk-num-badge">' + num + '</span>' +
+                                        '<span class="jk-val-txt">' + rNum.toFixed(3) + '</span>' +
+                                    '</div>';
+                        } else {
+                            wHtml += '<div class="jk-cell-item"></div>';
+                        }
+                    }
+                }
+                if (wGrid.innerHTML !== wHtml) wGrid.innerHTML = wHtml;
+            }
+
+            // Protection Grid (BMS only, hidden for Balancer)
+            const protGrid = _c('protection-grid');
+            const protTitle = protGrid ? protGrid.previousElementSibling : null;
+            if (isBalancer) {
+                if (protGrid) protGrid.style.display = 'none';
+                if (protTitle) protTitle.style.display = 'none';
+            } else if (protGrid) {
+                protGrid.style.display = 'grid';
+                if (protTitle) protTitle.style.display = 'block';
+                const errMask = dev.raw_errors_bitmask || 0;
+                let pHtml = '';
+                PROT_ITEMS.forEach(p => {
+                    const isAlarm = (errMask & (1 << p.bit)) !== 0;
+                    pHtml += '<div class="prot-item"><span class="prot-lbl">' + p.desc + '</span><span class="prot-badge ' + (isAlarm ? 'alarm' : 'ok') + '">' + (isAlarm ? '⚠️ Báo động' : '✔ Chuẩn') + '</span></div>';
+                });
+                if (protGrid.innerHTML !== pHtml) protGrid.innerHTML = pHtml;
+            }
+
+            // Settings tab info
+            _set('lbl-wifi-ssid', '📶 ' + (dev.ssid || 'Chưa kết nối'));
+            _set('lbl-wifi-ip', dev.local_ip || '—');
+            _set('lbl-wifi-rssi', dev.rssi ? (dev.rssi + ' dBm') : '—');
+            _set('lbl-ble-name', '🔋 ' + (isConn ? bmsName : 'Chưa kết nối BMS'));
+            _set('lbl-ble-mac', dev.active_bms_mac || '—');
+            _set('lbl-ble-status', isConn ? '● Đang kết nối' : '○ Chưa kết nối');
+
+            // If BLE scan result is available on dev
+            if (isScanning && dev.scanned_devices && Array.isArray(dev.scanned_devices) && dev.scanned_devices.length > 0) {
+                clearInterval(scanTimer);
+                isScanning = false;
+                const btnHome = document.getElementById('btn-home-ble-scan');
+                if (btnHome) { btnHome.disabled = false; btnHome.innerText = '🔍 Quét Bluetooth'; }
+                const statHome = document.getElementById('home-ble-status');
+                if (statHome) { statHome.style.display = 'block'; statHome.style.color = 'var(--green)'; statHome.innerText = '✅ Đã tìm thấy ' + dev.scanned_devices.length + ' thiết bị Bluetooth JK-BMS!'; }
+                renderScannedDevices(dev.scanned_devices);
+            }
+
+        } catch(e) {
+        } finally {
+            window._isRefreshing = false;
+        }
+    }
+
+    liveTimer = setInterval(refreshLiveData, 1000);
+    refreshLiveData();
+
+    function notifySessionEnd() {
+        try {
+            const endUrl = '/api/session-end?device_id=' + encodeURIComponent('${d.device_id}');
+            if (navigator.sendBeacon) {
+                navigator.sendBeacon(endUrl);
+            } else {
+                fetch(endUrl, { method: 'POST', keepalive: true }).catch(()=>{});
+            }
         } catch(e){}
-      }, 2000);
-    } catch(e) { updateScanStatus('❌ Lỗi kết nối máy chủ!', '#f85149'); }
-  }
+    }
 
-  async function connectBms(mac, name) {
-    if (!confirm('Kết nối ESP32 tới BMS '+name+' ('+mac+')?')) return;
-    const el = document.getElementById('scan-status');
-    if (el) { el.style.display='block'; el.style.color='#e3b341'; el.textContent='⏳ Đang gửi lệnh kết nối tới ESP32...'; }
-    try {
-      await fetch('/api/send-command', {
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({
-          device_id:'${d.device_id}',
-          cmd:[
-            {cmd:'connect_bms', mac:mac, name:name, pin:'1234'},
-            {cmd:'send_heartbeat_now'}
-          ]
-        })
-      });
-      if (el) { el.style.color='#3fb950'; el.textContent='✅ Đã gửi lệnh! ESP32 đang kết nối và đọc dữ liệu...'; }
-      setTimeout(() => {
-        showTab('status');
-        location.reload();
-      }, 3000);
-    } catch(e) { if (el) { el.style.color='#f85149'; el.textContent='❌ Lỗi gửi lệnh!'; } }
-  }
+    window.addEventListener('pagehide', notifySessionEnd);
+    window.addEventListener('beforeunload', notifySessionEnd);
 
-  setTimeout(() => location.reload(), 15000);
-</script>
+    document.addEventListener('visibilitychange', function() {
+        if (document.hidden) {
+            if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
+            notifySessionEnd();
+        } else {
+            refreshLiveData();
+            if (!liveTimer) liveTimer = setInterval(refreshLiveData, 1000);
+        }
+    });
+    </script>
 </body>
 </html>`;
 }
+
+
+function DEVICE_NOT_FOUND_HTML(deviceId) {
+  return `<!DOCTYPE html>
+<html lang="vi"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Không tìm thấy thiết bị</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+<style>*{margin:0;padding:0;box-sizing:border-box;}body{font-family:'Inter',sans-serif;background:#0d1117;color:#e6edf3;min-height:100vh;display:flex;align-items:center;justify-content:center;text-align:center;padding:20px;}
+.icon{font-size:4rem;margin-bottom:16px;}.h{font-size:1.3rem;font-weight:700;margin-bottom:8px;}.s{color:#8b949e;font-size:0.85rem;line-height:1.6;}.id{font-family:monospace;background:#161b22;padding:4px 10px;border-radius:6px;color:#f85149;}</style>
+</head><body><div><div class="icon">📡</div><div class="h">Không tìm thấy thiết bị</div>
+<div class="s">ID <span class="id">${deviceId}</span> chưa đăng ký hoặc chưa kết nối lần nào.<br>Kiểm tra lại thiết bị và đảm bảo đã kết nối WiFi.</div></div></body></html>`;
+}
+
+const WEB_FLASHER_HTML = `<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JK BMS Web Flasher - Nạp Firmware Qua Cáp USB</title>
+    <!-- ESP Web Tools Official Module -->
+    <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #0b0f17;
+            --surface: #151d28;
+            --surface-hover: #1e293b;
+            --border: #243247;
+            --cyan: #38bdf8;
+            --cyan-dim: rgba(56,189,248,0.12);
+            --green: #22c55e;
+            --green-dim: rgba(34,197,94,0.12);
+            --yellow: #f59e0b;
+            --yellow-dim: rgba(245,158,11,0.12);
+            --purple: #a855f7;
+            --purple-dim: rgba(168,85,247,0.12);
+            --text-main: #f8fafc;
+            --text-sub: #94a3b8;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', sans-serif; }
+        body { background: var(--bg); color: var(--text-main); min-height: 100vh; padding: 24px 16px; display: flex; flex-direction: column; align-items: center; }
+
+        .container { width: 100%; max-width: 860px; }
+
+        .header { text-align: center; margin-bottom: 28px; }
+        .logo-badge { display: inline-flex; align-items: center; gap: 8px; background: var(--cyan-dim); border: 1px solid rgba(56,189,248,0.3); color: var(--cyan); padding: 6px 16px; border-radius: 99px; font-size: 0.85rem; font-weight: 700; margin-bottom: 12px; }
+        .title { font-size: 2.1rem; font-weight: 800; letter-spacing: -0.5px; margin-bottom: 8px; background: linear-gradient(135deg, #fff 40%, var(--cyan) 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .subtitle { font-size: 0.95rem; color: var(--text-sub); line-height: 1.5; }
+
+        .warning-box { background: rgba(56,189,248,0.06); border: 1px solid var(--border); border-radius: 12px; padding: 14px 18px; margin-bottom: 24px; font-size: 0.85rem; color: #cbd5e1; display: flex; align-items: center; gap: 12px; }
+        .warning-icon { font-size: 1.5rem; flex-shrink: 0; }
+
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 18px; margin-bottom: 28px; }
+
+        .card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 22px; display: flex; flex-direction: column; justify-content: space-between; transition: 0.2s; position: relative; overflow: hidden; }
+        .card:hover { transform: translateY(-2px); border-color: rgba(56,189,248,0.4); box-shadow: 0 10px 25px -5px rgba(0,0,0,0.5); }
+
+        .card-header { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+        .card-icon { width: 44px; height: 44px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 1.4rem; flex-shrink: 0; }
+        .card-title { font-size: 1.1rem; font-weight: 700; color: #fff; line-height: 1.3; }
+        .card-ver { font-size: 0.78rem; font-weight: 700; padding: 2px 8px; border-radius: 6px; display: inline-block; margin-top: 4px; }
+
+        .card-desc { font-size: 0.84rem; color: var(--text-sub); line-height: 1.5; margin-bottom: 20px; flex-grow: 1; }
+        .card-features { list-style: none; margin-bottom: 18px; }
+        .card-features li { font-size: 0.78rem; color: #cbd5e1; margin-bottom: 5px; display: flex; align-items: center; gap: 6px; }
+        .card-features li::before { content: "✔"; color: var(--green); font-weight: bold; }
+
+        /* Color accents */
+        .card-ble .card-icon { background: var(--cyan-dim); border: 1px solid rgba(56,189,248,0.3); }
+        .card-ble .card-ver { background: var(--cyan-dim); color: var(--cyan); border: 1px solid rgba(56,189,248,0.3); }
+
+        .card-rs485 .card-icon { background: var(--yellow-dim); border: 1px solid rgba(245,158,11,0.3); }
+        .card-rs485 .card-ver { background: var(--yellow-dim); color: var(--yellow); border: 1px solid rgba(245,158,11,0.3); }
+
+        .card-bal .card-icon { background: var(--purple-dim); border: 1px solid rgba(168,85,247,0.3); }
+        .card-bal .card-ver { background: var(--purple-dim); color: var(--purple); border: 1px solid rgba(168,85,247,0.3); }
+
+        /* Custom Button for ESP Web Tools */
+        esp-web-install-button { width: 100%; display: block; }
+        .btn-install {
+            width: 100%;
+            padding: 13px 16px;
+            border-radius: 10px;
+            font-size: 0.95rem;
+            font-weight: 700;
+            border: none;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            transition: 0.2s;
+        }
+
+        .btn-ble { background: var(--cyan); color: #051923; }
+        .btn-ble:hover { background: #7dd3fc; }
+
+        .btn-rs485 { background: var(--yellow); color: #2e1065; }
+        .btn-rs485:hover { background: #fde047; }
+
+        .btn-bal { background: var(--purple); color: #fff; }
+        .btn-bal:hover { background: #c084fc; }
+
+        /* Steps guide */
+        .guide-box { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 22px; margin-bottom: 28px; }
+        .guide-title { font-size: 1.05rem; font-weight: 700; margin-bottom: 14px; color: var(--cyan); display: flex; align-items: center; gap: 8px; }
+        .steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }
+        .step-item { background: rgba(0,0,0,0.25); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
+        .step-num { width: 28px; height: 28px; border-radius: 99px; background: var(--cyan); color: #000; font-weight: 800; font-size: 0.85rem; display: flex; align-items: center; justify-content: center; margin-bottom: 8px; }
+        .step-txt { font-size: 0.82rem; color: #cbd5e1; line-height: 1.45; }
+
+        .footer { text-align: center; font-size: 0.8rem; color: var(--text-sub); border-top: 1px solid var(--border); padding-top: 20px; }
+        .not-supported { display: none; background: rgba(239,68,68,0.15); border: 1px solid #ef4444; color: #fca5a5; padding: 14px; border-radius: 10px; text-align: center; margin-bottom: 20px; font-weight: 600; font-size: 0.9rem; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="logo-badge">⚡ WEB SERIAL FLASHER</div>
+            <h1 class="title">Nạp Firmware ESP32 Qua Cáp USB</h1>
+            <p class="subtitle">Khách hàng chỉ cần cắm cáp USB vào máy tính và ấn nút nạp trực tiếp trên trình duyệt.<br>Hoàn toàn không cần cài đặt Python, PlatformIO hay driver phức tạp!</p>
+        </div>
+
+        <div id="unsupported-alert" class="not-supported">
+            ⚠️ Trình duyệt của bạn không hỗ trợ Web Serial API. Vui lòng mở trang web này bằng <strong>Google Chrome</strong>, <strong>Microsoft Edge</strong> hoặc <strong>Cốc Cốc</strong> trên máy tính!
+        </div>
+
+        <div class="warning-box">
+            <span class="warning-icon">💡</span>
+            <div>
+                <strong>Lưu ý quan trọng:</strong> Chọn đúng loại thiết bị của bạn bên dưới để nạp firmware chuẩn. Bản nạp là <strong>Full Factory Image (0x0)</strong> bao gồm Bootloader, Partition và Firmware mới nhất, khôi phục 100% chip về trạng thái xuất xưởng hoàn hảo.
+            </div>
+        </div>
+
+        <!-- 3 FIRMWARE CARDS -->
+        <div class="grid">
+            <!-- 1. BLUETOOTH BLE -->
+            <div class="card card-ble">
+                <div>
+                    <div class="card-header">
+                        <div class="card-icon">📡</div>
+                        <div>
+                            <div class="card-title">JK BMS Bluetooth</div>
+                            <span class="card-ver">Phiên bản v2.9.0-BLE</span>
+                        </div>
+                    </div>
+                    <p class="card-desc">Dành cho mạch ESP32 kết nối không dây với JK BMS qua Bluetooth BLE.</p>
+                    <ul class="card-features">
+                        <li>Hỗ trợ đổi Pack pin & xóa Pack linh hoạt</li>
+                        <li>Ngắt BMS an toàn khi nhận OTA từ xa</li>
+                        <li>Đọc cell điện áp, nhiệt độ, bảo vệ 24/7</li>
+                    </ul>
+                </div>
+                <div>
+                    <esp-web-install-button manifest="/manifest-ble.json">
+                        <button slot="activate" class="btn-install btn-ble">
+                            ⚡ Kết Nối & Nạp BLE
+                        </button>
+                    </esp-web-install-button>
+                </div>
+            </div>
+
+            <!-- 2. RS485 MODBUS -->
+            <div class="card card-rs485">
+                <div>
+                    <div class="card-header">
+                        <div class="card-icon">🔌</div>
+                        <div>
+                            <div class="card-title">JK BMS RS485</div>
+                            <span class="card-ver">Phiên bản v2.9.2-RS485</span>
+                        </div>
+                    </div>
+                    <p class="card-desc">Dành cho ESP32 kết nối có dây với JK BMS qua cổng RS485 Modbus RTU.</p>
+                    <ul class="card-features">
+                        <li>Giao tiếp có dây chống nhiễu cực tốt</li>
+                        <li>Hỗ trợ song song tới 16 Pack BMS</li>
+                        <li>Đã tắt Watchdog & dừng đọc khi nạp OTA</li>
+                    </ul>
+                </div>
+                <div>
+                    <esp-web-install-button manifest="/manifest-rs485.json">
+                        <button slot="activate" class="btn-install btn-rs485">
+                            ⚡ Kết Nối & Nạp RS485
+                        </button>
+                    </esp-web-install-button>
+                </div>
+            </div>
+
+            <!-- 3. BALANCER LCD -->
+            <div class="card card-bal">
+                <div>
+                    <div class="card-header">
+                        <div class="card-icon">⚖️</div>
+                        <div>
+                            <div class="card-title">JK Active Balancer</div>
+                            <span class="card-ver">Phiên bản v1.0.0-BALANCER</span>
+                        </div>
+                    </div>
+                    <p class="card-desc">Dành riêng cho Mạch Cân Bằng Chủ Động JK kết nối qua cổng LCD UART TTL.</p>
+                    <ul class="card-features">
+                        <li>Giao tiếp cổng màn hình LCD 115200</li>
+                        <li>Đọc và cài đặt dòng cân bằng 5A/10A/15A</li>
+                        <li>Bảo vệ chống nạp nhầm Firmware BMS</li>
+                    </ul>
+                </div>
+                <div>
+                    <esp-web-install-button manifest="/manifest-balancer.json">
+                        <button slot="activate" class="btn-install btn-bal">
+                            ⚡ Kết Nối & Nạp Balancer
+                        </button>
+                    </esp-web-install-button>
+                </div>
+            </div>
+        </div>
+
+        <!-- 4-STEP INSTRUCTIONS FOR CUSTOMERS -->
+        <div class="guide-box">
+            <div class="guide-title">
+                <span>📖</span> Hướng Dẫn 4 Bước Cho Khách Hàng
+            </div>
+            <div class="steps">
+                <div class="step-item">
+                    <div class="step-num">1</div>
+                    <div class="step-txt">Cắm cáp sạc/truyền dữ liệu Type-C từ ESP32 vào cổng USB máy tính.</div>
+                </div>
+                <div class="step-item">
+                    <div class="step-num">2</div>
+                    <div class="step-txt">Nhấn nút <strong>"Kết Nối & Nạp"</strong> tương ứng với loại mạch của bạn ở trên.</div>
+                </div>
+                <div class="step-item">
+                    <div class="step-num">3</div>
+                    <div class="step-txt">Trình duyệt hiện hộp thoại chọn cổng: Chọn cổng COM (VD: <em>USB Serial</em>) rồi bấm <strong>Connect</strong>.</div>
+                </div>
+                <div class="step-item">
+                    <div class="step-num">4</div>
+                    <div class="step-txt">Chờ nạp xong 100% trong 15-20 giây. ESP32 sẽ tự khởi động lại vào firmware mới sạch sẽ!</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="footer">
+            Hệ Thống Giám Sát JK BMS WiFi Monitor &bull; Server: bms.lha.io.vn &bull; Tương thích ESP32-C3 / ESP32-C6 / ESP32
+        </div>
+    </div>
+
+    <script>
+        if (!('serial' in navigator)) {
+            document.getElementById('unsupported-alert').style.display = 'block';
+        }
+    </script>
+</body>
+</html>
+`;
