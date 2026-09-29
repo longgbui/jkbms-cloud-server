@@ -11,3 +11,14 @@ users.json
 *.sqlite-shm
 *.sqlite-wal
 *result.txt
+*.py
+*.txt
+*_check.html
+new_live.html
+single_server.js
+assemble_server.js
+build_*.js
+fix_*.js
+inspect_*.js
+test_*.js
+search_*.js
