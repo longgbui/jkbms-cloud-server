@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Đăng Nhập & Quản Lý - JK BMS Cloud</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:#0b0f17;--surface:#151d28;--surface2:#1c2738;--border:#243247;
+    --cyan:#38bdf8;--cyan-dim:rgba(56,189,248,0.15);
+    --green:#22c55e;--green-dim:rgba(34,197,94,0.15);
+    --danger:#f85149;--danger-dim:rgba(248,81,73,0.15);
+    --text:#f8fafc;--subtext:#94a3b8;
+  }
+  *{margin:0;padding:0;box-sizing:border-box;font-family:'Inter',sans-serif;-webkit-tap-highlight-color:transparent;}
+  body{background:radial-gradient(circle at 50% 20%, #172438 0%, #0b0f17 80%);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px;}
+  .auth-card{width:100%;max-width:420px;background:rgba(21,29,40,0.85);backdrop-filter:blur(20px);border:1px solid rgba(56,189,248,0.25);border-radius:20px;padding:30px 24px;box-shadow:0 25px 50px -12px rgba(0,0,0,0.7);}
+  .brand{display:flex;align-items:center;justify-content:center;gap:10px;margin-bottom:6px;}
+  .logo-box{width:46px;height:46px;background:linear-gradient(135deg,#0284c7,#0369a1);border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:1.6rem;box-shadow:0 0 16px rgba(2,132,199,0.5);}
+  .brand-title{font-size:1.35rem;font-weight:800;letter-spacing:-0.5px;color:#fff;}
+  .brand-sub{font-size:0.78rem;color:var(--subtext);text-align:center;margin-bottom:22px;}
+  
+  .tabs{display:flex;background:var(--surface2);border-radius:10px;padding:4px;margin-bottom:20px;border:1px solid var(--border);}
+  .tab-btn{flex:1;padding:9px;border:none;border-radius:8px;background:transparent;color:var(--subtext);font-weight:700;font-size:0.85rem;cursor:pointer;transition:all 0.2s ease;}
+  .tab-btn.active{background:linear-gradient(135deg,#0284c7,#0369a1);color:#fff;box-shadow:0 2px 8px rgba(2,132,199,0.4);}
+  
+  .form-group{margin-bottom:14px;}
+  label{display:block;font-size:0.75rem;color:var(--subtext);margin-bottom:6px;font-weight:600;}
+  .input-wrap{position:relative;display:flex;align-items:center;}
+  input{width:100%;padding:12px 14px;background:#090d14;border:1px solid var(--border);border-radius:10px;color:#fff;font-size:0.95rem;outline:none;transition:border-color 0.2s;}
+  input:focus{border-color:var(--cyan);box-shadow:0 0 0 2px var(--cyan-dim);}
+  .input-wrap input{padding-right:42px;}
+  .btn-eye{position:absolute;right:10px;background:none;border:none;color:#94a3b8;font-size:1.1rem;cursor:pointer;padding:4px;user-select:none;transition:color 0.2s;}
+  .btn-eye:hover{color:#38bdf8;}
+  
+  .btn-submit{width:100%;padding:13px;background:linear-gradient(135deg,#0284c7,#0369a1);border:none;border-radius:10px;color:#fff;font-size:0.95rem;font-weight:700;cursor:pointer;transition:all 0.15s ease;margin-top:8px;}
+  .btn-submit:active{transform:scale(0.98);}
+  
+  .alert-box{padding:10px 14px;border-radius:8px;font-size:0.8rem;margin-bottom:14px;display:none;}
+  .alert-err{background:var(--danger-dim);border:1px solid rgba(248,81,73,0.3);color:var(--danger);}
+  .alert-ok{background:var(--green-dim);border:1px solid rgba(34,197,94,0.3);color:var(--green);}
+  
+  .footer-links{display:flex;justify-content:center;margin-top:20px;padding-top:14px;border-top:1px solid var(--border);font-size:0.75rem;}
+  .footer-links a{color:var(--subtext);text-decoration:none;transition:color 0.2s;}
+  .footer-links a:hover{color:var(--cyan);}
+</style>
+</head>
+<body>
+<div class="auth-card">
+  <div class="brand">
+    <div class="logo-box">⚡</div>
+    <div class="brand-title">JK BMS Cloud</div>
+  </div>
+  <div class="brand-sub">Hệ Thống Giám Sát & Điều Khiển Pin Thông Minh</div>
+
+  <div class="tabs">
+    <button class="tab-btn active" id="tab-login" onclick="switchTab('login')">Đăng Nhập</button>
+    <button class="tab-btn" id="tab-register" onclick="switchTab('register')">Đăng Ký Khách Hàng</button>
+  </div>
+
+  <div id="msg-box" class="alert-box"></div>
+
+  <!-- FORM LOGIN -->
+  <form id="form-login" onsubmit="handleLogin(event)">
+    <div class="form-group">
+      <label>Tên Đăng Nhập / Số Điện Thoại</label>
+      <input type="text" id="login-username" placeholder="Nhập tên tài khoản..." required autofocus autocomplete="username">
+    </div>
+    <div class="form-group">
+      <label>Mật Khẩu</label>
+      <div class="input-wrap">
+        <input type="password" id="login-password" placeholder="Nhập mật khẩu..." required autocomplete="current-password">
+        <button type="button" class="btn-eye" onclick="togglePass('login-password', this)" title="Ẩn/hiện mật khẩu">👁️</button>
+      </div>
+    </div>
+    <button type="submit" class="btn-submit" id="btn-login-submit">Đăng Nhập Ngay</button>
+    <div style="font-size:0.72rem;color:var(--subtext);text-align:center;margin-top:12px;">
+      🛡️ Tài khoản Quản Trị Viên (Admin) đăng nhập tại đây sẽ tự động mở trang Admin.
+    </div>
+  </form>
+
+  <!-- FORM REGISTER -->
+  <form id="form-register" style="display:none;" onsubmit="handleRegister(event)">
+    <div class="form-group">
+      <label>Tên Đăng Nhập (3-30 ký tự, viết liền không dấu)</label>
+      <input type="text" id="reg-username" placeholder="Ví dụ: nguyenvana" required autocomplete="username">
+    </div>
+    <div class="form-group">
+      <label>Họ và Tên (Tùy chọn)</label>
+      <input type="text" id="reg-fullname" placeholder="Ví dụ: Nguyễn Văn A">
+    </div>
+    <div class="form-group">
+      <label>Số Điện Thoại (Tùy chọn, để hỗ trợ kỹ thuật)</label>
+      <input type="tel" id="reg-phone" placeholder="Ví dụ: 0912345678">
+    </div>
+    <div class="form-group">
+      <label>Mật Khẩu (Tối thiểu 6 ký tự)</label>
+      <div class="input-wrap">
+        <input type="password" id="reg-password" placeholder="Tạo mật khẩu an toàn..." required autocomplete="new-password">
+        <button type="button" class="btn-eye" onclick="togglePass('reg-password', this)" title="Ẩn/hiện mật khẩu">👁️</button>
+      </div>
+    </div>
+    <div class="form-group">
+      <label>Nhập Lại Mật Khẩu</label>
+      <div class="input-wrap">
+        <input type="password" id="reg-confirm" placeholder="Xác nhận lại mật khẩu..." required autocomplete="new-password">
+        <button type="button" class="btn-eye" onclick="togglePass('reg-confirm', this)" title="Ẩn/hiện mật khẩu">👁️</button>
+      </div>
+    </div>
+    <button type="submit" class="btn-submit" id="btn-reg-submit" style="background:linear-gradient(135deg,#10b981,#059669);">Tạo Tài Khoản Mới</button>
+  </form>
+
+  <div class="footer-links">
+    <a href="javascript:void(0)" onclick="alert('Quý khách vui lòng liên hệ Admin / Kỹ thuật viên (Hotline/Zalo) để được hỗ trợ đặt lại mật khẩu.')">❓ Quên mật khẩu hoặc cần hỗ trợ?</a>
+  </div>
+</div>
+
+<script>
+  function togglePass(id, btn) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (el.type === 'password') {
+      el.type = 'text';
+      btn.textContent = '🙈';
+      btn.style.color = '#38bdf8';
+    } else {
+      el.type = 'password';
+      btn.textContent = '👁️';
+      btn.style.color = '#94a3b8';
+    }
+  }
+
+  function switchTab(mode) {
+    const isLogin = (mode === 'login');
+    document.getElementById('tab-login').className = 'tab-btn ' + (isLogin ? 'active' : '');
+    document.getElementById('tab-register').className = 'tab-btn ' + (!isLogin ? 'active' : '');
+    document.getElementById('form-login').style.display = isLogin ? 'block' : 'none';
+    document.getElementById('form-register').style.display = !isLogin ? 'block' : 'none';
+    hideMsg();
+  }
+
+  function showMsg(text, isErr) {
+    const box = document.getElementById('msg-box');
+    box.className = 'alert-box ' + (isErr ? 'alert-err' : 'alert-ok');
+    box.textContent = (isErr ? '⚠️ ' : '✅ ') + text;
+    box.style.display = 'block';
+  }
+
+  function hideMsg() {
+    document.getElementById('msg-box').style.display = 'none';
+  }
+
+  async function handleLogin(e) {
+    e.preventDefault();
+    hideMsg();
+    const btn = document.getElementById('btn-login-submit');
+    const u = document.getElementById('login-username').value.trim();
+    const p = document.getElementById('login-password').value;
+
+    btn.disabled = true;
+    btn.textContent = 'Đang kiểm tra...';
+
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: u, password: p })
+      });
+      const data = await res.json();
+      if (res.ok && data.status === 'ok') {
+        showMsg('Đăng nhập thành công! Đang chuyển hướng...', false);
+        setTimeout(() => {
+          window.location.href = data.redirect || '/my-devices';
+        }, 400);
+      } else {
+        showMsg(data.error || 'Tài khoản hoặc mật khẩu không chính xác', true);
+        btn.disabled = false;
+        btn.textContent = 'Đăng Nhập Ngay';
+      }
+    } catch(err) {
+      showMsg('Lỗi kết nối máy chủ!', true);
+      btn.disabled = false;
+      btn.textContent = 'Đăng Nhập Ngay';
+    }
+  }
+
+  async function handleRegister(e) {
+    e.preventDefault();
+    hideMsg();
+    const btn = document.getElementById('btn-reg-submit');
+    const u = document.getElementById('reg-username').value.trim();
+    const fn = document.getElementById('reg-fullname').value.trim();
+    const phone = document.getElementById('reg-phone').value.trim();
+    const p = document.getElementById('reg-password').value;
+    const c = document.getElementById('reg-confirm').value;
+
+    if (p !== c) {
+      showMsg('Mật khẩu nhập lại không khớp!', true);
+      return;
+    }
+    if (p.length < 6) {
+      showMsg('Mật khẩu phải có tối thiểu 6 ký tự!', true);
+      return;
+    }
+
+    btn.disabled = true;
+    btn.textContent = 'Đang tạo tài khoản...';
+
+    try {
+      const res = await fetch('/api/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: u, fullname: fn, phone: phone, password: p })
+      });
+      const data = await res.json();
+      if (res.ok && data.status === 'ok') {
+        showMsg('Tạo tài khoản thành công! Đang vào hệ thống...', false);
+        setTimeout(() => {
+          window.location.href = data.redirect || '/my-devices';
+        }, 500);
+      } else {
+        showMsg(data.error || 'Không thể tạo tài khoản', true);
+        btn.disabled = false;
+        btn.textContent = 'Tạo Tài Khoản Mới';
+      }
+    } catch(err) {
+      showMsg('Lỗi kết nối máy chủ!', true);
+      btn.disabled = false;
+      btn.textContent = 'Tạo Tài Khoản Mới';
+    }
+  }
+</script>
+</body>
+</html>

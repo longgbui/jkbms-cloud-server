@@ -1,6 +1,13 @@
 name = "jkbms-cloud"
 main = "worker.js"
 compatibility_date = "2024-01-01"
+workers_dev = true
+
+# Route bms.lha.io.vn đã được chuyển sang Cloudflare Tunnel → TV Box (192.168.31.10:3001)
+# Tunnel ID: 97f250c4-5b2e-4883-a0db-90481d1ab6ee → ingress: bms.lha.io.vn → http://localhost:3001
+# routes = [
+#   { pattern = "bms.lha.io.vn/*", zone_name = "lha.io.vn" }
+# ]
 
 [[kv_namespaces]]
 binding = "DEVICES"

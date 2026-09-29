@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Bộ Pin Của Tôi - JK BMS Cloud</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:#0b0f17;--surface:#151d28;--surface2:#1c2738;--border:#243247;
+    --cyan:#38bdf8;--cyan-dim:rgba(56,189,248,0.15);
+    --green:#22c55e;--green-dim:rgba(34,197,94,0.15);
+    --warning:#e3b341;--danger:#f85149;--danger-dim:rgba(248,81,73,0.15);
+    --text:#f8fafc;--subtext:#94a3b8;
+  }
+  *{margin:0;padding:0;box-sizing:border-box;font-family:'Inter',sans-serif;-webkit-tap-highlight-color:transparent;}
+  body{background:radial-gradient(circle at 50% 10%, #152236 0%, #0b0f17 70%);color:var(--text);min-height:100vh;padding-bottom:50px;}
+  
+  .navbar{display:flex;justify-content:space-between;align-items:center;padding:14px 20px;background:rgba(21,29,40,0.85);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100;}
+  .brand{display:flex;align-items:center;gap:10px;}
+  .logo-box{width:38px;height:38px;background:linear-gradient(135deg,#0284c7,#0369a1);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:1.3rem;box-shadow:0 0 12px rgba(2,132,199,0.5);}
+  .brand-title{font-size:1.15rem;font-weight:800;letter-spacing:-0.5px;}
+  
+  .nav-right{display:flex;align-items:center;gap:10px;}
+  .user-badge{background:var(--surface2);border:1px solid var(--border);padding:6px 12px;border-radius:20px;font-size:0.8rem;color:#cbd5e1;display:flex;align-items:center;gap:6px;}
+  .btn-add{background:linear-gradient(135deg,#0284c7,#0369a1);color:#fff;border:none;padding:8px 16px;border-radius:10px;font-size:0.82rem;font-weight:700;cursor:pointer;display:flex;align-items:center;gap:6px;box-shadow:0 2px 8px rgba(2,132,199,0.3);}
+  .btn-logout{background:transparent;border:1px solid var(--border);color:var(--subtext);padding:8px 12px;border-radius:10px;font-size:0.8rem;cursor:pointer;}
+  
+  .container{max-width:1100px;margin:24px auto;padding:0 16px;}
+  
+  .stats-bar{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:24px;}
+  .stat-card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:14px 18px;display:flex;flex-direction:column;gap:4px;}
+  .stat-val{font-size:1.6rem;font-weight:800;}
+  .stat-lbl{font-size:0.75rem;color:var(--subtext);text-transform:uppercase;letter-spacing:0.5px;}
+  
+  .devices-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:18px;}
+  .device-card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:18px;display:flex;flex-direction:column;gap:14px;box-shadow:0 10px 25px -5px rgba(0,0,0,0.5);transition:transform 0.15s ease, border-color 0.15s ease;}
+  .device-card:hover{transform:translateY(-2px);border-color:rgba(56,189,248,0.4);}
+  
+  .card-top{display:flex;justify-content:space-between;align-items:flex-start;}
+  .dev-name{font-size:1.1rem;font-weight:700;color:#fff;}
+  .dev-id-tag{font-size:0.75rem;color:var(--subtext);font-family:monospace;margin-top:2px;}
+  .badge-status{font-size:0.72rem;font-weight:700;padding:4px 10px;border-radius:20px;}
+  .badge-online{background:var(--green-dim);color:var(--green);border:1px solid rgba(34,197,94,0.3);}
+  .badge-offline{background:var(--danger-dim);color:var(--danger);border:1px solid rgba(248,81,73,0.3);}
+  
+  .metrics-row{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;background:var(--surface2);border-radius:12px;padding:12px 10px;text-align:center;}
+  .metric-item div:first-child{font-size:1.15rem;font-weight:800;}
+  .metric-item div:last-child{font-size:0.68rem;color:var(--subtext);margin-top:2px;}
+  
+  .switches-row{display:flex;gap:8px;justify-content:space-between;font-size:0.75rem;}
+  .sw-badge{padding:3px 8px;border-radius:6px;font-weight:700;font-size:0.7rem;}
+  .sw-on{background:var(--green-dim);color:var(--green);}
+  .sw-off{background:var(--surface2);color:var(--subtext);}
+  
+  .card-actions{display:flex;gap:8px;margin-top:auto;}
+  .btn-open-dev{flex:1;background:linear-gradient(135deg,#0284c7,#0369a1);color:#fff;border:none;padding:10px;border-radius:10px;font-size:0.85rem;font-weight:700;text-decoration:none;text-align:center;transition:opacity 0.2s;}
+  .btn-open-dev:hover{opacity:0.9;}
+  .btn-unlink{background:transparent;border:1px solid var(--border);color:var(--danger);padding:10px 14px;border-radius:10px;cursor:pointer;font-size:0.85rem;}
+  
+  .empty-state{grid-column:1/-1;background:var(--surface);border:1px dashed var(--border);border-radius:20px;padding:50px 20px;text-align:center;}
+  .empty-icon{font-size:3rem;margin-bottom:12px;opacity:0.6;}
+  
+  /* MODAL */
+  .modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.8);backdrop-filter:blur(8px);z-index:200;align-items:center;justify-content:center;padding:16px;}
+  .modal-box{background:var(--surface);border:1px solid var(--border);border-radius:18px;max-width:460px;width:100%;padding:24px;box-shadow:0 25px 50px rgba(0,0,0,0.8);}
+  .modal-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;}
+  .modal-title{font-size:1.15rem;font-weight:800;}
+  .btn-close-modal{background:none;border:none;color:var(--subtext);font-size:1.5rem;cursor:pointer;}
+  .modal-tabs{display:flex;gap:8px;background:var(--surface2);padding:4px;border-radius:10px;margin-bottom:16px;}
+  .modal-tab-btn{flex:1;padding:8px;border:none;border-radius:6px;background:transparent;color:var(--subtext);font-size:0.8rem;font-weight:700;cursor:pointer;}
+  .modal-tab-btn.active{background:var(--cyan-dim);color:var(--cyan);border:1px solid rgba(56,189,248,0.3);}
+  
+  .form-group{margin-bottom:14px;}
+  label{display:block;font-size:0.75rem;color:var(--subtext);margin-bottom:6px;font-weight:600;}
+  .input-wrap{position:relative;display:flex;align-items:center;}
+  input{width:100%;padding:10px 12px;background:#090d14;border:1px solid var(--border);border-radius:8px;color:#fff;font-size:0.9rem;outline:none;}
+  input:focus{border-color:var(--cyan);}
+  .input-wrap input{padding-right:42px;}
+  .btn-eye{position:absolute;right:10px;background:none;border:none;color:#94a3b8;font-size:1.1rem;cursor:pointer;padding:4px;user-select:none;}
+  .btn-submit-modal{width:100%;padding:11px;background:linear-gradient(135deg,#0284c7,#0369a1);border:none;border-radius:8px;color:#fff;font-weight:700;cursor:pointer;margin-top:6px;}
+</style>
+</head>
+<body>
+<div class="navbar">
+  <div class="brand">
+    <div class="logo-box">⚡</div>
+    <div>
+      <div class="brand-title">JK BMS Cloud</div>
+      <div style="font-size:0.7rem;color:var(--subtext);">Cổng Khách Hàng</div>
+    </div>
+  </div>
+  <div class="nav-right">
+    <div class="user-badge">
+      <span>👤</span>
+      <span id="user-display-name">Khách Hàng</span>
+    </div>
+    <button onclick="openAddModal()" class="btn-add">➕ Thêm Bộ Pin</button>
+    <button onclick="logoutUser()" class="btn-logout" title="Đăng Xuất">🚪</button>
+  </div>
+</div>
+
+<div class="container">
+  <div class="stats-bar">
+    <div class="stat-card">
+      <div class="stat-val" id="stat-total" style="color:var(--cyan);">--</div>
+      <div class="stat-lbl">Tổng Số Bộ Pin</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-val" id="stat-online" style="color:var(--green);">--</div>
+      <div class="stat-lbl">Đang Hoạt Động</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-val" id="stat-offline" style="color:var(--subtext);">--</div>
+      <div class="stat-lbl">Ngoại Tuyến</div>
+    </div>
+  </div>
+
+  <div class="devices-grid" id="my-devices-grid">
+    <div class="empty-state">
+      <div class="empty-icon">⏳</div>
+      <h3 style="font-size:1.1rem;margin-bottom:6px;">Đang tải danh sách thiết bị...</h3>
+      <p style="font-size:0.8rem;color:var(--subtext);">Vui lòng chờ trong giây lát.</p>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL THÊM BỘ PIN -->
+<div class="modal-overlay" id="add-modal">
+  <div class="modal-box">
+    <div class="modal-header">
+      <div class="modal-title">➕ Liên Kết Bộ Pin Mới</div>
+      <button class="btn-close-modal" onclick="closeAddModal()">&times;</button>
+    </div>
+    <div class="modal-tabs">
+      <button class="modal-tab-btn active" id="mtab-auto" onclick="switchModalTab('auto')">⚡ Tự Động (Quét Token)</button>
+      <button class="modal-tab-btn" id="mtab-manual" onclick="switchModalTab('manual')">⌨️ Thủ Công (Nhập ID)</button>
+    </div>
+
+    <!-- TAB AUTO BIND TOKEN -->
+    <div id="mcontent-auto">
+      <div style="font-size:0.82rem;color:var(--subtext);line-height:1.5;margin-bottom:14px;">
+        Truy cập trang cấu hình WiFi của mạch ESP32, nhập mã Token bên dưới vào ô <strong>"Account Token"</strong> để hệ thống tự động nhận diện thiết bị của bạn:
+      </div>
+      <div style="background:var(--surface2);border:1px dashed var(--cyan);border-radius:10px;padding:12px;text-align:center;margin-bottom:14px;">
+        <div style="font-size:0.75rem;color:var(--subtext);margin-bottom:4px;">MÃ LIÊN KẾT NHANH (TOKEN):</div>
+        <div id="my-bind-token" style="font-family:monospace;font-size:1.25rem;font-weight:800;color:var(--cyan);letter-spacing:1px;word-break:break-all;">Đang tạo...</div>
+      </div>
+      <button onclick="copyBindToken()" class="btn-submit-modal" style="background:var(--surface2);border:1px solid var(--border);">📋 Sao Chép Mã Token</button>
+    </div>
+
+    <!-- TAB MANUAL BIND -->
+    <div id="mcontent-manual" style="display:none;">
+      <form onsubmit="handleManualLink(event)">
+        <div class="form-group">
+          <label>Mã Device ID (Ví dụ: JKBMS-ACCA hoặc JKBMS-C4CA)</label>
+          <input type="text" id="manual-dev-id" placeholder="Nhập Device ID..." required style="font-family:monospace;text-transform:uppercase;">
+        </div>
+        <div class="form-group">
+          <label>Đặt Tên Gợi Nhớ (Ví dụ: Pin Năng Lượng Mặt Trời Tầng 2)</label>
+          <input type="text" id="manual-dev-name" placeholder="Tên gợi nhớ cho bộ pin...">
+        </div>
+        <div class="form-group">
+          <label>Mã PIN BMS (Nếu có đặt mã bảo vệ PIN)</label>
+          <div class="input-wrap">
+            <input type="password" id="manual-dev-pin" placeholder="Mã PIN 4 số (để trống nếu mặc định 1234)">
+            <button type="button" class="btn-eye" onclick="togglePass('manual-dev-pin', this)" title="Ẩn/hiện mã PIN">👁️</button>
+          </div>
+        </div>
+        <button type="submit" class="btn-submit-modal" id="btn-manual-submit">Xác Nhận Thêm Thiết Bị</button>
+      </form>
+    </div>
+  </div>
+</div>
+
+<script>
+  function togglePass(id, btn) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (el.type === 'password') {
+      el.type = 'text';
+      btn.textContent = '🙈';
+      btn.style.color = '#38bdf8';
+    } else {
+      el.type = 'password';
+      btn.textContent = '👁️';
+      btn.style.color = '#94a3b8';
+    }
+  }
+
+  let currentBindToken = '';
+
+  function openAddModal() {
+    document.getElementById('add-modal').style.display = 'flex';
+    createBindToken();
+  }
+  function closeAddModal() {
+    document.getElementById('add-modal').style.display = 'none';
+  }
+
+  function switchModalTab(tab) {
+    const isAuto = (tab === 'auto');
+    document.getElementById('mtab-auto').className = 'modal-tab-btn ' + (isAuto ? 'active' : '');
+    document.getElementById('mtab-manual').className = 'modal-tab-btn ' + (!isAuto ? 'active' : '');
+    document.getElementById('mcontent-auto').style.display = isAuto ? 'block' : 'none';
+    document.getElementById('mcontent-manual').style.display = !isAuto ? 'block' : 'none';
+  }
+
+  async function createBindToken() {
+    try {
+      const res = await fetch('/api/user/create-bind-token', { method: 'POST' });
+      const data = await res.json();
+      if (data.status === 'ok') {
+        currentBindToken = data.token;
+        document.getElementById('my-bind-token').textContent = data.token;
+      }
+    } catch(e) {}
+  }
+
+  function copyBindToken() {
+    if (!currentBindToken) return;
+    navigator.clipboard.writeText(currentBindToken).then(() => {
+      alert('✅ Đã sao chép mã Token: ' + currentBindToken);
+    });
+  }
+
+  async function handleManualLink(e) {
+    e.preventDefault();
+    const btn = document.getElementById('btn-manual-submit');
+    const did = document.getElementById('manual-dev-id').value.trim().toUpperCase();
+    const name = document.getElementById('manual-dev-name').value.trim();
+    const pin = document.getElementById('manual-dev-pin').value.trim();
+
+    btn.disabled = true;
+    btn.textContent = 'Đang liên kết...';
+
+    try {
+      const res = await fetch('/api/user/link-device', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ device_id: did, custom_name: name, pin: pin })
+      });
+      const data = await res.json();
+      if (res.ok && data.status === 'ok') {
+        alert('🎉 ' + data.message);
+        closeAddModal();
+        
+  // Load thông tin người dùng
+  async function loadUserInfo() {
+    try {
+      const res = await fetch('/api/auth/me');
+      const data = await res.json();
+      if (data && data.authenticated && data.user) {
+        const el = document.getElementById('user-display-name');
+        if (el) el.textContent = data.user.fullname || data.user.username;
+      }
+    } catch(e) {}
+  }
+  loadUserInfo();
+
+  fetchMyDevices();
+      } else {
+        alert('⚠️ ' + (data.error || 'Không thể liên kết thiết bị'));
+      }
+    } catch(err) {
+      alert('⚠️ Lỗi kết nối!');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Xác Nhận Thêm Thiết Bị';
+    }
+  }
+
+  async function unlinkDevice(did) {
+    if (!confirm('Bạn có chắc chắn muốn hủy liên kết bộ pin ' + did + ' khỏi tài khoản?')) return;
+    try {
+      const res = await fetch('/api/user/unlink-device', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ device_id: did })
+      });
+      const data = await res.json();
+      if (data.status === 'ok') {
+        fetchMyDevices();
+      } else {
+        alert(data.error || 'Lỗi khi hủy liên kết');
+      }
+    } catch(e) {
+      alert('Lỗi kết nối!');
+    }
+  }
+
+  async function logoutUser() {
+    if (!confirm('Bạn có muốn đăng xuất khỏi tài khoản?')) return;
+    try {
+      await fetch('/api/auth/logout', { method: 'POST' });
+    } catch(e) {}
+    window.location.href = '/login';
+  }
+
+  async function fetchMyDevices() {
+    const grid = document.getElementById('my-devices-grid');
+    try {
+      const res = await fetch('/api/user/devices');
+      if (!res.ok) {
+        if (res.status === 401) window.location.href = '/login';
+        return;
+      }
+      const list = await res.json();
+
+      let onlineCnt = 0;
+      let offlineCnt = 0;
+      for (const d of list) {
+        if (d.online) onlineCnt++;
+        else offlineCnt++;
+      }
+      document.getElementById('stat-total').textContent = list.length;
+      document.getElementById('stat-online').textContent = onlineCnt;
+      document.getElementById('stat-offline').textContent = offlineCnt;
+
+      if (!list || list.length === 0) {
+        grid.innerHTML = `
+          <div class="empty-state">
+            <div class="empty-icon">📡</div>
+            <h3 style="font-size:1.15rem;margin-bottom:8px;">Chưa Có Thiết Bị Nào</h3>
+            <p style="font-size:0.85rem;color:var(--subtext);max-width:400px;margin:0 auto 18px;">
+              Bạn chưa liên kết bộ pin hoặc mạch cân bằng nào vào tài khoản này.
+            </p>
+            <button onclick="openAddModal()" class="btn-add" style="margin:0 auto;">➕ Thêm Thiết Bị Ngay</button>
+          </div>
+        `;
+        return;
+      }
+
+      let html = '';
+      for (const d of list) {
+        const v = (d.voltage || 0).toFixed(1);
+        const soc = (d.soc !== undefined && d.soc !== null) ? d.soc : '--';
+        const t = (d.mos_temp !== undefined && d.mos_temp !== null) ? (d.mos_temp).toFixed(1) : '--';
+        const titleName = d.custom_name || d.device_id;
+        const subId = d.device_id;
+        const isOnline = d.online;
+        const statusTxt = isOnline ? '🟢 Hoạt động' : '🔴 Ngoại tuyến';
+        const badgeCls = isOnline ? 'badge-online' : 'badge-offline';
+
+        const chgOn = d.charge_mos || d.chargeMosOn;
+        const dsgOn = d.discharge_mos || d.dischargeMosOn;
+        const balOn = d.balance || d.balanceActive;
+
+        html += `
+          <div class="device-card">
+            <div class="card-top">
+              <div>
+                <div class="dev-name">${titleName}</div>
+                <div class="dev-id-tag">Mã ID: ${subId}</div>
+              </div>
+              <div class="badge-status ${badgeCls}">${statusTxt}</div>
+            </div>
+
+            <div class="metrics-row">
+              <div class="metric-item">
+                <div style="color:var(--cyan);">${v} V</div>
+                <div>Điện Áp</div>
+              </div>
+              <div class="metric-item">
+                <div style="color:var(--green);">${soc} %</div>
+                <div>SoC Pin</div>
+              </div>
+              <div class="metric-item">
+                <div style="color:var(--warning);">${t} °C</div>
+                <div>Nhiệt Độ MOS</div>
+              </div>
+            </div>
+
+            <div class="switches-row">
+              <div>Sạc: <span class="sw-badge ${chgOn ? 'sw-on' : 'sw-off'}">${chgOn ? 'BẬT' : 'TẮT'}</span></div>
+              <div>Xả: <span class="sw-badge ${dsgOn ? 'sw-on' : 'sw-off'}">${dsgOn ? 'BẬT' : 'TẮT'}</span></div>
+              <div>Cân Bằng: <span class="sw-badge ${balOn ? 'sw-on' : 'sw-off'}">${balOn ? 'BẬT' : 'TẮT'}</span></div>
+            </div>
+
+            <div class="card-actions">
+              <a href="/d/${d.device_id}" class="btn-open-dev">🚀 Vào Điều Khiển & Cài Đặt</a>
+              <button onclick="unlinkDevice('${d.device_id}')" class="btn-unlink" title="Hủy liên kết">🗑️</button>
+            </div>
+          </div>
+        `;
+      }
+      grid.innerHTML = html;
+    } catch(e) {
+      console.warn('Error fetching devices:', e);
+    }
+  }
+
+  fetchMyDevices();
+  setInterval(fetchMyDevices, 4000);
+</script>
+</body>
+</html>
