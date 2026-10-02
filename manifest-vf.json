@@ -1,0 +1,13 @@
+{
+  "name": "Mạch Xóa Lỗi Pin VinFast (ESP32 CYD)",
+  "version": "v1.3.0-VF-PIN",
+  "new_install_prompt_erase": false,
+  "builds": [
+    {
+      "chipFamily": "ESP32",
+      "parts": [
+        { "path": "/firmware/factory_vf.bin", "offset": 0 }
+      ]
+    }
+  ]
+}
