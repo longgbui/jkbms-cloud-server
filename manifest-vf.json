@@ -1,13 +1,20 @@
 {
   "name": "Mạch Xóa Lỗi Pin VinFast (ESP32 CYD)",
-  "version": "v1.3.0-VF-PIN",
+  "version": "v1.3.8-VF-PIN",
   "new_install_prompt_erase": false,
   "builds": [
     {
       "chipFamily": "ESP32",
       "parts": [
-        { "path": "/firmware/factory_vf.bin", "offset": 0 }
+        {
+          "path": "/firmware/factory_vf.bin",
+          "offset": 0
+        }
       ]
     }
-  ]
+  ],
+  "md5": "872d1ab59ffa52c40a36e177060c888d",
+  "size": 1556800,
+  "release_date": "2026-10-04",
+  "change_log": "Hien thi thoi gian hoat dong On-Time thuc te tu BMS JK"
 }

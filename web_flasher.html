@@ -135,7 +135,7 @@
                         <div class="card-icon">📡</div>
                         <div>
                             <div class="card-title">JK BMS Bluetooth</div>
-                            <span class="card-ver">Phiên bản v2.9.9-BLE</span>
+                            <span class="card-ver" id="ver-ble">Phiên bản v2.9.9-BLE</span>
                         </div>
                     </div>
                     <p class="card-desc">Dành cho mạch ESP32 kết nối không dây với JK BMS qua Bluetooth BLE.</p>
@@ -161,7 +161,7 @@
                         <div class="card-icon">🔌</div>
                         <div>
                             <div class="card-title">JK BMS RS485</div>
-                            <span class="card-ver">Phiên bản v2.9.8-RS485</span>
+                            <span class="card-ver" id="ver-rs485">Phiên bản v2.9.8-RS485</span>
                         </div>
                     </div>
                     <p class="card-desc">Dành cho ESP32 kết nối có dây với JK BMS qua cổng RS485 Modbus RTU.</p>
@@ -187,7 +187,7 @@
                         <div class="card-icon">⚖️</div>
                         <div>
                             <div class="card-title">JK Active Balancer</div>
-                            <span class="card-ver">Phiên bản v1.0.4-BALANCER</span>
+                            <span class="card-ver" id="ver-bal">Phiên bản v1.0.4-BALANCER</span>
                         </div>
                     </div>
                     <p class="card-desc">Dành riêng cho Mạch Cân Bằng Chủ Động JK kết nối qua cổng LCD UART TTL.</p>
@@ -213,7 +213,7 @@
                         <div class="card-icon">🔧</div>
                         <div>
                             <div class="card-title">Xóa Lỗi Pin VinFast</div>
-                            <span class="card-ver">v1.3.0-VF-PIN</span>
+                            <span class="card-ver" id="ver-vf">Phiên bản v1.3.5-VF-PIN</span>
                         </div>
                     </div>
                     <p class="card-desc">Dành cho mạch ESP32 CYD (màn hình cảm ứng 2.8") xóa lỗi BMS pin VinFast qua giao tiếp BLE & CAN Bus.</p>
@@ -267,7 +267,29 @@
         if (!('serial' in navigator)) {
             document.getElementById('unsupported-alert').style.display = 'block';
         }
+
+        // Tự động đọc phiên bản mới nhất trực tiếp từ manifest của server
+        async function loadLiveVersions() {
+            const targets = [
+                { id: 'ver-ble', url: '/manifest-ble.json', prefix: 'Phiên bản ' },
+                { id: 'ver-rs485', url: '/manifest-rs485.json', prefix: 'Phiên bản ' },
+                { id: 'ver-bal', url: '/manifest-balancer.json', prefix: 'Phiên bản ' },
+                { id: 'ver-vf', url: '/manifest-vf.json', prefix: 'Phiên bản ' }
+            ];
+            for (const t of targets) {
+                try {
+                    const r = await fetch(t.url + '?t=' + Date.now());
+                    if (r.ok) {
+                        const data = await r.json();
+                        if (data && data.version) {
+                            const el = document.getElementById(t.id);
+                            if (el) el.textContent = t.prefix + data.version;
+                        }
+                    }
+                } catch (e) {}
+            }
+        }
+        loadLiveVersions();
     </script>
-<script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/v31edd6df95cf4e85bb4c19e7a9bdbcba1788362987495" integrity="sha512-iIg7k2xntmwu6/uSb5tpc/hySgZc4eoL31yB29W6tJFo2akwjPWcEqnCEdJvGexCL0KEQwVYv5BlowfhVz26hg==" data-cf-beacon='{"version":"2024.11.0","token":"693f5e0e08794b5b89d5eace43eafda7","r":1,"spa":2}' crossorigin="anonymous"></script>
 </body>
 </html>

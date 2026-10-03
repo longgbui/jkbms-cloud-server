@@ -1,0 +1,19 @@
+{
+  "name": "JK BMS Monitor - Bluetooth BLE",
+  "version": "v2.9.9-BLE",
+  "new_install_prompt_erase": false,
+  "builds": [
+    {
+      "chipFamily": "ESP32-C3",
+      "parts": [
+        { "path": "/firmware/factory_ble.bin", "offset": 0 }
+      ]
+    },
+    {
+      "chipFamily": "ESP32",
+      "parts": [
+        { "path": "/firmware/factory_ble.bin", "offset": 0 }
+      ]
+    }
+  ]
+}

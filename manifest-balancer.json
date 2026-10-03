@@ -1,0 +1,19 @@
+{
+  "name": "JK Active Balancer - UART LCD TTL",
+  "version": "v1.0.4-BALANCER",
+  "new_install_prompt_erase": false,
+  "builds": [
+    {
+      "chipFamily": "ESP32-C3",
+      "parts": [
+        { "path": "/firmware/factory_balancer.bin", "offset": 0 }
+      ]
+    },
+    {
+      "chipFamily": "ESP32",
+      "parts": [
+        { "path": "/firmware/factory_balancer.bin", "offset": 0 }
+      ]
+    }
+  ]
+}

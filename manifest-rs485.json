@@ -1,0 +1,19 @@
+{
+  "name": "JK BMS Monitor - RS485 Modbus RTU",
+  "version": "v2.9.8-RS485",
+  "new_install_prompt_erase": false,
+  "builds": [
+    {
+      "chipFamily": "ESP32-C3",
+      "parts": [
+        { "path": "/firmware/factory_rs485.bin", "offset": 0 }
+      ]
+    },
+    {
+      "chipFamily": "ESP32",
+      "parts": [
+        { "path": "/firmware/factory_rs485.bin", "offset": 0 }
+      ]
+    }
+  ]
+}

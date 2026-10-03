@@ -532,9 +532,9 @@ export default {
           for (const tId of targetIds) {
             if (!tId || tId.startsWith('all')) continue;
             const tDev = MEMORY_DEVICE_CACHE.get(tId) || allDevs.find(x => x.device_id === tId);
-            const isBal = tDev && ((tDev.conn_type === 'uart_lcd') || (tDev.conn_type === 'balancer') || (tDev.conn_type_num === 3) || (tDev.firmware_version && tDev.firmware_version.includes('BALANCER')));
-            const isMod = !isBal && tDev && ((tDev.conn_type === 'modbus') || (tDev.conn_type === 'rs485') || (tDev.conn_type_num === 2) || (tDev.firmware_version && tDev.firmware_version.includes('RS485')));
-            const isBle = !isBal && !isMod;
+            const isBle = tDev && ((tDev.conn_type === 'ble') || (tDev.conn_type_num === 1) || (tDev.firmware_version && tDev.firmware_version.includes('BLE')));
+            const isMod = !isBle && tDev && ((tDev.conn_type === 'modbus') || (tDev.conn_type === 'rs485') || (tDev.conn_type_num === 2) || (tDev.firmware_version && tDev.firmware_version.includes('RS485')));
+            const isBal = !isBle && !isMod && tDev && ((tDev.conn_type === 'uart_lcd') || (tDev.conn_type === 'balancer') || (tDev.conn_type_num === 3) || (tDev.firmware_version && tDev.firmware_version.includes('BALANCER')) || (tDev.device_id && tDev.device_id.startsWith('JKBAL')));
 
             if (isBalOnly && !isBal) continue;
             if (isBleOnly && !isBle) continue;
@@ -574,8 +574,9 @@ export default {
 
         // Tự động gán đúng URL firmware theo loại kết nối khi phát OTA đơn lẻ
         if (cmdArr.some(c => c && c.cmd === 'ota_update')) {
-          const isBal = dev && ((dev.conn_type === 'uart_lcd') || (dev.conn_type === 'balancer') || (dev.conn_type_num === 3) || (dev.firmware_version && dev.firmware_version.includes('BALANCER')));
-          const isMod = !isBal && dev && ((dev.conn_type === 'modbus') || (dev.conn_type === 'rs485') || (dev.conn_type_num === 2) || (dev.firmware_version && dev.firmware_version.includes('RS485')));
+          const isBle = dev && ((dev.conn_type === 'ble') || (dev.conn_type_num === 1) || (dev.firmware_version && dev.firmware_version.includes('BLE')));
+          const isMod = !isBle && dev && ((dev.conn_type === 'modbus') || (dev.conn_type === 'rs485') || (dev.conn_type_num === 2) || (dev.firmware_version && dev.firmware_version.includes('RS485')));
+          const isBal = !isBle && !isMod && dev && ((dev.conn_type === 'uart_lcd') || (dev.conn_type === 'balancer') || (dev.conn_type_num === 3) || (dev.firmware_version && dev.firmware_version.includes('BALANCER')) || (dev.device_id && dev.device_id.startsWith('JKBAL')));
           for (const c of cmdArr) {
             if (c && c.cmd === 'ota_update') {
               if (c.target_type === 'balancer' || (isBal && (!c.target_type || c.target_type === 'auto'))) {
@@ -1129,15 +1130,23 @@ export default {
         const firstActivationIp = (existing.activationIp && existing.activationIp !== '—') ? existing.activationIp : (body.local_ip || '—');
         const firstActivationSsid = (existing.activationSsid && existing.activationSsid !== '—') ? existing.activationSsid : (body.ssid || '—');
 
-        const isBalancerPayload = (body.conn_type === 'uart_lcd') || (body.conn_type === 'balancer') || (body.conn_type_num === 3) || (body.firmware_version && body.firmware_version.includes('BALANCER')) || (deviceId.startsWith('JKBAL')) || (body.modelName && (body.modelName.includes('Balancer') || body.modelName.includes('B5A24S') || body.modelName.includes('JK_B'))) || (body.model_name && (body.model_name.includes('Balancer') || body.model_name.includes('B5A24S') || body.model_name.includes('JK_B')));
-        const isBlePayload = !isBalancerPayload && ((body.conn_type === 'ble') || (body.conn_type_num === 1) || (body.firmware_version && body.firmware_version.includes('BLE')));
-        const isRs485Payload = !isBalancerPayload && ((body.conn_type === 'modbus') || (body.conn_type === 'rs485') || (body.conn_type_num === 2) || (body.firmware_version && body.firmware_version.includes('RS485')));
+        const isBlePayload = (body.conn_type === 'ble') || (body.conn_type_num === 1) || (body.firmware_version && body.firmware_version.includes('BLE')) || (deviceId.startsWith('JKBMS') && !body.firmware_version?.includes('RS485') && !body.firmware_version?.includes('BALANCER') && body.conn_type !== 'modbus' && body.conn_type !== 'uart_lcd');
+        const isRs485Payload = !isBlePayload && ((body.conn_type === 'modbus') || (body.conn_type === 'rs485') || (body.conn_type_num === 2) || (body.firmware_version && body.firmware_version.includes('RS485')) || deviceId.startsWith('JKMOD'));
+        const isBalancerPayload = !isBlePayload && !isRs485Payload && ((body.conn_type === 'uart_lcd') || (body.conn_type === 'balancer') || (body.conn_type_num === 3) || (body.firmware_version && body.firmware_version.includes('BALANCER')) || deviceId.startsWith('JKBAL'));
 
         let finalConnType = 'ble';
         let finalConnNum = 1;
         let finalConnProtocol = 'Bluetooth BLE';
 
-        if (isBalancerPayload) {
+        if (isBlePayload) {
+          finalConnType = 'ble';
+          finalConnNum = 1;
+          finalConnProtocol = 'Bluetooth BLE';
+        } else if (isRs485Payload) {
+          finalConnType = 'modbus';
+          finalConnNum = 2;
+          finalConnProtocol = 'RS485 Modbus RTU';
+        } else if (isBalancerPayload) {
           finalConnType = 'uart_lcd';
           finalConnNum = 3;
           finalConnProtocol = 'JK Balancer UART (LCD Port)';
@@ -1158,17 +1167,10 @@ export default {
           body.balance_active = body.balanceActive;
           body.balance = body.balanceActive;
           body.balanceStatus = body.balanceActive;
-        } else if (isBlePayload) {
-          finalConnType = 'ble';
-          finalConnNum = 1;
-          finalConnProtocol = 'Bluetooth BLE';
-        } else if (isRs485Payload) {
-          finalConnType = 'modbus';
-          finalConnNum = 2;
-          finalConnProtocol = 'RS485 Modbus RTU';
         } else {
-          const isBalancerExisting = (existing.conn_type === 'uart_lcd') || (existing.conn_type === 'balancer') || (existing.conn_type_num === 3) || (existing.firmware_version && existing.firmware_version.includes('BALANCER'));
-          const isModbusExisting = !isBalancerExisting && ((existing.conn_type === 'modbus') || (existing.conn_type === 'rs485') || (existing.conn_type_num === 2) || (existing.firmware_version && existing.firmware_version.includes('RS485')));
+          const isBleExisting = (existing.firmware_version && existing.firmware_version.includes('BLE')) || (existing.conn_type === 'ble') || (existing.conn_type_num === 1);
+          const isModbusExisting = !isBleExisting && ((existing.conn_type === 'modbus') || (existing.conn_type === 'rs485') || (existing.conn_type_num === 2) || (existing.firmware_version && existing.firmware_version.includes('RS485')));
+          const isBalancerExisting = !isBleExisting && !isModbusExisting && ((existing.conn_type === 'uart_lcd') || (existing.conn_type === 'balancer') || (existing.conn_type_num === 3) || (existing.firmware_version && existing.firmware_version.includes('BALANCER')) || deviceId.startsWith('JKBAL'));
           finalConnType = isBalancerExisting ? 'uart_lcd' : (isModbusExisting ? 'modbus' : 'ble');
           finalConnNum = isBalancerExisting ? 3 : (isModbusExisting ? 2 : 1);
           finalConnProtocol = isBalancerExisting ? 'JK Balancer UART (LCD Port)' : (isModbusExisting ? 'RS485 Modbus RTU' : 'Bluetooth BLE');
@@ -1195,6 +1197,8 @@ export default {
           delete updated.rs485_slave_id;
           delete updated.active_slave_ids;
           delete updated.summary;
+          if (updated.active_bms_mac === 'UART-LCD') delete updated.active_bms_mac;
+          if (updated.active_bms_name && updated.active_bms_name.includes('Balancer')) delete updated.active_bms_name;
           if (updated.packs_summary && updated.packs_summary.some(p => p.name && p.name.includes('JK-PB (ID'))) {
             delete updated.packs_summary;
           }
@@ -1396,7 +1400,10 @@ export default {
         }
 
         if (range === 'day' || range === '24h') {
-          let pts = real24h ? real24h.slice() : [];
+          const startOfDay = new Date(now).setHours(0, 0, 0, 0);
+          const endOfDay = startOfDay + 24 * 3600 * 1000;
+          let pts = real24h ? real24h.filter(p => p.t >= startOfDay - 3600000) : [];
+
           if (pts.length === 0 && dev && dev.voltage) {
             const timeStr = new Date(now).toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: 'Asia/Ho_Chi_Minh' });
             pts = [{
@@ -1407,6 +1414,30 @@ export default {
               v: parseFloat((dev.voltage || 0).toFixed(2)),
               c: parseFloat((dev.current || 0).toFixed(2))
             }];
+          }
+
+          if (pts.length > 0 && pts[0].t > startOfDay + 120000) {
+            const firstPt = pts[0];
+            pts.unshift({
+              t: startOfDay,
+              time: '00:00:00',
+              p: 0,
+              s: firstPt.s,
+              v: firstPt.v,
+              c: 0
+            });
+          }
+
+          if (pts.length > 0 && (now - pts[pts.length - 1].t > 30000) && dev && dev.voltage) {
+            const nowTimeStr = new Date(now).toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: 'Asia/Ho_Chi_Minh' });
+            pts.push({
+              t: now,
+              time: nowTimeStr,
+              p: parseFloat((dev.power || 0).toFixed(1)),
+              s: parseInt(dev.soc || 0),
+              v: parseFloat((dev.voltage || 0).toFixed(2)),
+              c: parseFloat((dev.current || 0).toFixed(2))
+            });
           }
 
           let peakChg = 0;
@@ -1422,6 +1453,9 @@ export default {
             range: 'day',
             unit: 'W',
             is_real_data: true,
+            start_ts: startOfDay,
+            end_ts: endOfDay,
+            current_ts: now,
             points: pts,
             summary: {
               totalPoints: pts.length,
@@ -1680,11 +1714,11 @@ export default {
 
           dev.online = isOnline(dev);
 
-          const isBal = (dev.conn_type === 'uart_lcd') || (dev.conn_type === 'balancer') || (dev.conn_type_num === 3) || 
+          const isBle = (dev.conn_type === 'ble' || dev.conn_type_num === 1 || (dev.firmware_version && dev.firmware_version.includes('BLE')));
+          const isMod = !isBle && ((dev.conn_type === 'modbus') || (dev.conn_type === 'rs485') || (dev.conn_type_num === 2) || (dev.firmware_version && dev.firmware_version.includes('RS485')));
+          const isBal = !isBle && !isMod && ((dev.conn_type === 'uart_lcd') || (dev.conn_type === 'balancer') || (dev.conn_type_num === 3) || 
             (dev.firmware_version && dev.firmware_version.includes('BALANCER')) || 
-            (dev.device_id && dev.device_id.startsWith('JKBAL')) ||
-            (dev.modelName && (dev.modelName.includes('Balancer') || dev.modelName.includes('B5A24S') || dev.modelName.includes('JK_B'))) ||
-            (dev.model_name && (dev.model_name.includes('Balancer') || dev.model_name.includes('B5A24S') || dev.model_name.includes('JK_B')));
+            (dev.device_id && dev.device_id.startsWith('JKBAL')));
 
           if (isBal) {
             return new Response(BALANCER_DEVICE_HTML(dev), {
@@ -1726,47 +1760,47 @@ export default {
     if (method === 'GET' && path === '/manifest-ble.json') {
       return jsonResponse({
         name: 'JK BMS Monitor - Bluetooth BLE',
-        version: 'v2.9.0-BLE',
+        version: 'v2.9.9-BLE',
         new_install_prompt_erase: false,
         builds: [
           { chipFamily: 'ESP32-C3', parts: [{ path: '/firmware/factory_ble.bin', offset: 0 }] },
           { chipFamily: 'ESP32', parts: [{ path: '/firmware/factory_ble.bin', offset: 0 }] }
         ]
-      }, 200, corsHeaders);
+      }, 200, { ...corsHeaders, 'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0' });
     }
 
     if (method === 'GET' && path === '/manifest-rs485.json') {
       return jsonResponse({
         name: 'JK BMS Monitor - RS485 Modbus RTU',
-        version: 'v2.9.2-RS485',
+        version: 'v2.9.8-RS485',
         new_install_prompt_erase: false,
         builds: [
           { chipFamily: 'ESP32-C3', parts: [{ path: '/firmware/factory_rs485.bin', offset: 0 }] },
           { chipFamily: 'ESP32', parts: [{ path: '/firmware/factory_rs485.bin', offset: 0 }] }
         ]
-      }, 200, corsHeaders);
+      }, 200, { ...corsHeaders, 'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0' });
     }
 
     if (method === 'GET' && path === '/manifest-vf.json') {
       return jsonResponse({
-        name: 'Mach Xoa Loi Pin VinFast (ESP32 CYD)',
-        version: 'v1.0.0-VF-PIN',
+        name: 'Mạch Xóa Lỗi Pin VinFast (ESP32 CYD)',
+        version: 'v1.3.8-VF-PIN',
         new_install_prompt_erase: false,
         builds: [
           { chipFamily: 'ESP32', parts: [{ path: '/firmware/factory_vf.bin', offset: 0 }] }
         ]
-      }, 200, corsHeaders);
+      }, 200, { ...corsHeaders, 'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0' });
     }
     if (method === 'GET' && path === '/manifest-balancer.json') {
       return jsonResponse({
         name: 'JK Active Balancer - UART LCD TTL',
-        version: 'v1.0.0-BALANCER-LCD',
+        version: 'v1.0.4-BALANCER',
         new_install_prompt_erase: false,
         builds: [
           { chipFamily: 'ESP32-C3', parts: [{ path: '/firmware/factory_balancer.bin', offset: 0 }] },
           { chipFamily: 'ESP32', parts: [{ path: '/firmware/factory_balancer.bin', offset: 0 }] }
         ]
-      }, 200, corsHeaders);
+      }, 200, { ...corsHeaders, 'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0' });
     }
 
 
@@ -2902,8 +2936,9 @@ function CUSTOMER_PORTAL_HTML(user) {
         const statusTxt = isOnline ? '🟢 Hoạt động' : '🔴 Ngoại tuyến';
         const badgeCls = isOnline ? 'badge-online' : 'badge-offline';
 
-        const isBal = (d.conn_type === 'uart_lcd') || (d.conn_type === 'balancer') || (d.conn_type_num === 3) || (d.firmware_version && d.firmware_version.indexOf('BALANCER') !== -1) || (d.device_id && d.device_id.startsWith('JKBAL'));
-        const isMod = !isBal && ((d.conn_type === 'modbus') || (d.conn_type === 'rs485') || (d.conn_type_num === 2) || (d.firmware_version && d.firmware_version.indexOf('RS485') !== -1) || (d.active_bms_mac && String(d.active_bms_mac).startsWith('RS485')));
+        const isBle = (d.firmware_version && d.firmware_version.indexOf('BLE') !== -1) || (d.conn_type === 'ble') || (d.conn_type_num === 1);
+        const isMod = !isBle && ((d.conn_type === 'modbus') || (d.conn_type === 'rs485') || (d.conn_type_num === 2) || (d.firmware_version && d.firmware_version.indexOf('RS485') !== -1) || (d.active_bms_mac && String(d.active_bms_mac).startsWith('RS485')));
+        const isBal = !isBle && !isMod && ((d.conn_type === 'uart_lcd') || (d.conn_type === 'balancer') || (d.conn_type_num === 3) || (d.firmware_version && d.firmware_version.indexOf('BALANCER') !== -1) || (d.device_id && d.device_id.startsWith('JKBAL')));
 
         const typeBadge = isBal 
           ? '<span style="background:rgba(16,185,129,0.18);color:#10b981;border:1px solid rgba(16,185,129,0.45);font-size:0.65rem;padding:2px 7px;border-radius:4px;font-weight:800;letter-spacing:0.5px;margin-left:6px;vertical-align:middle;">⚡ CÂN BẰNG JK</span>'
@@ -2966,6 +3001,10 @@ function CUSTOMER_PORTAL_HTML(user) {
               <div>Sạc: <span class="sw-badge \${chgOn ? 'sw-on' : 'sw-off'}">\${chgOn ? 'BẬT' : 'TẮT'}</span></div>
               <div>Xả: <span class="sw-badge \${dsgOn ? 'sw-on' : 'sw-off'}">\${dsgOn ? 'BẬT' : 'TẮT'}</span></div>
               <div>Cân Bằng: <span class="sw-badge \${balOn ? 'sw-on' : 'sw-off'}">\${balOn ? 'BẬT' : 'TẮT'}</span></div>
+            </div>
+            <div class="switches-row" style="margin-top:6px;font-size:0.75rem;color:var(--text-sub);">
+              <div>Pass \${isMod ? 'PIN' : 'BLE'}: <strong style="color:#38bdf8;font-family:monospace;">\${d.devicePasscode || d.device_passcode || '1234'}</strong></div>
+              <div>Pass Setup: <strong style="color:var(--green);font-family:monospace;">\${d.setup_passcode || d.setupPasscode || '123456'}</strong></div>
             </div>
           \`;
         }
@@ -3599,8 +3638,9 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
                       '<option value="all_balancer">⚡ Tất cả mạch Cân Bằng Balancer UART</option>' +
                       '<optgroup label="--- Từng Thiết Bị Cụ Thể ---">';
         for(let d of devices) {
-          const isBal = (d.conn_type === 'uart_lcd') || (d.conn_type === 'balancer') || (d.conn_type_num === 3) || (d.firmware_version && d.firmware_version.indexOf('BALANCER') !== -1) || (d.device_id && d.device_id.startsWith('JKBAL'));
-          const isMod = !isBal && ((d.conn_type === 'rs485' || d.conn_type === 'modbus' || (d.firmware_version && d.firmware_version.includes('RS485'))));
+          const isBle = (d.firmware_version && d.firmware_version.indexOf('BLE') !== -1) || (d.conn_type === 'ble') || (d.conn_type_num === 1);
+          const isMod = !isBle && ((d.conn_type === 'rs485' || d.conn_type === 'modbus' || (d.firmware_version && d.firmware_version.includes('RS485'))));
+          const isBal = !isBle && !isMod && ((d.conn_type === 'uart_lcd') || (d.conn_type === 'balancer') || (d.conn_type_num === 3) || (d.firmware_version && d.firmware_version.indexOf('BALANCER') !== -1) || (d.device_id && d.device_id.startsWith('JKBAL')));
           const tag = isBal ? ' [BALANCER]' : (isMod ? ' [RS485]' : ' [BLE]');
           optHtml += '<option value="' + d.device_id + '">' + (d.online ? '🟢 ' : '🔴 ') + d.device_id + tag + (d.ssid ? ' (' + d.ssid + ')' : '') + '</option>';
         }
@@ -3627,11 +3667,9 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         var statusBadge = d.online ? '<span class="badge badge-online"><span class="pulse"></span> Online</span>' : '<span class="badge badge-offline">Offline</span>';
         var statusText = d.online ? 'Hoạt động ' : 'Offline từ ';
         
-        var isBalancer = (d.conn_type === 'uart_lcd') || (d.conn_type === 'balancer') || (d.conn_type_num === 3) || (d.firmware_version && d.firmware_version.indexOf('BALANCER') !== -1) || (d.device_id && d.device_id.startsWith('JKBAL'));
-        var isModbus = !isBalancer && ((d.conn_type === 'ble' || d.conn_type_num === 1 || (d.firmware_version && d.firmware_version.indexOf('BLE') !== -1))
-          ? false
-          : ((d.conn_type === 'modbus') || (d.conn_type === 'rs485') || (d.conn_type_num === 2) || (d.firmware_version && d.firmware_version.indexOf('RS485') !== -1) || (d.active_bms_mac && String(d.active_bms_mac).startsWith('RS485'))));
-        var isBle = !isBalancer && !isModbus;
+        var isBle = (d.firmware_version && d.firmware_version.indexOf('BLE') !== -1) || (d.conn_type === 'ble') || (d.conn_type_num === 1);
+        var isModbus = !isBle && ((d.conn_type === 'modbus') || (d.conn_type === 'rs485') || (d.conn_type_num === 2) || (d.firmware_version && d.firmware_version.indexOf('RS485') !== -1) || (d.active_bms_mac && String(d.active_bms_mac).startsWith('RS485')));
+        var isBalancer = !isBle && !isModbus && ((d.conn_type === 'uart_lcd') || (d.conn_type === 'balancer') || (d.conn_type_num === 3) || (d.firmware_version && d.firmware_version.indexOf('BALANCER') !== -1) || (d.device_id && d.device_id.startsWith('JKBAL')));
 
         // ══════════════════════════════════════════════════════════════════
         // LOẠI 1: MẠCH CÂN BẰNG CHỦ ĐỘNG JK (UART LCD PORT)
@@ -3668,7 +3706,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
                 '<div class="info-row"><span class="info-key">IP Local</span><span class="info-val">' + localIp + '</span></div>' +
                 '<div class="info-row"><span class="info-key">Wi-Fi</span><span class="info-val">' + ssidName + '</span></div>' +
                 '<div class="info-row"><span class="info-key">Hostname</span><span class="info-val">' + hostName + '</span></div>' +
-                '<div class="info-row"><span class="info-key">Firmware</span><span class="info-val">v' + fwVer + '</span></div>' +
+                '<div class="info-row"><span class="info-key">Firmware</span><span class="info-val">' + (fwVer.startsWith('v') || fwVer.startsWith('V') ? '' : 'v') + fwVer + '</span></div>' +
               '</div>' +
               '<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);display:grid;grid-template-columns:1fr 1fr;gap:6px;">' +
                 '<a href="/d/' + d.device_id + '" target="_blank" style="background:var(--surface2);border:1px solid var(--accent);color:var(--accent);padding:7px 8px;border-radius:6px;font-size:0.75rem;font-weight:600;text-decoration:none;text-align:center;">' +
@@ -3717,11 +3755,13 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
                 '<div class="info-row"><span class="info-key">Kiểu Kết Nối</span><span class="info-val" style="color:#f59e0b;font-weight:700;">🟠 RS485 Modbus RTU</span></div>' +
                 '<div class="info-row"><span class="info-key">Cổng BMS (Modbus)</span><span class="info-val" style="color:var(--accent);font-weight:700;">' + slaveLabel + '</span></div>' +
                 '<div class="info-row"><span class="info-key">Giao Thức Truyền</span><span class="info-val">Modbus RTU (9600 bps)</span></div>' +
+                '<div class="info-row"><span class="info-key">Mã PIN BMS</span><span class="info-val" style="color:#38bdf8;font-weight:700;font-family:monospace;">🔑 ' + (d.devicePasscode || d.device_passcode || '1234') + '</span></div>' +
+                '<div class="info-row"><span class="info-key">Pass Cài Đặt (Setup)</span><span class="info-val" style="color:#10b981;font-weight:700;font-family:monospace;">⚙️ ' + (d.setup_passcode || d.setupPasscode || '123456') + '</span></div>' +
                 '<div class="info-row"><span class="info-key">Ngày Kích Hoạt</span><span class="info-val" style="color:var(--primary);font-weight:700;">' + activatedStr + '</span></div>' +
                 '<div class="info-row"><span class="info-key">IP Local</span><span class="info-val">' + localIp + '</span></div>' +
                 '<div class="info-row"><span class="info-key">Wi-Fi</span><span class="info-val">' + ssidName + '</span></div>' +
                 '<div class="info-row"><span class="info-key">Hostname</span><span class="info-val">' + hostName + '</span></div>' +
-                '<div class="info-row"><span class="info-key">Firmware</span><span class="info-val">v' + fwVer + '</span></div>' +
+                '<div class="info-row"><span class="info-key">Firmware</span><span class="info-val">' + (fwVer.startsWith('v') || fwVer.startsWith('V') ? '' : 'v') + fwVer + '</span></div>' +
               '</div>' +
               '<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);display:grid;grid-template-columns:1fr 1fr;gap:6px;">' +
                 '<a href="/d/' + d.device_id + '" target="_blank" style="background:var(--surface2);border:1px solid var(--accent);color:var(--accent);padding:7px 8px;border-radius:6px;font-size:0.75rem;font-weight:600;text-decoration:none;text-align:center;">' +
@@ -3769,11 +3809,13 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
                 '<div class="info-row"><span class="info-key">Kiểu Kết Nối</span><span class="info-val" style="color:#38bdf8;font-weight:700;">🔵 Bluetooth BLE</span></div>' +
                 '<div class="info-row"><span class="info-key">Tên Bluetooth (BMS)</span><span class="info-val" style="color:var(--accent);font-weight:700;">' + bmsTitle + '</span></div>' +
                 (d.active_bms_mac ? ('<div class="info-row"><span class="info-key">Địa Chỉ MAC</span><span class="info-val" style="color:var(--subtext);">' + d.active_bms_mac + '</span></div>') : '') +
+                '<div class="info-row"><span class="info-key">Pass Kết Nối (BLE)</span><span class="info-val" style="color:#38bdf8;font-weight:700;font-family:monospace;">🔑 ' + (d.devicePasscode || d.device_passcode || '1234') + '</span></div>' +
+                '<div class="info-row"><span class="info-key">Pass Cài Đặt (Setup)</span><span class="info-val" style="color:#10b981;font-weight:700;font-family:monospace;">⚙️ ' + (d.setup_passcode || d.setupPasscode || '123456') + '</span></div>' +
                 '<div class="info-row"><span class="info-key">Ngày Kích Hoạt</span><span class="info-val" style="color:var(--primary);font-weight:700;">' + activatedStr + '</span></div>' +
                 '<div class="info-row"><span class="info-key">IP Local</span><span class="info-val">' + localIp + '</span></div>' +
                 '<div class="info-row"><span class="info-key">Wi-Fi</span><span class="info-val">' + ssidName + '</span></div>' +
                 '<div class="info-row"><span class="info-key">Hostname</span><span class="info-val">' + hostName + '</span></div>' +
-                '<div class="info-row"><span class="info-key">Firmware</span><span class="info-val">v' + fwVer + '</span></div>' +
+                '<div class="info-row"><span class="info-key">Firmware</span><span class="info-val">' + (fwVer.startsWith('v') || fwVer.startsWith('V') ? '' : 'v') + fwVer + '</span></div>' +
               '</div>' +
               '<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);display:grid;grid-template-columns:1fr 1fr;gap:6px;">' +
                 '<a href="/d/' + d.device_id + '" target="_blank" style="background:var(--surface2);border:1px solid var(--accent);color:var(--accent);padding:7px 8px;border-radius:6px;font-size:0.75rem;font-weight:600;text-decoration:none;text-align:center;">' +
@@ -4363,10 +4405,9 @@ function CUSTOMER_DEVICE_HTML(d) {
   // 90s Grace Period: Cho phép ESP kết nối lại trong 90s mà không làm gián đoạn trạng thái Xanh
   const bmsConnected = online && (d.connected === true || (hasData && timeSinceBms < 90000));
 
-  const isBalancer = (d.conn_type === 'uart_lcd') || (d.conn_type === 'balancer') || (d.conn_type_num === 3) || (d.firmware_version && d.firmware_version.includes('BALANCER')) || (d.device_id && d.device_id.startsWith('JKBAL'));
-  const isModbus = !isBalancer && ((d.conn_type === 'ble' || d.conn_type_num === 1 || (d.firmware_version && d.firmware_version.includes('BLE')))
-    ? false
-    : ((d.conn_type === 'modbus') || (d.conn_type === 'rs485') || (d.conn_type_num === 2) || (d.firmware_version && d.firmware_version.includes('RS485')) || (d.active_bms_mac && String(d.active_bms_mac).startsWith('RS485'))));
+  const isBle = (d.conn_type === 'ble' || d.conn_type_num === 1 || (d.firmware_version && d.firmware_version.includes('BLE')));
+  const isModbus = !isBle && ((d.conn_type === 'modbus') || (d.conn_type === 'rs485') || (d.conn_type_num === 2) || (d.firmware_version && d.firmware_version.includes('RS485')) || (d.active_bms_mac && String(d.active_bms_mac).startsWith('RS485')));
+  const isBalancer = !isBle && !isModbus && ((d.conn_type === 'uart_lcd') || (d.conn_type === 'balancer') || (d.conn_type_num === 3) || (d.firmware_version && d.firmware_version.includes('BALANCER')) || (d.device_id && d.device_id.startsWith('JKBAL')));
 
   const connProtocol = isBalancer ? 'JK Balancer UART (LCD Port)' : (isModbus ? 'RS485 Modbus RTU' : 'Bluetooth BLE');
   const connBadgeHtml = isBalancer
@@ -5491,10 +5532,8 @@ function CUSTOMER_DEVICE_HTML(d) {
                 <div class="card-row"><span>Address ID:</span><strong id="dev-info-addr" style="color:var(--green); font-family:monospace;">${formatBmsAddress(d.address_id !== undefined ? d.address_id : d.rs485DeviceId)}</strong></div>
                 <div class="card-row" id="row-dev-info-mac"><span>${isModbus ? 'Cổng Giao Tiếp:' : 'Bluetooth MAC:'}</span><strong id="dev-info-mac" style="color:var(--cyan); font-family:monospace;">${isModbus ? 'RS485 Modbus RTU' : (d.active_bms_mac||'—')}</strong></div>
                 <div class="card-row" id="row-dev-info-ble-rssi" style="display:${isModbus ? 'none' : 'flex'};"><span>Tín Hiệu BLE:</span><strong id="dev-info-ble-rssi" style="color:var(--cyan); font-family:monospace;">${(d.ble_rssi && d.ble_rssi !== 0) ? d.ble_rssi + ' dBm' : '—'}</strong></div>
-                ${isModbus ? `
-                <div class="card-row" id="row-dev-info-pin"><span>Mã PIN BMS:</span><strong id="dev-info-pin" style="color:#fff; font-family:monospace;">${d.devicePasscode||'—'}</strong></div>
-                <div class="card-row" id="row-dev-info-setup-pin"><span>Mật Khẩu Cài Đặt:</span><strong id="dev-info-setup-pin" style="color:var(--green); font-family:monospace;">${d.setup_passcode||d.setupPasscode||'—'}</strong></div>
-                ` : ''}
+                <div class="card-row" id="row-dev-info-pin"><span>${isModbus ? 'Mã PIN BMS:' : 'Pass Kết Nối (Bluetooth):'}</span><strong id="dev-info-pin" style="color:#38bdf8; font-family:monospace;">${d.devicePasscode||d.device_passcode||'1234'}</strong></div>
+                <div class="card-row" id="row-dev-info-setup-pin"><span>Mật Khẩu Cài Đặt (Setup):</span><strong id="dev-info-setup-pin" style="color:var(--green); font-family:monospace;">${d.setup_passcode||d.setupPasscode||'123456'}</strong></div>
                 <div class="card-row"><span>Kích Hoạt:</span><strong id="dev-info-act" style="color:var(--green); font-size:0.75rem;">${reg}</strong></div>
             </div>
         </div>
@@ -6383,7 +6422,7 @@ function CUSTOMER_DEVICE_HTML(d) {
         var fLeft = document.getElementById('chart-footer-left');
         var fRight = document.getElementById('chart-footer-right');
 
-        // ── MODE: 24 GIỜ (DAY) - BIPOLAR ZERO LINE SMOOTH SPLINE ──
+        // ── MODE: 24 GIỜ (DAY) - BIPOLAR ZERO LINE SMOOTH SPLINE (FULL 24H DOMAIN 00:00 -> 24:00) ──
         if (range === 'day') {
             var pts = res.points || [];
             if (pts.length === 0) {
@@ -6393,6 +6432,10 @@ function CUSTOMER_DEVICE_HTML(d) {
                 ctx.fillText('Đang tích lũy dữ liệu đo đạc thực tế...', w / 2, h / 2);
                 return;
             }
+
+            var startTs = res.start_ts || (new Date().setHours(0, 0, 0, 0));
+            var endTs = res.end_ts || (startTs + 24 * 3600 * 1000);
+            var totalDuration = endTs - startTs;
 
             var maxPeak = 100;
             for (var i = 0; i < pts.length; i++) {
@@ -6421,11 +6464,11 @@ function CUSTOMER_DEVICE_HTML(d) {
             if (sBadge) {
                 sBadge.textContent = lastPt.s + '% (' + (lastPt.v || 0) + 'V)';
             }
-            if (fLeft) fLeft.textContent = pts[0].time || 'Bắt đầu';
-            if (fRight) fRight.textContent = pts[pts.length - 1].time || 'Hiện tại';
-            if (fCenter) fCenter.textContent = 'Đo thực tế: ' + pts.length + ' điểm • Cân xứng: ±' + maxScale + 'W • Chạm để xem chi tiết';
+            if (fLeft) fLeft.textContent = '00:00';
+            if (fRight) fRight.textContent = '24:00 (Hiện tại ' + (lastPt.time ? lastPt.time.substring(0,5) : '') + ')';
+            if (fCenter) fCenter.textContent = 'Đo thực tế 24h: ' + pts.length + ' điểm • Cân xứng: ±' + maxScale + 'W • Chạm để xem chi tiết';
 
-            // Lưới ngang đối xứng
+            // Lưới ngang đối xứng (5 mức)
             ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
             ctx.lineWidth = 1 * dpr;
             ctx.setLineDash([3 * dpr, 3 * dpr]);
@@ -6443,6 +6486,29 @@ function CUSTOMER_DEVICE_HTML(d) {
             ctx.moveTo(padL, zeroY);
             ctx.lineTo(w - padR, zeroY);
             ctx.stroke();
+            ctx.setLineDash([]);
+
+            // Lưới dọc và các mốc giờ chuẩn 24H: 00:00, 04:00, 08:00, 12:00, 16:00, 20:00, 24:00
+            var timeMarks = [
+                { frac: 0.000, label: '00:00' },
+                { frac: 0.1667, label: '04:00' },
+                { frac: 0.3333, label: '08:00' },
+                { frac: 0.5000, label: '12:00' },
+                { frac: 0.6667, label: '16:00' },
+                { frac: 0.8333, label: '20:00' },
+                { frac: 1.000, label: '24:00' }
+            ];
+
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.06)';
+            ctx.lineWidth = 1 * dpr;
+            ctx.setLineDash([2 * dpr, 4 * dpr]);
+            timeMarks.forEach(function(tm) {
+                var mx = padL + tm.frac * plotW;
+                ctx.beginPath();
+                ctx.moveTo(mx, padT);
+                ctx.lineTo(mx, padT + plotH);
+                ctx.stroke();
+            });
             ctx.setLineDash([]);
 
             // Axis labels Left (Watt)
@@ -6468,13 +6534,15 @@ function CUSTOMER_DEVICE_HTML(d) {
             ctx.fillText('25%', w - padR + (4 * dpr), padT + plotH * 0.75 + (3 * dpr));
             ctx.fillText('0%', w - padR + (4 * dpr), padT + plotH - (2 * dpr));
 
-            var stepX = pts.length > 1 ? (plotW / (pts.length - 1)) : plotW;
+            // TÍNH TOẠ ĐỘ X THỰC TẾ THEO THỜI GIAN TRÊN TRỤC 24H:
             var pCoords = [];
             var sCoords = [];
             for (var k = 0; k < pts.length; k++) {
                 var itm = pts[k];
                 var sp = (itm.c < -0.05 || itm.p < 0) ? -Math.abs(itm.p) : Math.abs(itm.p);
-                var px = padL + k * stepX;
+                var ptTime = itm.t || (startTs + (k / Math.max(1, pts.length - 1)) * totalDuration);
+                var frac = Math.max(0, Math.min(1, (ptTime - startTs) / totalDuration));
+                var px = padL + frac * plotW;
                 var py = zeroY - (sp / maxScale) * halfH;
                 var sy = padT + plotH - (itm.s / 100) * plotH;
                 pCoords.push({ x: px, y: py, sp: sp, raw: itm });
@@ -6496,7 +6564,7 @@ function CUSTOMER_DEVICE_HTML(d) {
             ctx.stroke();
             ctx.restore();
 
-            // Clean SOC Line (Nét liền)
+            // Clean SOC Line (Nét liền xanh dương)
             ctx.save();
             ctx.strokeStyle = '#38bdf8';
             ctx.lineWidth = 1.8 * dpr;
@@ -6507,59 +6575,89 @@ function CUSTOMER_DEVICE_HTML(d) {
             ctx.stroke();
             ctx.restore();
 
-            // Clean Endpoint Dots
-            var lastP = smoothP[smoothP.length - 1];
-            var lastS = smoothS[smoothS.length - 1];
-            ctx.fillStyle = '#38bdf8';
+            // Vạch chỉ báo thời điểm HIỆN TẠI (Current Time Marker)
+            var nowFrac = Math.max(0, Math.min(1, (Date.now() - startTs) / totalDuration));
+            var nowX = padL + nowFrac * plotW;
+            ctx.save();
+            ctx.strokeStyle = 'rgba(239, 68, 68, 0.7)';
+            ctx.lineWidth = 1.2 * dpr;
+            ctx.setLineDash([2 * dpr, 2 * dpr]);
             ctx.beginPath();
-            ctx.arc(lastS.x, lastS.y, 3 * dpr, 0, Math.PI * 2);
-            ctx.fill();
+            ctx.moveTo(nowX, padT);
+            ctx.lineTo(nowX, padT + plotH);
+            ctx.stroke();
+            ctx.restore();
 
-            ctx.fillStyle = lastColor;
-            ctx.beginPath();
-            ctx.arc(lastP.x, lastP.y, 3.5 * dpr, 0, Math.PI * 2);
-            ctx.fill();
+            // Điểm mút mới nhất (Latest Point Indicator)
+            if (smoothP.length > 0) {
+                var lp = smoothP[smoothP.length - 1];
+                ctx.beginPath();
+                ctx.arc(lp.x, lp.y, 4.5 * dpr, 0, Math.PI * 2);
+                ctx.fillStyle = lastColor;
+                ctx.fill();
+                ctx.strokeStyle = '#0f172a';
+                ctx.lineWidth = 1.8 * dpr;
+                ctx.stroke();
+            }
 
-            // Con trỏ cảm ứng/chuột (Crosshair & Floating Tooltip) trong chế độ 24h
+            // Điểm mút SOC mới nhất
+            if (smoothS.length > 0) {
+                var ls = smoothS[smoothS.length - 1];
+                ctx.beginPath();
+                ctx.arc(ls.x, ls.y, 4.5 * dpr, 0, Math.PI * 2);
+                ctx.fillStyle = '#38bdf8';
+                ctx.fill();
+                ctx.strokeStyle = '#0f172a';
+                ctx.lineWidth = 1.8 * dpr;
+                ctx.stroke();
+            }
+
+            // TOOLTIP KHI RÊ CHUỘT / CHẠM
             if (chartHoverIdx >= 0 && chartHoverIdx < smoothP.length) {
-                var hP = smoothP[chartHoverIdx];
-                var hS = smoothS[chartHoverIdx];
-                var rawItem = hP.raw || {};
+                var pPt = smoothP[chartHoverIdx];
+                var sPt = smoothS[chartHoverIdx];
+                var rawItem = pPt.raw;
 
+                // Vertical Crosshair
                 ctx.save();
-                ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
+                ctx.strokeStyle = 'rgba(255, 255, 255, 0.45)';
                 ctx.lineWidth = 1 * dpr;
                 ctx.setLineDash([3 * dpr, 3 * dpr]);
                 ctx.beginPath();
-                ctx.moveTo(hP.x, padT);
-                ctx.lineTo(hP.x, padT + plotH);
+                ctx.moveTo(pPt.x, padT);
+                ctx.lineTo(pPt.x, padT + plotH);
                 ctx.stroke();
                 ctx.restore();
 
-                ctx.save();
-                ctx.fillStyle = (hP.sp < -0.05) ? '#f97316' : '#22c55e';
+                // Target Rings
+                ctx.beginPath();
+                ctx.arc(pPt.x, pPt.y, 6 * dpr, 0, Math.PI * 2);
+                ctx.fillStyle = pPt.sp < 0 ? '#f97316' : '#22c55e';
+                ctx.fill();
                 ctx.strokeStyle = '#ffffff';
-                ctx.lineWidth = 1.6 * dpr;
-                ctx.beginPath();
-                ctx.arc(hP.x, hP.y, 4.5 * dpr, 0, Math.PI * 2);
-                ctx.fill();
+                ctx.lineWidth = 2 * dpr;
                 ctx.stroke();
 
+                ctx.beginPath();
+                ctx.arc(sPt.x, sPt.y, 5 * dpr, 0, Math.PI * 2);
                 ctx.fillStyle = '#38bdf8';
-                ctx.beginPath();
-                ctx.arc(hS.x, hS.y, 4 * dpr, 0, Math.PI * 2);
                 ctx.fill();
+                ctx.strokeStyle = '#ffffff';
+                ctx.lineWidth = 1.5 * dpr;
                 ctx.stroke();
-                ctx.restore();
 
-                var tipW = 126 * dpr;
-                var tipH = 58 * dpr;
-                var tipX = (hP.x > w / 2) ? (hP.x - tipW - 10 * dpr) : (hP.x + 10 * dpr);
-                var tipY = Math.max(padT + 4 * dpr, Math.min(padT + plotH - tipH - 4 * dpr, hP.y - tipH / 2));
-
+                // Tooltip Floating Card
                 ctx.save();
-                ctx.fillStyle = 'rgba(11, 15, 25, 0.95)';
-                ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
+                var tipW = 150 * dpr;
+                var tipH = 54 * dpr;
+                var tipX = pPt.x + 10 * dpr;
+                if (tipX + tipW > w - padR) {
+                    tipX = pPt.x - tipW - 10 * dpr;
+                }
+                var tipY = padT + 8 * dpr;
+
+                ctx.fillStyle = 'rgba(15, 23, 42, 0.92)';
+                ctx.strokeStyle = 'rgba(255, 255, 255, 0.18)';
                 ctx.lineWidth = 1 * dpr;
                 ctx.beginPath();
                 if (ctx.roundRect) ctx.roundRect(tipX, tipY, tipW, tipH, 6 * dpr);
@@ -6585,14 +6683,15 @@ function CUSTOMER_DEVICE_HTML(d) {
                 ctx.restore();
             }
 
+            // VẼ CÁC NHÃN GIỜ 00:00, 04:00, 08:00, 12:00, 16:00, 20:00, 24:00 DƯỚI TRỤC X
             ctx.fillStyle = '#64748b';
             ctx.font = (8.5 * dpr) + 'px monospace';
-            ctx.textAlign = 'center';
-            var markIndices = [0, Math.floor(pts.length * 0.33), Math.floor(pts.length * 0.66), pts.length - 1];
-            markIndices.forEach(function(idx) {
-                if (pts[idx]) {
-                    ctx.fillText(pts[idx].time || '', padL + idx * stepX, h - (6 * dpr));
-                }
+            timeMarks.forEach(function(tm) {
+                var mx = padL + tm.frac * plotW;
+                if (tm.frac === 0) ctx.textAlign = 'left';
+                else if (tm.frac === 1) ctx.textAlign = 'right';
+                else ctx.textAlign = 'center';
+                ctx.fillText(tm.label, mx, h - (6 * dpr));
             });
             return;
         }
@@ -6804,9 +6903,20 @@ function CUSTOMER_DEVICE_HTML(d) {
             } else if (currentChartRange === 'day' && cachedHistoryData['day'] && cachedHistoryData['day'].points) {
                 var pts = cachedHistoryData['day'].points;
                 if (pts.length > 0) {
-                    var stepX = pts.length > 1 ? (plotW / (pts.length - 1)) : plotW;
-                    var nearestIdx = Math.round((canvasX - padL) / stepX);
-                    nearestIdx = Math.max(0, Math.min(pts.length - 1, nearestIdx));
+                    var startTs = cachedHistoryData['day'].start_ts || (new Date().setHours(0, 0, 0, 0));
+                    var endTs = cachedHistoryData['day'].end_ts || (startTs + 24 * 3600 * 1000);
+                    var totalDuration = endTs - startTs;
+                    var bestDist = 999999;
+                    var nearestIdx = 0;
+                    for (var i = 0; i < pts.length; i++) {
+                        var ptTime = pts[i].t || (startTs + (i / Math.max(1, pts.length - 1)) * totalDuration);
+                        var ptX = padL + ((ptTime - startTs) / totalDuration) * plotW;
+                        var dist = Math.abs(ptX - canvasX);
+                        if (dist < bestDist) {
+                            bestDist = dist;
+                            nearestIdx = i;
+                        }
+                    }
                     if (chartHoverIdx !== nearestIdx) {
                         chartHoverIdx = nearestIdx;
                         drawHistoricalChart('day', cachedHistoryData['day']);
@@ -7610,10 +7720,9 @@ function CUSTOMER_DEVICE_HTML(d) {
             if (dev.bmsSwVersion && dev.bmsSwVersion !== '—') _set('dev-info-sw', dev.bmsSwVersion);
             else if (dev.swVersionStr && dev.swVersionStr !== '—') _set('dev-info-sw', dev.swVersionStr);
             if (dev.protocol_version) _set('dev-info-family', dev.protocol_version + (dev.bmsFamilyStr ? ' (' + dev.bmsFamilyStr + ')' : ''));
-            const isBalancer = (dev.conn_type === 'uart_lcd') || (dev.conn_type === 'balancer') || (dev.conn_type_num === 3) || (dev.firmware_version && dev.firmware_version.includes('BALANCER')) || (dev.device_id && dev.device_id.startsWith('JKBAL'));
-            const isMod = !isBalancer && ((dev.conn_type === 'ble' || dev.conn_type_num === 1 || (dev.firmware_version && dev.firmware_version.includes('BLE')))
-                ? false
-                : ((dev.conn_type === 'modbus') || (dev.conn_type === 'rs485') || (dev.conn_type_num === 2) || (dev.firmware_version && dev.firmware_version.includes('RS485')) || (dev.active_bms_mac && String(dev.active_bms_mac).startsWith('RS485'))));
+            const isBle = (dev.conn_type === 'ble' || dev.conn_type_num === 1 || (dev.firmware_version && dev.firmware_version.includes('BLE')));
+            const isMod = !isBle && ((dev.conn_type === 'modbus') || (dev.conn_type === 'rs485') || (dev.conn_type_num === 2) || (dev.firmware_version && dev.firmware_version.includes('RS485')) || (dev.active_bms_mac && String(dev.active_bms_mac).startsWith('RS485')));
+            const isBalancer = !isBle && !isMod && ((dev.conn_type === 'uart_lcd') || (dev.conn_type === 'balancer') || (dev.conn_type_num === 3) || (dev.firmware_version && dev.firmware_version.includes('BALANCER')) || (dev.device_id && dev.device_id.startsWith('JKBAL')));
             if (isBalancer) {
                 _set('dev-info-mac', 'JK Balancer UART TTL (Cổng LCD)');
                 const rowBle = document.getElementById('row-dev-info-ble-rssi');
@@ -7640,6 +7749,10 @@ function CUSTOMER_DEVICE_HTML(d) {
                 _set('dev-info-ble-rssi', bleRssiStr);
                 const rowBle = document.getElementById('row-dev-info-ble-rssi');
                 if (rowBle) rowBle.style.display = 'flex';
+                const rowPin = document.getElementById('row-dev-info-pin');
+                if (rowPin) { rowPin.style.display = 'flex'; _set('dev-info-pin', dev.devicePasscode || dev.device_passcode || '1234'); }
+                const rowSetupPin = document.getElementById('row-dev-info-setup-pin');
+                if (rowSetupPin) { rowSetupPin.style.display = 'flex'; _set('dev-info-setup-pin', dev.setup_passcode || dev.setupPasscode || '123456'); }
                 const hBox = document.getElementById('home-ble-box');
                 if (hBox) hBox.style.display = 'block';
             }
@@ -8089,6 +8202,9 @@ const WEB_FLASHER_HTML = `<!DOCTYPE html>
         .card-bal .card-icon { background: var(--purple-dim); border: 1px solid rgba(168,85,247,0.3); }
         .card-bal .card-ver { background: var(--purple-dim); color: var(--purple); border: 1px solid rgba(168,85,247,0.3); }
 
+        .card-vf .card-icon { background: var(--green-dim); border: 1px solid rgba(34,197,94,0.3); }
+        .card-vf .card-ver { background: var(--green-dim); color: var(--green); border: 1px solid rgba(34,197,94,0.3); }
+
         /* Custom Button for ESP Web Tools */
         esp-web-install-button { width: 100%; display: block; }
         .btn-install {
@@ -8114,6 +8230,9 @@ const WEB_FLASHER_HTML = `<!DOCTYPE html>
 
         .btn-bal { background: var(--purple); color: #fff; }
         .btn-bal:hover { background: #c084fc; }
+
+        .btn-vf { background: var(--green); color: #052e16; }
+        .btn-vf:hover { background: #4ade80; }
 
         /* Steps guide */
         .guide-box { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 22px; margin-bottom: 28px; }
@@ -8155,7 +8274,7 @@ const WEB_FLASHER_HTML = `<!DOCTYPE html>
                         <div class="card-icon">📡</div>
                         <div>
                             <div class="card-title">JK BMS Bluetooth</div>
-                            <span class="card-ver">Phiên bản v2.9.0-BLE</span>
+                            <span class="card-ver" id="ver-ble">Phiên bản v2.9.9-BLE</span>
                         </div>
                     </div>
                     <p class="card-desc">Dành cho mạch ESP32 kết nối không dây với JK BMS qua Bluetooth BLE.</p>
@@ -8181,7 +8300,7 @@ const WEB_FLASHER_HTML = `<!DOCTYPE html>
                         <div class="card-icon">🔌</div>
                         <div>
                             <div class="card-title">JK BMS RS485</div>
-                            <span class="card-ver">Phiên bản v2.9.2-RS485</span>
+                            <span class="card-ver" id="ver-rs485">Phiên bản v2.9.8-RS485</span>
                         </div>
                     </div>
                     <p class="card-desc">Dành cho ESP32 kết nối có dây với JK BMS qua cổng RS485 Modbus RTU.</p>
@@ -8207,7 +8326,7 @@ const WEB_FLASHER_HTML = `<!DOCTYPE html>
                         <div class="card-icon">⚖️</div>
                         <div>
                             <div class="card-title">JK Active Balancer</div>
-                            <span class="card-ver">Phiên bản v1.0.0-BALANCER</span>
+                            <span class="card-ver" id="ver-bal">Phiên bản v1.0.4-BALANCER</span>
                         </div>
                     </div>
                     <p class="card-desc">Dành riêng cho Mạch Cân Bằng Chủ Động JK kết nối qua cổng LCD UART TTL.</p>
@@ -8221,6 +8340,32 @@ const WEB_FLASHER_HTML = `<!DOCTYPE html>
                     <esp-web-install-button manifest="/manifest-balancer.json">
                         <button slot="activate" class="btn-install btn-bal">
                             ⚡ Kết Nối & Nạp Balancer
+                        </button>
+                    </esp-web-install-button>
+                </div>
+            </div>
+
+            <!-- 4. XOA LOI PIN VF -->
+            <div class="card card-vf">
+                <div>
+                    <div class="card-header">
+                        <div class="card-icon">🔧</div>
+                        <div>
+                            <div class="card-title">Xóa Lỗi Pin VinFast</div>
+                            <span class="card-ver" id="ver-vf">Phiên bản v1.3.5-VF-PIN</span>
+                        </div>
+                    </div>
+                    <p class="card-desc">Dành cho mạch ESP32 CYD (màn hình cảm ứng 2.8") xóa lỗi BMS pin VinFast qua giao tiếp BLE & CAN Bus.</p>
+                    <ul class="card-features">
+                        <li>Hiển thị trạng thái pin trực tiếp trên màn hình TFT</li>
+                        <li>Xóa mã lỗi BMS pin VinFast qua CAN Bus</li>
+                        <li>Hỗ trợ ESP32 Dev Module (ESP32-2432S028)</li>
+                    </ul>
+                </div>
+                <div>
+                    <esp-web-install-button manifest="/manifest-vf.json">
+                        <button slot="activate" class="btn-install btn-vf">
+                            🔧 Kết Nối &amp; Nạp VF Pin Tool
                         </button>
                     </esp-web-install-button>
                 </div>
@@ -8253,7 +8398,7 @@ const WEB_FLASHER_HTML = `<!DOCTYPE html>
         </div>
 
         <div class="footer">
-            Hệ Thống Giám Sát JK BMS WiFi Monitor &bull; Server: bms.lha.io.vn &bull; Tương thích ESP32-C3 / ESP32-C6 / ESP32
+            Hệ Thống Giám Sát JK BMS WiFi Monitor &bull; Server: bms.lha.io.vn &bull; ESP32-C3 / ESP32-C6 / ESP32 / ESP32 CYD
         </div>
     </div>
 
@@ -8261,6 +8406,29 @@ const WEB_FLASHER_HTML = `<!DOCTYPE html>
         if (!('serial' in navigator)) {
             document.getElementById('unsupported-alert').style.display = 'block';
         }
+
+        // Tự động đọc phiên bản mới nhất trực tiếp từ manifest của server
+        async function loadLiveVersions() {
+            const targets = [
+                { id: 'ver-ble', url: '/manifest-ble.json', prefix: 'Phiên bản ' },
+                { id: 'ver-rs485', url: '/manifest-rs485.json', prefix: 'Phiên bản ' },
+                { id: 'ver-bal', url: '/manifest-balancer.json', prefix: 'Phiên bản ' },
+                { id: 'ver-vf', url: '/manifest-vf.json', prefix: 'Phiên bản ' }
+            ];
+            for (const t of targets) {
+                try {
+                    const r = await fetch(t.url + '?t=' + Date.now());
+                    if (r.ok) {
+                        const data = await r.json();
+                        if (data && data.version) {
+                            const el = document.getElementById(t.id);
+                            if (el) el.textContent = t.prefix + data.version;
+                        }
+                    }
+                } catch (e) {}
+            }
+        }
+        loadLiveVersions();
     </script>
 </body>
 </html>
