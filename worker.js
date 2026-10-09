@@ -58,6 +58,137 @@ function isOnline(device) {
   return device.lastSeen && (Date.now() - device.lastSeen) < OFFLINE_MS;
 }
 
+function sortDevicesByOnlineAndName(a, b) {
+  const onA = a.online ? 1 : 0;
+  const onB = b.online ? 1 : 0;
+  if (onA !== onB) return onB - onA; // Online lên đầu tiên
+  const nA = (a.custom_name || a.device_id || '').trim();
+  const nB = (b.custom_name || b.device_id || '').trim();
+  const c = nA.localeCompare(nB, 'vi', { numeric: true, sensitivity: 'base' });
+  if (c !== 0) return c;
+  return (a.device_id || '').localeCompare(b.device_id || '', 'vi', { numeric: true, sensitivity: 'base' });
+}
+
+function isHardwareModelName(name, devModel) {
+  if (!name || typeof name !== 'string') return true;
+  const s = name.trim();
+  if (!s || s === '—' || s === '(Không có tên)' || s === 'null' || s === 'undefined') return true;
+  if (devModel && s.toLowerCase() === devModel.toLowerCase()) return true;
+  if (/^JK[_-]PB\d+/i.test(s)) return true;
+  if (/^JK[_-]B\d+A/i.test(s)) return true;
+  if (/^JK0[24]/i.test(s)) return true;
+  if (s === 'JK-BMS' || s === 'JK_BMS' || s.startsWith('JK-BMS [')) return true;
+  return false;
+}
+
+function getBleNameForMac(dev, mac) {
+  if (!dev || !mac) return null;
+  const norm = mac.toLowerCase().replace(/[:-]/g, '');
+  if (dev.ble_pack_names && dev.ble_pack_names[norm] && !isHardwareModelName(dev.ble_pack_names[norm], dev.modelName)) {
+    return dev.ble_pack_names[norm];
+  }
+  if (dev.scanned_devices && Array.isArray(dev.scanned_devices)) {
+    const found = dev.scanned_devices.find(item => (item.mac || '').toLowerCase().replace(/[:-]/g, '') === norm);
+    if (found && found.name && !isHardwareModelName(found.name, dev.modelName)) {
+      return found.name;
+    }
+  }
+  if (dev.packs_summary && Array.isArray(dev.packs_summary)) {
+    const found = dev.packs_summary.find(p => (p.mac || '').toLowerCase().replace(/[:-]/g, '') === norm);
+    if (found) {
+      if (found.alias && !isHardwareModelName(found.alias, dev.modelName)) return found.alias;
+      if (found.name && !isHardwareModelName(found.name, dev.modelName)) return found.name;
+    }
+  }
+  return null;
+}
+
+function resolveBmsDisplayName(dev) {
+  if (!dev) return 'JK-BMS';
+  const isBal = (dev.conn_type === 'uart_lcd' || dev.conn_type === 'balancer' || dev.conn_type_num === 3 || (dev.firmware_version && dev.firmware_version.includes('BALANCER')) || (dev.device_id && dev.device_id.startsWith('JKBAL')));
+  const isMod = !isBal && (dev.conn_type === 'rs485' || dev.conn_type === 'modbus' || dev.conn_type_num === 2 || (dev.firmware_version && dev.firmware_version.includes('RS485')) || (dev.device_id && dev.device_id.startsWith('JKMOD')));
+  if (isBal) return 'JK Active Balancer';
+  if (isMod) return dev.active_bms_name || 'JK-PB Modbus';
+
+  const normActiveMac = (dev.active_bms_mac || '').toLowerCase().replace(/[:-]/g, '');
+  if (normActiveMac) {
+    const bleName = getBleNameForMac(dev, normActiveMac);
+    if (bleName) return bleName;
+  }
+
+  if (dev.packs_summary && Array.isArray(dev.packs_summary) && dev.packs_summary.length > 0) {
+    let actPack = null;
+    if (normActiveMac) {
+      actPack = dev.packs_summary.find(p => (p.mac || '').toLowerCase().replace(/[:-]/g, '') === normActiveMac);
+    }
+    if (!actPack && dev.active_pack_idx !== undefined && dev.packs_summary[dev.active_pack_idx]) {
+      actPack = dev.packs_summary[dev.active_pack_idx];
+    }
+    if (actPack) {
+      if (actPack.alias && !isHardwareModelName(actPack.alias, dev.modelName)) return actPack.alias;
+      if (actPack.name && !isHardwareModelName(actPack.name, dev.modelName)) return actPack.name;
+      if (actPack.mac) {
+        const n = getBleNameForMac(dev, actPack.mac);
+        if (n) return n;
+      }
+    }
+  }
+
+  if (dev.active_bms_name && !isHardwareModelName(dev.active_bms_name, dev.modelName)) {
+    return dev.active_bms_name;
+  }
+  if (dev.active_pack_name && !isHardwareModelName(dev.active_pack_name, dev.modelName)) {
+    return dev.active_pack_name;
+  }
+  if (dev.active_pack_alias && !isHardwareModelName(dev.active_pack_alias, dev.modelName)) {
+    return dev.active_pack_alias;
+  }
+
+  if (dev.packs_summary && dev.packs_summary.length > 1) {
+    return 'Pack ' + ((dev.active_pack_idx || 0) + 1);
+  }
+  return dev.active_bms_name || 'JK-BMS';
+}
+
+function sanitizeDeviceBleNames(dev) {
+  if (!dev) return;
+  const isBal = (dev.conn_type === 'uart_lcd' || dev.conn_type === 'balancer' || dev.conn_type_num === 3 || (dev.firmware_version && dev.firmware_version.includes('BALANCER')) || (dev.device_id && dev.device_id.startsWith('JKBAL')));
+  const isMod = !isBal && (dev.conn_type === 'rs485' || dev.conn_type === 'modbus' || dev.conn_type_num === 2 || (dev.firmware_version && dev.firmware_version.includes('RS485')) || (dev.device_id && dev.device_id.startsWith('JKMOD')));
+  if (isBal || isMod) return;
+
+  dev.ble_pack_names = dev.ble_pack_names || {};
+
+  if (dev.scanned_devices && Array.isArray(dev.scanned_devices)) {
+    dev.scanned_devices.forEach(item => {
+      if (item.mac && item.name && !isHardwareModelName(item.name, dev.modelName)) {
+        const norm = item.mac.toLowerCase().replace(/[:-]/g, '');
+        dev.ble_pack_names[norm] = item.name.trim();
+      }
+    });
+  }
+
+  if (dev.packs_summary && Array.isArray(dev.packs_summary)) {
+    dev.packs_summary.forEach((p, idx) => {
+      const norm = (p.mac || '').toLowerCase().replace(/[:-]/g, '');
+      if (norm && dev.ble_pack_names[norm]) {
+        if (isHardwareModelName(p.name, dev.modelName)) {
+          p.name = dev.ble_pack_names[norm];
+        }
+        if (isHardwareModelName(p.alias, dev.modelName)) {
+          p.alias = dev.ble_pack_names[norm];
+        }
+      } else if (p.name && !isHardwareModelName(p.name, dev.modelName)) {
+        if (norm) dev.ble_pack_names[norm] = p.name.trim();
+      }
+    });
+  }
+
+  const resolved = resolveBmsDisplayName(dev);
+  if (resolved && !isHardwareModelName(resolved, dev.modelName)) {
+    dev.active_bms_name = resolved;
+  }
+}
+
 // ── D1 SQLite Storage Engine ────────────────────────────────────────────────
 // Zero-cost, 5M rows free tier, ultra-reliable persistent database
 async function d1Init(env) {
@@ -404,10 +535,27 @@ export default {
     // ── GET /api/firmware-info ─────────────────────────────────
     if (method === 'GET' && path === '/api/firmware-info') {
       try {
-        const typeQuery = (url.searchParams.get('type') || request.headers.get('X-Firmware-Type') || '').toLowerCase();
-        const isRs485Req = (typeQuery.includes('rs485') || typeQuery.includes('modbus'));
+        let typeQuery = (url.searchParams.get('type') || request.headers.get('X-Firmware-Type') || '').toLowerCase();
+        const reqDevId = (url.searchParams.get('device_id') || url.searchParams.get('dev') || request.headers.get('x-device-id') || '').trim().toUpperCase();
 
+        if (!typeQuery && reqDevId) {
+          let d = MEMORY_DEVICE_CACHE.get(reqDevId);
+          if (!d) d = await d1GetDevice(env, reqDevId);
+          if (d) {
+            if (d.conn_type === 'uart_lcd' || d.conn_type === 'balancer' || d.conn_type_num === 3 || d.firmware_version?.includes('BALANCER') || reqDevId.startsWith('JKBAL')) {
+              typeQuery = 'balancer';
+            } else if (d.conn_type === 'modbus' || d.conn_type === 'rs485' || d.conn_type_num === 2 || d.firmware_version?.includes('RS485') || reqDevId.startsWith('JKMOD')) {
+              typeQuery = 'rs485';
+            } else {
+              typeQuery = 'ble';
+            }
+          }
+        }
+
+        const isRs485Req = (typeQuery.includes('rs485') || typeQuery.includes('modbus'));
         const isBalReq   = typeQuery.includes('balancer') || typeQuery.includes('uart') || typeQuery.includes('bal');
+        const isBleReq   = !isBalReq && !isRs485Req && (typeQuery.includes('ble') || typeQuery.includes('bluetooth'));
+
         const [rawBle, rawRs485, rawBal] = await Promise.all([
           env.DEVICES.get('__firmware_ble_meta__'),
           env.DEVICES.get('__firmware_rs485_meta__'),
@@ -416,12 +564,24 @@ export default {
 
         const bleInfo    = rawBle ? JSON.parse(rawBle) : null;
         const rs485Info  = rawRs485 ? JSON.parse(rawRs485) : null;
-        const balInfo    = rawBal ? JSON.parse(rawBal) : { version: 'v1.0.4-BALANCER', size: 1048576, type: 'balancer' };
+        const balInfo    = rawBal ? JSON.parse(rawBal) : { version: 'v1.0.5-BALANCER', size: 1048576, type: 'balancer' };
 
-        const targetInfo = isBalReq ? balInfo : (isRs485Req ? (rs485Info || { version: 'none', size: 0 }) : (bleInfo || { version: 'none', size: 0 }));
+        // If caller didn't specify type, do NOT default to BLE! Return overview object.
+        if (!isBalReq && !isRs485Req && !isBleReq) {
+          return jsonResponse({
+            status: 'ok',
+            message: 'Vui lòng cung cấp tham số ?type=rs485, ?type=ble hoặc ?type=balancer',
+            ble: bleInfo ? { ...bleInfo, url: `${url.origin}/firmware/ble.bin` } : null,
+            rs485: rs485Info ? { ...rs485Info, url: `${url.origin}/firmware/rs485.bin` } : null,
+            balancer: balInfo ? { ...balInfo, url: `${url.origin}/firmware/balancer.bin` } : null
+          }, 200, corsHeaders);
+        }
+
+        const targetInfo = isBalReq ? balInfo : (isRs485Req ? (rs485Info || { version: 'none', size: 0, type: 'rs485' }) : (bleInfo || { version: 'none', size: 0, type: 'ble' }));
 
         return jsonResponse({
           ...targetInfo,
+          type: isBalReq ? 'balancer' : (isRs485Req ? 'rs485' : 'ble'),
           latest_version: targetInfo.version,
           firmware_url: isBalReq ? `${url.origin}/firmware/balancer.bin` : (isRs485Req ? `${url.origin}/firmware/rs485.bin` : `${url.origin}/firmware/ble.bin`),
           ble: bleInfo ? { ...bleInfo, url: `${url.origin}/firmware/ble.bin` } : null,
@@ -451,14 +611,8 @@ export default {
         let binKey = isBalReq ? '__latest_firmware_balancer_bin__' : (isRs485Req ? '__latest_firmware_rs485_bin__' : '__latest_firmware_ble_bin__');
 
         let bin = await env.DEVICES.get(binKey, { type: 'arrayBuffer' });
-        // Fallback an toàn sang BLE
-        if (!bin) {
-          bin = await env.DEVICES.get('__latest_firmware_ble_bin__', { type: 'arrayBuffer' });
-        }
-        if (!bin) {
-          bin = await env.DEVICES.get('__latest_firmware_bin__', { type: 'arrayBuffer' });
-        }
-        if (!bin) return new Response('Firmware not found', { status: 404 });
+        // Tuyệt đối không fallback sang BLE khi mạch RS485/Balancer yêu cầu file của nó
+        if (!bin) return new Response('Firmware not found for requested type: ' + (isBalReq ? 'balancer' : (isRs485Req ? 'rs485' : 'ble')), { status: 404 });
 
         if (method === 'HEAD') {
           return new Response(null, {
@@ -548,7 +702,8 @@ export default {
                   ...c,
                   target_type: targetType,
                   url: 'http://bms.lha.io.vn/api/ota-bin?type=' + targetType,
-                  version: isBal ? 'v1.0.4-BALANCER' : (isMod ? 'v2.9.2-RS485' : 'v2.9.0-BLE')
+                  version: isBal ? 'v1.0.5-BALANCER' : (isMod ? 'v2.9.9-RS485' : 'v3.0.1-BLE'),
+                  allow_cross_flash: false
                 };
               }
               return c;
@@ -579,18 +734,22 @@ export default {
           const isBal = !isBle && !isMod && dev && ((dev.conn_type === 'uart_lcd') || (dev.conn_type === 'balancer') || (dev.conn_type_num === 3) || (dev.firmware_version && dev.firmware_version.includes('BALANCER')) || (dev.device_id && dev.device_id.startsWith('JKBAL')));
           for (const c of cmdArr) {
             if (c && c.cmd === 'ota_update') {
+              const allowCross = !!c.allow_cross_flash;
               if (c.target_type === 'balancer' || (isBal && (!c.target_type || c.target_type === 'auto'))) {
                 c.target_type = 'balancer';
-                c.url = c.url || 'https://jkbms-cloud.jkbmscloud.workers.dev/firmware/balancer.bin';
-                c.version = c.version || 'v1.0.4-BALANCER';
+                c.url = c.url || 'http://bms.lha.io.vn/api/ota-bin?type=balancer';
+                c.version = c.version || 'v1.0.5-BALANCER';
+                c.allow_cross_flash = allowCross;
               } else if (c.target_type === 'rs485' || (isMod && (!c.target_type || c.target_type === 'auto'))) {
                 c.target_type = 'rs485';
-                c.url = c.url || 'https://jkbms-cloud.jkbmscloud.workers.dev/firmware/rs485.bin';
-                c.version = c.version || 'v2.9.8-RS485';
+                c.url = c.url || 'http://bms.lha.io.vn/api/ota-bin?type=rs485';
+                c.version = c.version || 'v2.9.9-RS485';
+                c.allow_cross_flash = allowCross;
               } else {
                 c.target_type = 'ble';
-                c.url = c.url || 'https://jkbms-cloud.jkbmscloud.workers.dev/firmware/ble.bin';
-                c.version = c.version || 'v2.9.7-BLE';
+                c.url = c.url || 'http://bms.lha.io.vn/api/ota-bin?type=ble';
+                c.version = c.version || 'v3.0.1-BLE';
+                c.allow_cross_flash = allowCross;
               }
             }
           }
@@ -626,6 +785,22 @@ export default {
                 dev.rs485DeviceId = numVal;
               }
               hasParams = true;
+            }
+            if (c && c.cmd === 'connect_bms' && c.mac && c.name) {
+              const norm = c.mac.toLowerCase().replace(/[:-]/g, '');
+              if (!isHardwareModelName(c.name, dev.modelName)) {
+                dev.ble_pack_names = dev.ble_pack_names || {};
+                dev.ble_pack_names[norm] = c.name.trim();
+                if (dev.packs_summary && Array.isArray(dev.packs_summary)) {
+                  const p = dev.packs_summary.find(pk => (pk.mac || '').toLowerCase().replace(/[:-]/g, '') === norm);
+                  if (p) {
+                    p.name = c.name.trim();
+                    p.alias = c.name.trim();
+                  }
+                }
+                dev.active_bms_name = c.name.trim();
+                hasParams = true;
+              }
             }
           }
           if (hasParams) {
@@ -813,6 +988,7 @@ export default {
           }
         }
       }
+      sanitizeDeviceBleNames(devObj);
 
       MEMORY_DEVICE_INDEX.add(deviceId);
       MEMORY_DEVICE_CACHE.set(deviceId, devObj);
@@ -882,12 +1058,12 @@ export default {
             return true;
           } else if (c.target_type === 'rs485') {
             c.url = c.url || 'https://jkbms-cloud.jkbmscloud.workers.dev/firmware/rs485.bin';
-            c.version = c.version || 'v2.9.8-RS485';
+            c.version = c.version || 'v2.9.9-RS485';
             return true;
           }
           // Tự động phân loại theo phần cứng thực tế đang heartbeat:
           c.url = c.url || ('https://jkbms-cloud.jkbmscloud.workers.dev/firmware/' + (isDeviceRs485 ? 'rs485.bin' : 'ble.bin'));
-          c.version = c.version || (isDeviceRs485 ? 'v2.9.8-RS485' : 'v2.9.7-BLE');
+          c.version = c.version || (isDeviceRs485 ? 'v2.9.9-RS485' : 'v3.0.1-BLE');
         }
         return true;
       });
@@ -1033,6 +1209,66 @@ export default {
         message: 'Đã xóa toàn bộ danh sách pack thành công',
         active_pack_idx: 0,
         packs_summary: []
+      }, 200, corsHeaders);
+    }
+
+    // ── POST /api/rename-pack (Đổi tên bộ pin Pack) ─────────────
+    if (method === 'POST' && (path === '/api/rename-pack' || path === '/api/set-pack-name')) {
+      let body = {};
+      try { body = await request.json(); } catch(e){}
+      const deviceId = body.device_id;
+      const newName = (body.name || '').trim();
+      let targetIdx = body.idx !== undefined ? parseInt(body.idx) : -1;
+      let targetMac = body.mac || '';
+      if (!deviceId) return jsonResponse({ error: 'Missing device_id' }, 400, corsHeaders);
+      if (!newName) return jsonResponse({ error: 'Tên pack không được để trống' }, 400, corsHeaders);
+
+      let devObj = MEMORY_DEVICE_CACHE.get(deviceId);
+      if (!devObj) {
+        devObj = await d1GetDevice(env, deviceId);
+      }
+      if (!devObj) return jsonResponse({ error: 'Device not found' }, 404, corsHeaders);
+
+      devObj.ble_pack_names = devObj.ble_pack_names || {};
+      if (devObj.packs_summary && Array.isArray(devObj.packs_summary)) {
+        let p = null;
+        if (targetIdx >= 0 && targetIdx < devObj.packs_summary.length) {
+          p = devObj.packs_summary[targetIdx];
+        } else if (targetMac) {
+          const norm = targetMac.toLowerCase().replace(/[:-]/g, '');
+          p = devObj.packs_summary.find(pk => (pk.mac || '').toLowerCase().replace(/[:-]/g, '') === norm);
+        }
+        if (p) {
+          p.name = newName;
+          p.alias = newName;
+          targetMac = p.mac || targetMac;
+          targetIdx = p.idx !== undefined ? p.idx : targetIdx;
+        }
+      }
+      if (targetMac) {
+        const norm = targetMac.toLowerCase().replace(/[:-]/g, '');
+        devObj.ble_pack_names[norm] = newName;
+        if (devObj.active_bms_mac && devObj.active_bms_mac.toLowerCase().replace(/[:-]/g, '') === norm) {
+          devObj.active_bms_name = newName;
+        }
+      }
+      MEMORY_DEVICE_CACHE.set(deviceId, devObj);
+      ctx.waitUntil(d1SaveDevice(env, devObj));
+
+      const cmd = { cmd: 'rename_pack', idx: targetIdx, mac: targetMac, name: newName };
+      let existing = MEMORY_COMMANDS_MAP.get(deviceId) || [];
+      existing.push(cmd);
+      MEMORY_COMMANDS_MAP.set(deviceId, existing);
+      if (env.DEVICES) {
+        try { await env.DEVICES.put(`cmd:${deviceId}`, JSON.stringify(existing)); } catch(e){}
+      }
+      ctx.waitUntil(d1AddCommand(env, deviceId, cmd));
+
+      return jsonResponse({
+        status: 'ok',
+        message: 'Đã đổi tên pack thành ' + newName,
+        packs_summary: devObj.packs_summary,
+        active_bms_name: devObj.active_bms_name
       }, 200, corsHeaders);
     }
 
@@ -1377,6 +1613,66 @@ export default {
       }
     }
 
+    function normalizeDateStr(dStr) {
+      if (!dStr) return '';
+      let s = String(dStr).trim().replace(/[-. ]/g, '/');
+      const parts = s.split('/').filter(Boolean);
+      if (parts.length >= 2) {
+        const day = parts[0].padStart(2, '0');
+        const month = parts[1].padStart(2, '0');
+        return `${day}/${month}`;
+      }
+      return s;
+    }
+
+    function datesMatch(d1, d2) {
+      const n1 = normalizeDateStr(d1);
+      const n2 = normalizeDateStr(d2);
+      return !!(n1 && n2 && n1 === n2);
+    }
+
+    function getVnDateKey(timestamp) {
+      const d = new Date(timestamp || Date.now());
+      const formatter = new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Asia/Ho_Chi_Minh',
+        day: '2-digit',
+        month: '2-digit'
+      });
+      return formatter.format(d);
+    }
+
+    // Thuật toán giảm mẫu thông minh: Giữ nguyên các đỉnh sạc/xả cực đại và điểm đầu/cuối
+    function downsamplePoints(points, maxPoints = 200) {
+      if (!points || points.length <= maxPoints) return points;
+      const result = [];
+      const bucketSize = (points.length - 2) / (maxPoints - 2);
+
+      result.push(points[0]);
+
+      for (let i = 0; i < maxPoints - 2; i++) {
+        const start = Math.floor(i * bucketSize) + 1;
+        const end = Math.min(points.length - 1, Math.floor((i + 1) * bucketSize) + 1);
+        if (start >= end) {
+          if (start < points.length - 1) result.push(points[start]);
+          continue;
+        }
+
+        let maxAbsP = -1;
+        let peakIdx = start;
+        for (let j = start; j < end; j++) {
+          const absP = Math.abs(points[j].p || 0);
+          if (absP > maxAbsP) {
+            maxAbsP = absP;
+            peakIdx = j;
+          }
+        }
+        result.push(points[peakIdx]);
+      }
+
+      result.push(points[points.length - 1]);
+      return result;
+    }
+
     // ── GET /api/history (ACCURATE REAL MEASURED DATA ONLY) ──
     if (method === 'GET' && path === '/api/history') {
       try {
@@ -1399,10 +1695,12 @@ export default {
           } catch(e){}
         }
 
+        const realDaily = (dev && Array.isArray(dev.daily_history)) ? dev.daily_history : [];
+
         if (range === 'day' || range === '24h') {
           const startOfDay = new Date(now).setHours(0, 0, 0, 0);
-          const endOfDay = startOfDay + 24 * 3600 * 1000;
-          let pts = real24h ? real24h.filter(p => p.t >= startOfDay - 3600000) : [];
+          const endOfDay = now; // 00h đến thời gian hiện tại
+          let pts = real24h ? real24h.filter(p => p.t >= startOfDay - 3600000 && p.t <= now + 60000) : [];
 
           if (pts.length === 0 && dev && dev.voltage) {
             const timeStr = new Date(now).toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: 'Asia/Ho_Chi_Minh' });
@@ -1447,6 +1745,9 @@ export default {
             if ((p.c < -0.05 || p.p < 0) && Math.abs(p.p) > peakDsg) peakDsg = Math.abs(p.p);
           });
 
+          const totalRawPts = pts.length;
+          const sampledPts = downsamplePoints(pts, 200);
+
           return jsonResponse({
             status: 'ok',
             device_id: deviceId,
@@ -1456,9 +1757,9 @@ export default {
             start_ts: startOfDay,
             end_ts: endOfDay,
             current_ts: now,
-            points: pts,
+            points: sampledPts,
             summary: {
-              totalPoints: pts.length,
+              totalPoints: totalRawPts,
               peakChargeW: Math.round(peakChg),
               peakDischargeW: Math.round(peakDsg),
               currentSoc: (dev && dev.soc !== undefined) ? dev.soc : 0
@@ -1469,22 +1770,51 @@ export default {
         if (range === 'week' || range === '7d') {
           const days = [];
           const dayNames = ['CN', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7'];
-          const todayStr = new Date(now).toLocaleDateString('vi-VN', { day: '2-digit', month: '2-digit', timeZone: 'Asia/Ho_Chi_Minh' });
+          let totalChg = 0;
+          let totalDsg = 0;
+
           for (let i = 6; i >= 0; i--) {
-            const d = new Date(now - i * 86400000);
-            const dateStr = String(d.getDate()).padStart(2, '0') + '/' + String(d.getMonth() + 1).padStart(2, '0');
+            const targetTs = now - i * 86400000;
+            const dateStr = getVnDateKey(targetTs);
+            const d = new Date(targetTs);
             const dayName = (i === 0) ? 'Hôm nay' : dayNames[d.getDay()];
-            const isToday = (dateStr === todayStr);
+
+            const rec = realDaily.find(r => datesMatch(r.date, dateStr));
+            let chgKwh = rec ? parseFloat(rec.chgKwh.toFixed(2)) : 0;
+            let dsgKwh = rec ? parseFloat(rec.dsgKwh.toFixed(2)) : 0;
+            let minSoc = rec ? rec.minSoc : 0;
+            let maxSoc = rec ? rec.maxSoc : 0;
+            let hasData = !!rec && (rec.pointsCount > 0 || chgKwh > 0 || dsgKwh > 0);
+
+            if (i === 0 && dev) {
+              const liveChg = parseFloat((dev.today_chg_kwh || 0).toFixed(2));
+              const liveDsg = parseFloat((dev.today_dsg_kwh || 0).toFixed(2));
+              if (liveChg > 0 || liveDsg > 0) {
+                chgKwh = Math.max(chgKwh, liveChg);
+                dsgKwh = Math.max(dsgKwh, liveDsg);
+                hasData = true;
+              }
+              if (dev.soc !== undefined && dev.soc > 0) {
+                if (minSoc === 0) minSoc = dev.soc;
+                if (maxSoc === 0) maxSoc = dev.soc;
+                hasData = true;
+              }
+            }
+
+            totalChg += chgKwh;
+            totalDsg += dsgKwh;
+
             days.push({
               date: dateStr,
               dayName: dayName,
-              chgKwh: 0,
-              dsgKwh: 0,
-              minSoc: isToday && dev ? (dev.soc || 0) : 0,
-              maxSoc: isToday && dev ? (dev.soc || 0) : 0,
-              hasData: isToday && !!dev
+              chgKwh: chgKwh,
+              dsgKwh: dsgKwh,
+              minSoc: minSoc,
+              maxSoc: maxSoc,
+              hasData: hasData
             });
           }
+
           return jsonResponse({
             status: 'ok',
             device_id: deviceId,
@@ -1492,26 +1822,127 @@ export default {
             unit: 'kWh',
             is_real_data: true,
             days: days,
-            summary: { totalChgKwh: 0, totalDsgKwh: 0, recordedDays: dev ? 1 : 0 }
+            summary: {
+              totalChgKwh: parseFloat(totalChg.toFixed(2)),
+              totalDsgKwh: parseFloat(totalDsg.toFixed(2)),
+              recordedDays: days.filter(d => d.hasData).length
+            }
           }, 200, corsHeaders);
         }
 
         if (range === 'month' || range === '30d') {
           const days = [];
+          let totalChg = 0;
+          let totalDsg = 0;
+
           for (let i = 29; i >= 0; i--) {
-            const d = new Date(now - i * 86400000);
-            const dateStr = String(d.getDate()).padStart(2, '0') + '/' + String(d.getMonth() + 1).padStart(2, '0');
-            days.push({ date: dateStr, chgKwh: 0, dsgKwh: 0, minSoc: 0, maxSoc: 0, hasData: (i === 0 && !!dev) });
+            const targetTs = now - i * 86400000;
+            const dateStr = getVnDateKey(targetTs);
+            const rec = realDaily.find(r => datesMatch(r.date, dateStr));
+            let chgKwh = rec ? parseFloat(rec.chgKwh.toFixed(2)) : 0;
+            let dsgKwh = rec ? parseFloat(rec.dsgKwh.toFixed(2)) : 0;
+            let minSoc = rec ? rec.minSoc : 0;
+            let maxSoc = rec ? rec.maxSoc : 0;
+            let hasData = !!rec && (rec.pointsCount > 0 || chgKwh > 0 || dsgKwh > 0);
+
+            if (i === 0 && dev) {
+              const liveChg = parseFloat((dev.today_chg_kwh || 0).toFixed(2));
+              const liveDsg = parseFloat((dev.today_dsg_kwh || 0).toFixed(2));
+              if (liveChg > 0 || liveDsg > 0) {
+                chgKwh = Math.max(chgKwh, liveChg);
+                dsgKwh = Math.max(dsgKwh, liveDsg);
+                hasData = true;
+              }
+              if (dev.soc !== undefined && dev.soc > 0) {
+                if (minSoc === 0) minSoc = dev.soc;
+                if (maxSoc === 0) maxSoc = dev.soc;
+                hasData = true;
+              }
+            }
+
+            totalChg += chgKwh;
+            totalDsg += dsgKwh;
+
+            days.push({
+              date: dateStr,
+              chgKwh: chgKwh,
+              dsgKwh: dsgKwh,
+              minSoc: minSoc,
+              maxSoc: maxSoc,
+              hasData: hasData
+            });
           }
-          return jsonResponse({ status: 'ok', device_id: deviceId, range: 'month', unit: 'kWh', is_real_data: true, days: days, summary: { totalChgKwh: 0, totalDsgKwh: 0, recordedDays: dev ? 1 : 0 } }, 200, corsHeaders);
+
+          return jsonResponse({
+            status: 'ok',
+            device_id: deviceId,
+            range: 'month',
+            unit: 'kWh',
+            is_real_data: true,
+            days: days,
+            summary: {
+              totalChgKwh: parseFloat(totalChg.toFixed(2)),
+              totalDsgKwh: parseFloat(totalDsg.toFixed(2)),
+              recordedDays: days.filter(d => d.hasData).length
+            }
+          }, 200, corsHeaders);
         }
 
         if (range === 'year' || range === '12m') {
           const months = [];
+          let totalChg = 0;
+          let totalDsg = 0;
+          const currentMonthIdx = (new Date()).getMonth() + 1;
+
           for (let m = 0; m < 12; m++) {
-            months.push({ month: 'T' + (m + 1), monthIdx: m + 1, chgKwh: 0, dsgKwh: 0, hasData: false });
+            const mName = 'T' + (m + 1);
+            let mChg = 0;
+            let mDsg = 0;
+            let hasData = false;
+
+            realDaily.forEach(r => {
+              const norm = normalizeDateStr(r.date);
+              const parts = norm.split('/');
+              if (parts.length === 2 && parseInt(parts[1], 10) === (m + 1)) {
+                mChg += (r.chgKwh || 0);
+                mDsg += (r.dsgKwh || 0);
+                hasData = true;
+              }
+            });
+
+            if (m + 1 === currentMonthIdx && dev) {
+              const liveTodayChg = dev.today_chg_kwh || 0;
+              const liveTodayDsg = dev.today_dsg_kwh || 0;
+              if (mChg < liveTodayChg) mChg = liveTodayChg;
+              if (mDsg < liveTodayDsg) mDsg = liveTodayDsg;
+              if (liveTodayChg > 0 || liveTodayDsg > 0) hasData = true;
+            }
+
+            totalChg += mChg;
+            totalDsg += mDsg;
+
+            months.push({
+              month: mName,
+              monthIdx: m + 1,
+              chgKwh: parseFloat(mChg.toFixed(1)),
+              dsgKwh: parseFloat(mDsg.toFixed(1)),
+              hasData: hasData
+            });
           }
-          return jsonResponse({ status: 'ok', device_id: deviceId, range: 'year', unit: 'kWh', is_real_data: true, months: months, summary: { totalChgKwh: 0, totalDsgKwh: 0, cycleCount: (dev && dev.cycle_count) ? dev.cycle_count : 0 } }, 200, corsHeaders);
+
+          return jsonResponse({
+            status: 'ok',
+            device_id: deviceId,
+            range: 'year',
+            unit: 'kWh',
+            is_real_data: true,
+            months: months,
+            summary: {
+              totalChgKwh: parseFloat(totalChg.toFixed(1)),
+              totalDsgKwh: parseFloat(totalDsg.toFixed(1)),
+              cycleCount: (dev && dev.cycle_count) ? dev.cycle_count : 0
+            }
+          }, 200, corsHeaders);
         }
 
         return jsonResponse({ status: 'error', message: 'Invalid range' }, 400, corsHeaders);
@@ -1551,8 +1982,16 @@ export default {
             lastSeen: 0,
             connected: false
           };
-          MEMORY_DEVICE_CACHE.set(deviceId, existing);
+        }
+        if (body.claim_code) {
+          existing.claim_code = String(body.claim_code).trim().toUpperCase();
+        }
+        MEMORY_DEVICE_CACHE.set(deviceId, existing);
+        if (env.DEVICES) {
           try { await env.DEVICES.put(`device:${deviceId}`, JSON.stringify(existing)); } catch(e){}
+        }
+        if (env.DB) {
+          ctx.waitUntil(d1SaveDevice(env, existing));
         }
 
         return jsonResponse({ status: 'ok', device_id: deviceId, total: MEMORY_DEVICE_INDEX.size }, 200, corsHeaders);
@@ -1679,6 +2118,7 @@ export default {
           }
         }
 
+        devices.sort(sortDevicesByOnlineAndName);
         return jsonResponse(devices, 200, corsHeaders);
       } catch (e) {
         return jsonResponse([], 200, corsHeaders);
@@ -1760,7 +2200,7 @@ export default {
     if (method === 'GET' && path === '/manifest-ble.json') {
       return jsonResponse({
         name: 'JK BMS Monitor - Bluetooth BLE',
-        version: 'v2.9.9-BLE',
+        version: 'v3.0.1-BLE',
         new_install_prompt_erase: false,
         builds: [
           { chipFamily: 'ESP32-C3', parts: [{ path: '/firmware/factory_ble.bin', offset: 0 }] },
@@ -1772,7 +2212,7 @@ export default {
     if (method === 'GET' && path === '/manifest-rs485.json') {
       return jsonResponse({
         name: 'JK BMS Monitor - RS485 Modbus RTU',
-        version: 'v2.9.8-RS485',
+        version: 'v2.9.9-RS485',
         new_install_prompt_erase: false,
         builds: [
           { chipFamily: 'ESP32-C3', parts: [{ path: '/firmware/factory_rs485.bin', offset: 0 }] },
@@ -1794,7 +2234,7 @@ export default {
     if (method === 'GET' && path === '/manifest-balancer.json') {
       return jsonResponse({
         name: 'JK Active Balancer - UART LCD TTL',
-        version: 'v1.0.4-BALANCER',
+        version: 'v1.0.5-BALANCER',
         new_install_prompt_erase: false,
         builds: [
           { chipFamily: 'ESP32-C3', parts: [{ path: '/firmware/factory_balancer.bin', offset: 0 }] },
@@ -2041,6 +2481,7 @@ export default {
             list.push({ device_id: id, custom_name: customNameMap.get(id) || id, online: false, connected: false, voltage: 0, soc: 0 });
           }
         }
+        list.sort(sortDevicesByOnlineAndName);
         return jsonResponse(list, 200, corsHeaders);
       } catch(e) {
         return jsonResponse({ error: e.message }, 500, corsHeaders);
@@ -2096,7 +2537,7 @@ export default {
 
       try {
         const body = await request.json();
-        const claimCode = (body.claim_code || '').trim().toUpperCase();
+        const claimCode = (body.claim_code || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
         const customName = (body.custom_name || '').trim();
 
         if (!claimCode) return jsonResponse({ error: 'Vui lòng nhập mã liên kết từ thiết bị (ví dụ: 8F2A1C)' }, 400, corsHeaders);
@@ -2104,7 +2545,8 @@ export default {
         // Find device in memory cache or D1
         let matchedDevId = null;
         for (const [id, dev] of MEMORY_DEVICE_CACHE.entries()) {
-          if (dev.claim_code && dev.claim_code.toUpperCase() === claimCode) {
+          const devCode = (dev.claim_code || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+          if (devCode && devCode === claimCode) {
             matchedDevId = id;
             break;
           }
@@ -2112,7 +2554,14 @@ export default {
 
         if (!matchedDevId && env.DB) {
           try {
-            const d1Dev = await env.DB.prepare('SELECT device_id FROM devices WHERE json_extract(data, "$.claim_code") = ?').bind(claimCode).first();
+            const d1Dev = await env.DB.prepare('SELECT device_id FROM devices WHERE UPPER(json_extract(data, "$.claim_code")) = ? OR json_extract(data, "$.claim_code") = ?').bind(claimCode, claimCode).first();
+            if (d1Dev) matchedDevId = d1Dev.device_id;
+          } catch(e) {}
+        }
+
+        if (!matchedDevId && env.DB) {
+          try {
+            const d1Dev = await env.DB.prepare('SELECT device_id FROM devices WHERE data LIKE ?').bind(`%"claim_code":"${claimCode}"%`).first();
             if (d1Dev) matchedDevId = d1Dev.device_id;
           } catch(e) {}
         }
@@ -2650,7 +3099,7 @@ function CUSTOMER_PORTAL_HTML(user) {
   <div class="nav-right">
     <div class="user-badge">
       <span>👤</span>
-      <span>${safeName}</span>
+      <span>Quý Khách</span>
     </div>
     <button onclick="openAddModal()" class="btn-add">➕ Thêm Bộ Pin</button>
     <button onclick="logoutUser()" class="btn-logout" title="Đăng Xuất">🚪</button>
@@ -2702,7 +3151,11 @@ function CUSTOMER_PORTAL_HTML(user) {
       <form onsubmit="handleClaimDevice(event)">
         <div class="form-group">
           <label>Mã Liên Kết (Gồm 6 ký tự, ví dụ: 8F2A1C)</label>
-          <input type="text" id="claim-code-input" placeholder="Dán mã liên kết vào đây..." required style="font-family:monospace;font-size:1.15rem;font-weight:800;letter-spacing:2px;text-transform:uppercase;text-align:center;">
+          <div style="display:flex;gap:8px;align-items:center;">
+            <input type="text" id="claim-code-input" placeholder="Dán mã vào đây..." required maxlength="10" autocomplete="off" autocorrect="off" autocapitalize="characters" spellcheck="false" style="flex:1;font-family:monospace;font-size:1.15rem;font-weight:800;letter-spacing:2px;text-transform:uppercase;text-align:center;">
+            <button type="button" id="btn-paste-claim" onclick="pasteClaimCodeFromClipboard()" style="background:var(--surface2);border:1px solid var(--cyan);color:var(--cyan);border-radius:10px;padding:10px 14px;font-size:0.85rem;font-weight:700;cursor:pointer;white-space:nowrap;display:flex;align-items:center;gap:6px;transition:all 0.2s;">📋 Dán Mã</button>
+          </div>
+          <div id="claim-paste-status" style="display:none;font-size:0.75rem;margin-top:5px;font-weight:600;"></div>
         </div>
         <div class="form-group">
           <label>Đặt Tên Gợi Nhớ (Tùy chọn)</label>
@@ -2737,6 +3190,46 @@ function CUSTOMER_PORTAL_HTML(user) {
 </div>
 
 <script>
+  async function pasteClaimCodeFromClipboard() {
+    const inp = document.getElementById('claim-code-input');
+    const status = document.getElementById('claim-paste-status');
+    if (!inp) return;
+    let pastedText = '';
+    if (navigator.clipboard && navigator.clipboard.readText) {
+      try {
+        pastedText = await navigator.clipboard.readText();
+      } catch(e) {}
+    }
+    if (!pastedText) {
+      try {
+        inp.focus();
+        inp.select();
+        document.execCommand('paste');
+        pastedText = inp.value;
+      } catch(e) {}
+    }
+    if (!pastedText) {
+      pastedText = prompt('Vui lòng dán mã liên kết (6 ký tự) vào đây:') || '';
+    }
+    const clean = (pastedText || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (clean) {
+      inp.value = clean;
+      if (status) {
+        status.style.display = 'block';
+        status.style.color = 'var(--green)';
+        status.textContent = '✅ Đã dán mã: ' + clean;
+        setTimeout(() => { status.style.display = 'none'; }, 3000);
+      }
+    } else {
+      if (status) {
+        status.style.display = 'block';
+        status.style.color = 'var(--danger)';
+        status.textContent = '⚠️ Bộ nhớ tạm chưa có mã liên kết!';
+        setTimeout(() => { status.style.display = 'none'; }, 3000);
+      }
+    }
+  }
+
   function togglePass(id, btn) {
     const el = document.getElementById(id);
     if (!el) return;
@@ -2755,8 +3248,26 @@ function CUSTOMER_PORTAL_HTML(user) {
     document.getElementById('add-modal').style.display = 'flex';
     setTimeout(() => {
       const inp = document.getElementById('claim-code-input');
-      if (inp) inp.focus();
-    }, 100);
+      if (inp) {
+        inp.focus();
+        // Tự động kiểm tra clipboard nếu ô input còn trống
+        if (!inp.value && navigator.clipboard && navigator.clipboard.readText) {
+          navigator.clipboard.readText().then(txt => {
+            const clean = (txt || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+            if (clean && clean.length >= 5 && clean.length <= 8) {
+              inp.value = clean;
+              const status = document.getElementById('claim-paste-status');
+              if (status) {
+                status.style.display = 'block';
+                status.style.color = 'var(--green)';
+                status.textContent = '📋 Tự động nhận mã từ bộ nhớ tạm: ' + clean;
+                setTimeout(() => { status.style.display = 'none'; }, 3500);
+              }
+            }
+          }).catch(() => {});
+        }
+      }
+    }, 150);
   }
   function closeAddModal() {
     document.getElementById('add-modal').style.display = 'none';
@@ -2900,6 +3411,16 @@ function CUSTOMER_PORTAL_HTML(user) {
         }
         return;
       }
+
+      list.sort((a, b) => {
+        const onA = a.online ? 1 : 0;
+        const onB = b.online ? 1 : 0;
+        if (onA !== onB) return onB - onA; // Online lên đầu tiên
+        const nA = (a.custom_name || a.device_id || '').trim();
+        const nB = (b.custom_name || b.device_id || '').trim();
+        const c = nA.localeCompare(nB, 'vi', { numeric: true, sensitivity: 'base' });
+        return c !== 0 ? c : (a.device_id || '').localeCompare(b.device_id || '', 'vi', { numeric: true, sensitivity: 'base' });
+      });
 
       let onlineCnt = 0;
       let offlineCnt = 0;
@@ -3473,6 +3994,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
           cmd: {
             cmd: 'ota_update',
             target_type: forceType || 'auto',
+            allow_cross_flash: !!forceType,
             version: 'v' + Date.now()
           }
         })
@@ -3625,6 +4147,16 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const devices = await res.json();
       
+      devices.sort(function(a, b) {
+        var onA = a.online ? 1 : 0;
+        var onB = b.online ? 1 : 0;
+        if (onA !== onB) return onB - onA; // Online lên đầu tiên
+        var nA = (a.custom_name || a.device_id || '').trim();
+        var nB = (b.custom_name || b.device_id || '').trim();
+        var c = nA.localeCompare(nB, 'vi', { numeric: true, sensitivity: 'base' });
+        return c !== 0 ? c : (a.device_id || '').localeCompare(b.device_id || '', 'vi', { numeric: true, sensitivity: 'base' });
+      });
+
       document.getElementById('stat-online').textContent = devices.filter(function(d){ return d.online; }).length;
       document.getElementById('stat-offline').textContent = devices.filter(function(d){ return !d.online; }).length;
       document.getElementById('stat-total').textContent = devices.length;
@@ -4471,8 +5003,8 @@ function CUSTOMER_DEVICE_HTML(d) {
   const statusColor = online ? (bmsConnected ? '#3fb950' : '#f59e0b') : '#f85149';
   const statusText  = online ? (bmsConnected ? 'Online' : 'Đang kết nối lại...') : 'Offline';
   const rssiVal     = d.rssi ? d.rssi + ' dBm' : '—';
-  const reg = d.activatedAtStr || '—';
-  const bmsDisplayName = (d.active_bms_name && d.active_bms_name !== 'JK_PB2A16S15P' && !d.active_bms_name.startsWith('JK-BMS [') ? d.active_bms_name : null) || d.active_pack_name || d.active_pack_alias || d.active_bms_name || 'JK-BMS';
+  sanitizeDeviceBleNames(d);
+  const bmsDisplayName = resolveBmsDisplayName(d);
 
   // Pack Selector data
   const packsSummary = (d.packs_summary && Array.isArray(d.packs_summary) && d.packs_summary.length > 1) ? d.packs_summary : null;
@@ -4502,6 +5034,7 @@ function CUSTOMER_DEVICE_HTML(d) {
   const initMins = Math.floor((initSec % 3600) / 60);
   const initS = Math.floor(initSec % 60);
   const runtimeStr = `${initDays}d ${initHours.toString().padStart(2,'0')}h ${initMins.toString().padStart(2,'0')}m ${initS.toString().padStart(2,'0')}s`;
+  const regDateStr = d.activatedAtStr || (d.registeredAt ? new Date(d.registeredAt).toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' }) : 'Chưa kích hoạt');
 
   const getParamVal = (reg, sKey, formatFn) => {
     let val = undefined;
@@ -5405,13 +5938,11 @@ function CUSTOMER_DEVICE_HTML(d) {
                     </div>
                 </div>
 
-                <!-- RANGE SELECTOR BUTTONS (REALTIME / 24H / 7 NGÀY / THÁNG / NĂM) -->
+                <!-- RANGE SELECTOR BUTTONS (24H / 7 NGÀY / THÁNG) -->
                 <div style="display:flex; gap:4px; margin-bottom:10px; background:rgba(0,0,0,0.5); padding:3px; border-radius:8px; border:1px solid rgba(255,255,255,0.08);">
-                    <button type="button" id="btn-range-realtime" onclick="setChartRange('realtime')" class="chart-tab-btn active">🔴 Realtime</button>
-                    <button type="button" id="btn-range-day" onclick="setChartRange('day')" class="chart-tab-btn">24 Giờ</button>
+                    <button type="button" id="btn-range-day" onclick="setChartRange('day')" class="chart-tab-btn active">24 Giờ</button>
                     <button type="button" id="btn-range-week" onclick="setChartRange('week')" class="chart-tab-btn">7 Ngày</button>
                     <button type="button" id="btn-range-month" onclick="setChartRange('month')" class="chart-tab-btn">Tháng</button>
-                    <button type="button" id="btn-range-year" onclick="setChartRange('year')" class="chart-tab-btn">Năm</button>
                 </div>
 
                 <div style="position:relative; width:100%; height:180px; background:#0b0f19; border-radius:10px; border:1px solid rgba(255,255,255,0.08); overflow:hidden;">
@@ -5419,9 +5950,9 @@ function CUSTOMER_DEVICE_HTML(d) {
                 </div>
 
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-top:8px; font-size:0.68rem; color:#64748b;">
-                    <span id="chart-footer-left">◀ 60s gần nhất</span>
-                    <span id="chart-footer-center">Trục 0W ở giữa • Phía trên: Sạc 🟢 • Phía dưới: Xả 🟠 • Đường xanh: % Pin 🔵</span>
-                    <span id="chart-footer-right">Hiện tại ▶</span>
+                    <span id="chart-footer-left">00:00</span>
+                    <span id="chart-footer-center">Hôm nay: Đo thực tế từ 00h đến hiện tại • Chạm để xem chi tiết</span>
+                    <span id="chart-footer-right">Hiện tại</span>
                 </div>
 
                 <!-- BẢNG THỐNG KÊ CHI TIẾT DỮ LIỆU SẠC & XẢ PIN -->
@@ -5534,7 +6065,7 @@ function CUSTOMER_DEVICE_HTML(d) {
                 <div class="card-row" id="row-dev-info-ble-rssi" style="display:${isModbus ? 'none' : 'flex'};"><span>Tín Hiệu BLE:</span><strong id="dev-info-ble-rssi" style="color:var(--cyan); font-family:monospace;">${(d.ble_rssi && d.ble_rssi !== 0) ? d.ble_rssi + ' dBm' : '—'}</strong></div>
                 <div class="card-row" id="row-dev-info-pin"><span>${isModbus ? 'Mã PIN BMS:' : 'Pass Kết Nối (Bluetooth):'}</span><strong id="dev-info-pin" style="color:#38bdf8; font-family:monospace;">${d.devicePasscode||d.device_passcode||'1234'}</strong></div>
                 <div class="card-row" id="row-dev-info-setup-pin"><span>Mật Khẩu Cài Đặt (Setup):</span><strong id="dev-info-setup-pin" style="color:var(--green); font-family:monospace;">${d.setup_passcode||d.setupPasscode||'123456'}</strong></div>
-                <div class="card-row"><span>Kích Hoạt:</span><strong id="dev-info-act" style="color:var(--green); font-size:0.75rem;">${reg}</strong></div>
+                <div class="card-row"><span>Kích Hoạt:</span><strong id="dev-info-act" style="color:var(--green); font-size:0.75rem;">${regDateStr}</strong></div>
             </div>
         </div>
 
@@ -5878,7 +6409,7 @@ function CUSTOMER_DEVICE_HTML(d) {
                     <div class="card-row"><span>Wi-Fi SSID:</span><strong style="color:#fff;" id="lbl-wifi-ssid">${d.ssid||'—'}</strong></div>
                     <div class="card-row"><span>Wi-Fi RSSI:</span><strong style="color:var(--cyan);" id="lbl-wifi-rssi">${d.rssi ? d.rssi + ' dBm' : '—'}</strong></div>
                     <div class="card-row"><span>Firmware:</span><strong style="color:var(--green);">${(d.firmware_version && d.firmware_version.startsWith('v')) ? d.firmware_version : ('v' + (d.firmware_version||'—'))}</strong></div>
-                    <div class="card-row"><span>Ngày Kích Hoạt:</span><strong style="color:var(--green); font-size:0.75rem;">${reg}</strong></div>
+                    <div class="card-row"><span>Ngày Kích Hoạt:</span><strong style="color:var(--green); font-size:0.75rem;">${regDateStr}</strong></div>
                 </div>
                 <button onclick="resetWifi()" class="btn btn-sec" style="border-color:var(--red); color:var(--red); margin-top:14px;">♻️ Reset Cài Đặt Wi-Fi ESP32</button>
             </div>
@@ -5943,15 +6474,13 @@ function CUSTOMER_DEVICE_HTML(d) {
     }
 
     // ── ULTRA-SMOOTH BÉZIER SPLINE & DUAL-ZONE NEON CHART ENGINE ──
-    var currentChartRange = 'realtime';
-    var chartHistory = [];
-    var MAX_CHART_POINTS = 60;
+    var currentChartRange = 'day';
     var cachedHistoryData = {};
     var activeHoverPoint = null;
 
     function setChartRange(range) {
         currentChartRange = range;
-        var ranges = ['realtime', 'day', 'week', 'month', 'year'];
+        var ranges = ['day', 'week', 'month'];
         ranges.forEach(function(r) {
             var b = document.getElementById('btn-range-' + r);
             if (b) {
@@ -5962,61 +6491,47 @@ function CUSTOMER_DEVICE_HTML(d) {
 
         var liveInd = document.getElementById('chart-live-indicator');
         if (liveInd) {
-            liveInd.style.display = (range === 'realtime') ? 'inline-block' : 'none';
+            liveInd.style.display = 'none';
         }
 
         var mTitle = document.getElementById('chart-main-title');
         if (mTitle) {
-            if (range === 'realtime') mTitle.textContent = 'Biểu Đồ Sạc / Xả & SOC (Realtime)';
-            else if (range === 'day') mTitle.textContent = 'Biểu Đồ Đo Thực Tế 24 Giờ';
+            if (range === 'day') mTitle.textContent = 'Biểu Đồ Đo Thực Tế Hôm Nay (00h → Hiện tại)';
             else if (range === 'week') mTitle.textContent = 'Sản Lượng Điện Thực Tế (7 Ngày)';
             else if (range === 'month') mTitle.textContent = 'Sản Lượng Điện Theo Ngày (Tháng)';
-            else if (range === 'year') mTitle.textContent = 'Sản Lượng Điện Năm (12 Tháng)';
         }
 
         activeHoverPoint = null;
-
-        if (range === 'realtime') {
-            var fCenter = document.getElementById('chart-footer-center');
-            if (fCenter) fCenter.textContent = 'Trục 0W ở giữa • Phía trên: Sạc 🟢 • Phía dưới: Xả 🟠 • Đường xanh: % Pin 🔵';
-            var fLeft = document.getElementById('chart-footer-left');
-            if (fLeft) fLeft.textContent = '◀ 60s gần nhất';
-            var fRight = document.getElementById('chart-footer-right');
-            if (fRight) fRight.textContent = 'Hiện tại ▶';
-            drawLiveChart();
-        } else {
-            loadAndDrawHistorical(range);
-        }
+        loadAndDrawHistorical(range);
     }
 
     function pushChartPoint(powerW, socPct, currentA) {
         var p = parseFloat(powerW) || 0;
         var s = Math.min(100, Math.max(0, parseFloat(socPct) || 0));
         var c = parseFloat(currentA) || 0;
-        
         var sp = (c < -0.05) ? -Math.abs(p) : ((c > 0.05) ? Math.abs(p) : 0);
 
         var now = new Date();
         var timeStr = now.toTimeString().split(' ')[0];
         var volt = (window._lastDevData && window._lastDevData.voltage) ? parseFloat(window._lastDevData.voltage) : 0;
 
-        chartHistory.push({
-            power: p,
-            signedPower: sp,
-            soc: s,
-            current: c,
-            voltage: volt,
-            time: timeStr,
-            ts: Date.now()
-        });
-
-        if (chartHistory.length > MAX_CHART_POINTS) {
-            chartHistory.shift();
-        }
-
-        if (currentChartRange === 'realtime') {
+        if (currentChartRange === 'day' && cachedHistoryData['day'] && cachedHistoryData['day'].points) {
+            var pts = cachedHistoryData['day'].points;
+            var newPt = {
+                t: Date.now(),
+                time: timeStr,
+                p: p,
+                s: s,
+                v: volt,
+                c: c
+            };
+            pts.push(newPt);
+            if (pts.length > 250) {
+                cachedHistoryData['day'].points = downsamplePoints(pts, 200);
+            }
+            cachedHistoryData['day'].end_ts = Date.now();
             updateLiveBadges(sp, s, c);
-            drawLiveChart();
+            drawHistoricalChart('day', cachedHistoryData['day']);
         }
     }
 
@@ -6104,284 +6619,53 @@ function CUSTOMER_DEVICE_HTML(d) {
         }
     }
 
-    function drawLiveChart() {
-        if (currentChartRange !== 'realtime') return;
-        var canvas = document.getElementById('bms-live-chart');
-        if (!canvas) return;
-        var ctx = canvas.getContext('2d');
-        if (!ctx) return;
-
-        var rect = canvas.getBoundingClientRect();
-        if (rect.width === 0 || rect.height === 0) return;
-
-        var dpr = window.devicePixelRatio || 1;
-        var targetW = Math.round(rect.width * dpr);
-        var targetH = Math.round(rect.height * dpr);
-        if (canvas.width !== targetW || canvas.height !== targetH) {
-            canvas.width = targetW;
-            canvas.height = targetH;
-        }
-
-        var w = canvas.width;
-        var h = canvas.height;
-        ctx.clearRect(0, 0, w, h);
-
-        if (chartHistory.length < 1) {
-            ctx.fillStyle = '#64748b';
-            ctx.font = (12 * dpr) + 'px sans-serif';
-            ctx.textAlign = 'center';
-            ctx.fillText('Đang chờ dữ liệu realtime...', w / 2, h / 2);
-            return;
-        }
-
-        var padL = 52 * dpr;
-        var padR = 42 * dpr;
-        var padT = 16 * dpr;
-        var padB = 22 * dpr;
-        var plotW = w - padL - padR;
-        var plotH = h - padT - padB;
-        if (plotW <= 10 || plotH <= 10) return;
-
-        // Thang đo công suất đối xứng (Symmetrical Zero Line ở chính giữa)
-        var maxPeak = 100;
-        for (var i = 0; i < chartHistory.length; i++) {
-            var item = chartHistory[i];
-            var sp = item.signedPower !== undefined ? item.signedPower : ((item.current < -0.05) ? -Math.abs(item.power) : Math.abs(item.power));
-            var absP = Math.abs(sp);
-            if (absP > maxPeak) maxPeak = absP;
-        }
-        var maxScale = Math.ceil((maxPeak * 1.15) / 100) * 100;
-        if (maxScale < 200) maxScale = 200;
-
-        var zeroY = padT + plotH / 2;
-        var halfH = plotH / 2;
-
-        // Lưới ngang tinh tế (5 mức: +100%, +50%, 0W, -50%, -100%)
-        ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
-        ctx.lineWidth = 1 * dpr;
-        ctx.setLineDash([3 * dpr, 3 * dpr]);
-
-        // Top line (+maxScale W / 100% SOC)
-        ctx.beginPath();
-        ctx.moveTo(padL, padT);
-        ctx.lineTo(w - padR, padT);
-        ctx.stroke();
-
-        // 25% height line (+maxScale/2 W / 75% SOC)
-        ctx.beginPath();
-        ctx.moveTo(padL, padT + plotH * 0.25);
-        ctx.lineTo(w - padR, padT + plotH * 0.25);
-        ctx.stroke();
-
-        // 75% height line (-maxScale/2 W / 25% SOC)
-        ctx.beginPath();
-        ctx.moveTo(padL, padT + plotH * 0.75);
-        ctx.lineTo(w - padR, padT + plotH * 0.75);
-        ctx.stroke();
-
-        // Bottom line (-maxScale W / 0% SOC)
-        ctx.beginPath();
-        ctx.moveTo(padL, padT + plotH);
-        ctx.lineTo(w - padR, padT + plotH);
-        ctx.stroke();
-
-        // Trục 0W cân đối ở CHÍNH GIỮA (Nét đứt sáng rõ)
-        ctx.strokeStyle = 'rgba(255, 255, 255, 0.22)';
-        ctx.lineWidth = 1.2 * dpr;
-        ctx.setLineDash([4 * dpr, 3 * dpr]);
-        ctx.beginPath();
-        ctx.moveTo(padL, zeroY);
-        ctx.lineTo(w - padR, zeroY);
-        ctx.stroke();
-        ctx.setLineDash([]);
-
-        // Số đo trục Trái (Watt)
-        ctx.font = 'bold ' + (8.5 * dpr) + 'px monospace';
-        ctx.textAlign = 'right';
-        ctx.fillStyle = '#22c55e';
-        ctx.fillText('+' + maxScale + 'W', padL - (4 * dpr), padT + (7 * dpr));
-
-        ctx.fillStyle = '#94a3b8';
-        ctx.fillText('+' + Math.round(maxScale / 2) + 'W', padL - (4 * dpr), padT + plotH * 0.25 + (3 * dpr));
-
-        ctx.fillStyle = '#cbd5e1';
-        ctx.fillText('0W', padL - (4 * dpr), zeroY + (3 * dpr));
-
-        ctx.fillStyle = '#94a3b8';
-        ctx.fillText('-' + Math.round(maxScale / 2) + 'W', padL - (4 * dpr), padT + plotH * 0.75 + (3 * dpr));
-
-        ctx.fillStyle = '#f97316';
-        ctx.fillText('-' + maxScale + 'W', padL - (4 * dpr), padT + plotH - (2 * dpr));
-
-        // Số đo trục Phải (SOC %)
-        ctx.textAlign = 'left';
-        ctx.fillStyle = '#38bdf8';
-        ctx.fillText('100%', w - padR + (4 * dpr), padT + (7 * dpr));
-        ctx.fillText('75%', w - padR + (4 * dpr), padT + plotH * 0.25 + (3 * dpr));
-        ctx.fillText('50%', w - padR + (4 * dpr), zeroY + (3 * dpr));
-        ctx.fillText('25%', w - padR + (4 * dpr), padT + plotH * 0.75 + (3 * dpr));
-        ctx.fillText('0%', w - padR + (4 * dpr), padT + plotH - (2 * dpr));
-
-        var numPts = chartHistory.length;
-        var stepX = plotW / Math.max(1, MAX_CHART_POINTS - 1);
-        var startX = padL + (MAX_CHART_POINTS - numPts) * stepX;
-
-        var pCoords = [];
-        var sCoords = [];
-        for (var k = 0; k < numPts; k++) {
-            var itm = chartHistory[k];
-            var ptSp = itm.signedPower !== undefined ? item.signedPower : ((itm.current < -0.05) ? -Math.abs(itm.power) : Math.abs(itm.power));
-            var px = startX + k * stepX;
-            var py = zeroY - (ptSp / maxScale) * halfH;
-            var sy = padT + plotH - (itm.soc / 100) * plotH;
-            pCoords.push({ x: px, y: py, sp: ptSp, raw: itm });
-            sCoords.push({ x: px, y: sy, raw: itm });
-        }
-
-        // Lọc làm mịn mượt mà 3 lượt Gaussian
-        var smoothP = smoothCoords(pCoords, 3);
-        var smoothS = smoothCoords(sCoords, 3);
-
-        // 3. Đường Công Suất Đơn Sắc Tinh Tế (Clean minimal line - không đổ màu nền, không glow)
-        var latestPt = chartHistory[numPts - 1];
-        var isDsg = latestPt.current < -0.05;
-        var pwrColor = isDsg ? '#f97316' : '#22c55e';
-
-        ctx.save();
-        ctx.strokeStyle = pwrColor;
-        ctx.lineWidth = 2 * dpr;
-        ctx.lineCap = 'round';
-        ctx.lineJoin = 'round';
-        ctx.beginPath();
-        traceSpline(ctx, smoothP);
-        ctx.stroke();
-        ctx.restore();
-
-        // 4. Đường SOC Nét Liền Mảnh Tinh Tế (Clean solid line)
-        ctx.save();
-        ctx.strokeStyle = '#38bdf8';
-        ctx.lineWidth = 1.8 * dpr;
-        ctx.lineCap = 'round';
-        ctx.lineJoin = 'round';
-        ctx.beginPath();
-        traceSpline(ctx, smoothS);
-        ctx.stroke();
-        ctx.restore();
-
-        // 5. Chấm định vị phẳng nhỏ gọn tại điểm đo mới nhất
-        var lastP = smoothP[smoothP.length - 1];
-        var lastS = smoothS[smoothS.length - 1];
-
-        ctx.fillStyle = '#38bdf8';
-        ctx.beginPath();
-        ctx.arc(lastS.x, lastS.y, 3 * dpr, 0, Math.PI * 2);
-        ctx.fill();
-
-        ctx.fillStyle = pwrColor;
-        ctx.beginPath();
-        ctx.arc(lastP.x, lastP.y, 3.5 * dpr, 0, Math.PI * 2);
-        ctx.fill();
-
-        // 6. Con trỏ cảm ứng/chuột (Crosshair & Floating Tooltip)
-        if (chartHoverIdx >= 0 && chartHoverIdx < smoothP.length) {
-            var hP = smoothP[chartHoverIdx];
-            var hS = smoothS[chartHoverIdx];
-            var rawItem = hP.raw || {};
-
-            // Đường gióng dọc (Vertical Crosshair)
-            ctx.save();
-            ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
-            ctx.lineWidth = 1 * dpr;
-            ctx.setLineDash([3 * dpr, 3 * dpr]);
-            ctx.beginPath();
-            ctx.moveTo(hP.x, padT);
-            ctx.lineTo(hP.x, padT + plotH);
-            ctx.stroke();
-            ctx.restore();
-
-            // Điểm nhấn giao điểm
-            ctx.save();
-            ctx.fillStyle = (hP.sp < -0.05) ? '#f97316' : '#22c55e';
-            ctx.strokeStyle = '#ffffff';
-            ctx.lineWidth = 1.6 * dpr;
-            ctx.beginPath();
-            ctx.arc(hP.x, hP.y, 4.5 * dpr, 0, Math.PI * 2);
-            ctx.fill();
-            ctx.stroke();
-
-            ctx.fillStyle = '#38bdf8';
-            ctx.beginPath();
-            ctx.arc(hS.x, hS.y, 4 * dpr, 0, Math.PI * 2);
-            ctx.fill();
-            ctx.stroke();
-            ctx.restore();
-
-            // Hộp Tooltip nổi trực tiếp trên canvas
-            var tipW = 126 * dpr;
-            var tipH = 58 * dpr;
-            var tipX = (hP.x > w / 2) ? (hP.x - tipW - 10 * dpr) : (hP.x + 10 * dpr);
-            var tipY = Math.max(padT + 4 * dpr, Math.min(padT + plotH - tipH - 4 * dpr, hP.y - tipH / 2));
-
-            ctx.save();
-            ctx.fillStyle = 'rgba(11, 15, 25, 0.95)';
-            ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
-            ctx.lineWidth = 1 * dpr;
-            ctx.beginPath();
-            if (ctx.roundRect) {
-                ctx.roundRect(tipX, tipY, tipW, tipH, 6 * dpr);
-            } else {
-                ctx.rect(tipX, tipY, tipW, tipH);
-            }
-            ctx.fill();
-            ctx.stroke();
-
-            var isDischarging = rawItem.current < -0.05;
-            var isCharging = rawItem.current > 0.05;
-            var pwrSign = isDischarging ? '-' : (isCharging ? '+' : '');
-            var pwrText = pwrSign + Math.abs(rawItem.power || 0).toFixed(1) + ' W';
-            var pwrTxtColor = isDischarging ? '#f97316' : (isCharging ? '#22c55e' : '#94a3b8');
-
-            ctx.font = 'bold ' + (8.5 * dpr) + 'px monospace';
-            ctx.textAlign = 'left';
-            ctx.fillStyle = '#94a3b8';
-            ctx.fillText('🕒 ' + (rawItem.time || 'Hiện tại'), tipX + 8 * dpr, tipY + 15 * dpr);
-
-            ctx.fillStyle = pwrTxtColor;
-            ctx.fillText('⚡ ' + (isDischarging ? 'Xả: ' : (isCharging ? 'Sạc: ' : 'P: ')) + pwrText, tipX + 8 * dpr, tipY + 31 * dpr);
-
-            var currStr = (rawItem.current !== undefined) ? (rawItem.current > 0 ? '+' : '') + rawItem.current.toFixed(1) + 'A' : '';
-            var voltStr = (rawItem.voltage) ? rawItem.voltage.toFixed(1) + 'V' : '';
-            var ivStr = (currStr || voltStr) ? (' • ' + currStr) : '';
-            ctx.fillStyle = '#38bdf8';
-            ctx.fillText('🔋 Pin: ' + (rawItem.soc || 0) + '%' + ivStr, tipX + 8 * dpr, tipY + 47 * dpr);
-            ctx.restore();
-        }
-    }
-
     function loadAndDrawHistorical(range) {
         var devId = (typeof _devId !== 'undefined' ? _devId : '') || (document.getElementById('head-device-id') ? document.getElementById('head-device-id').textContent.replace(/[()#]/g, '').trim() : '');
-        var canvas = document.getElementById('bms-live-chart');
-        if (canvas) {
-            var ctx = canvas.getContext('2d');
-            if (ctx) {
-                var dpr = window.devicePixelRatio || 1;
-                ctx.clearRect(0, 0, canvas.width, canvas.height);
-                ctx.fillStyle = '#64748b';
-                ctx.font = (12 * dpr) + 'px sans-serif';
-                ctx.textAlign = 'center';
-                ctx.fillText('Đang tải dữ liệu đo đạc thực tế...', canvas.width / 2, canvas.height / 2);
+        
+        // 1. Phản hồi tức thì 0ms nếu đã có dữ liệu cache (không chớp hay đơ giao diện)
+        if (cachedHistoryData[range]) {
+            drawHistoricalChart(range, cachedHistoryData[range]);
+        } else {
+            var canvas = document.getElementById('bms-live-chart');
+            if (canvas) {
+                var ctx = canvas.getContext('2d');
+                if (ctx) {
+                    var dpr = window.devicePixelRatio || 1;
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                    ctx.fillStyle = '#64748b';
+                    ctx.font = (12 * dpr) + 'px sans-serif';
+                    ctx.textAlign = 'center';
+                    ctx.fillText('Đang tải dữ liệu đo đạc thực tế...', canvas.width / 2, canvas.height / 2);
+                }
             }
         }
 
+        // Tải dữ liệu mới nhất ngầm từ server và cập nhật mượt mà
         fetch('/api/history?device_id=' + encodeURIComponent(devId) + '&range=' + encodeURIComponent(range))
             .then(function(res) { return res.json(); })
             .then(function(json) {
                 cachedHistoryData[range] = json;
-                drawHistoricalChart(range, json);
+                if (currentChartRange === range) {
+                    drawHistoricalChart(range, json);
+                }
             })
             .catch(function(err) {
                 console.error('[Chart History Error]', err);
             });
+    }
+
+    // Tự động tải trước dữ liệu 7 ngày và tháng sau khi mở trang để khi chuyển tab phản hồi NGAY LẬP TỨC
+    function prefetchHistory() {
+        var devId = (typeof _devId !== 'undefined' ? _devId : '') || (document.getElementById('head-device-id') ? document.getElementById('head-device-id').textContent.replace(/[()#]/g, '').trim() : '');
+        if (!devId) return;
+        ['week', 'month'].forEach(function(r) {
+            if (!cachedHistoryData[r]) {
+                fetch('/api/history?device_id=' + encodeURIComponent(devId) + '&range=' + encodeURIComponent(r))
+                    .then(function(res) { return res.json(); })
+                    .then(function(json) { cachedHistoryData[r] = json; })
+                    .catch(function() {});
+            }
+        });
     }
 
     function drawHistoricalChart(range, res) {
@@ -6422,7 +6706,7 @@ function CUSTOMER_DEVICE_HTML(d) {
         var fLeft = document.getElementById('chart-footer-left');
         var fRight = document.getElementById('chart-footer-right');
 
-        // ── MODE: 24 GIỜ (DAY) - BIPOLAR ZERO LINE SMOOTH SPLINE (FULL 24H DOMAIN 00:00 -> 24:00) ──
+        // ── MODE: 24 GIỜ (HÔM NAY TỪ 00:00 ĐẾN THỜI GIAN HIỆN TẠI) ──
         if (range === 'day') {
             var pts = res.points || [];
             if (pts.length === 0) {
@@ -6434,7 +6718,10 @@ function CUSTOMER_DEVICE_HTML(d) {
             }
 
             var startTs = res.start_ts || (new Date().setHours(0, 0, 0, 0));
-            var endTs = res.end_ts || (startTs + 24 * 3600 * 1000);
+            var endTs = res.end_ts || (res.current_ts || Date.now());
+            if (endTs <= startTs + 10 * 60 * 1000) {
+                endTs = startTs + 60 * 60 * 1000;
+            }
             var totalDuration = endTs - startTs;
 
             var maxPeak = 100;
@@ -6455,6 +6742,11 @@ function CUSTOMER_DEVICE_HTML(d) {
             var lastIsDsg = (lastPt.c < -0.05 || lastPt.p < 0);
             var lastColor = lastIsDsg ? '#f97316' : '#22c55e';
 
+            var nowD = new Date(endTs);
+            var curHH = String(nowD.getHours()).padStart(2, '0');
+            var curMM = String(nowD.getMinutes()).padStart(2, '0');
+            var curTimeStr = curHH + ':' + curMM;
+
             if (lbl1) lbl1.textContent = lastIsDsg ? 'Đang Xả:' : 'Đang Sạc:';
             if (lbl2) lbl2.textContent = 'SOC:';
             if (pBadge) {
@@ -6465,8 +6757,8 @@ function CUSTOMER_DEVICE_HTML(d) {
                 sBadge.textContent = lastPt.s + '% (' + (lastPt.v || 0) + 'V)';
             }
             if (fLeft) fLeft.textContent = '00:00';
-            if (fRight) fRight.textContent = '24:00 (Hiện tại ' + (lastPt.time ? lastPt.time.substring(0,5) : '') + ')';
-            if (fCenter) fCenter.textContent = 'Đo thực tế 24h: ' + pts.length + ' điểm • Cân xứng: ±' + maxScale + 'W • Chạm để xem chi tiết';
+            if (fRight) fRight.textContent = 'Hiện tại (' + curTimeStr + ')';
+            if (fCenter) fCenter.textContent = 'Hôm nay (00h → ' + curTimeStr + '): ' + pts.length + ' điểm • Cân xứng ±' + maxScale + 'W • Chạm để xem';
 
             // Lưới ngang đối xứng (5 mức)
             ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
@@ -6488,16 +6780,18 @@ function CUSTOMER_DEVICE_HTML(d) {
             ctx.stroke();
             ctx.setLineDash([]);
 
-            // Lưới dọc và các mốc giờ chuẩn 24H: 00:00, 04:00, 08:00, 12:00, 16:00, 20:00, 24:00
-            var timeMarks = [
-                { frac: 0.000, label: '00:00' },
-                { frac: 0.1667, label: '04:00' },
-                { frac: 0.3333, label: '08:00' },
-                { frac: 0.5000, label: '12:00' },
-                { frac: 0.6667, label: '16:00' },
-                { frac: 0.8333, label: '20:00' },
-                { frac: 1.000, label: '24:00' }
-            ];
+            // Tạo các mốc thời gian động từ 00:00 đến thời điểm hiện tại
+            var timeMarks = [];
+            timeMarks.push({ frac: 0.0, label: '00:00' });
+            var numIntervals = 4;
+            for (var m = 1; m < numIntervals; m++) {
+                var markTs = startTs + (totalDuration / numIntervals) * m;
+                var markD = new Date(markTs);
+                var mh = String(markD.getHours()).padStart(2, '0');
+                var mm = String(markD.getMinutes()).padStart(2, '0');
+                timeMarks.push({ frac: m / numIntervals, label: mh + ':' + mm });
+            }
+            timeMarks.push({ frac: 1.0, label: curTimeStr });
 
             ctx.strokeStyle = 'rgba(255, 255, 255, 0.06)';
             ctx.lineWidth = 1 * dpr;
@@ -6534,7 +6828,7 @@ function CUSTOMER_DEVICE_HTML(d) {
             ctx.fillText('25%', w - padR + (4 * dpr), padT + plotH * 0.75 + (3 * dpr));
             ctx.fillText('0%', w - padR + (4 * dpr), padT + plotH - (2 * dpr));
 
-            // TÍNH TOẠ ĐỘ X THỰC TẾ THEO THỜI GIAN TRÊN TRỤC 24H:
+            // TÍNH TOẠ ĐỘ X THỰC TẾ THEO THỜI GIAN (00h -> HIỆN TẠI):
             var pCoords = [];
             var sCoords = [];
             for (var k = 0; k < pts.length; k++) {
@@ -6549,7 +6843,7 @@ function CUSTOMER_DEVICE_HTML(d) {
                 sCoords.push({ x: px, y: sy, raw: itm });
             }
 
-            // Apply Silky Gaussian Smoothing
+            // Silky Gaussian Smoothing
             var smoothP = smoothCoords(pCoords, 3);
             var smoothS = smoothCoords(sCoords, 3);
 
@@ -6564,7 +6858,7 @@ function CUSTOMER_DEVICE_HTML(d) {
             ctx.stroke();
             ctx.restore();
 
-            // Clean SOC Line (Nét liền xanh dương)
+            // Clean SOC Line
             ctx.save();
             ctx.strokeStyle = '#38bdf8';
             ctx.lineWidth = 1.8 * dpr;
@@ -6572,19 +6866,6 @@ function CUSTOMER_DEVICE_HTML(d) {
             ctx.lineJoin = 'round';
             ctx.beginPath();
             traceSpline(ctx, smoothS);
-            ctx.stroke();
-            ctx.restore();
-
-            // Vạch chỉ báo thời điểm HIỆN TẠI (Current Time Marker)
-            var nowFrac = Math.max(0, Math.min(1, (Date.now() - startTs) / totalDuration));
-            var nowX = padL + nowFrac * plotW;
-            ctx.save();
-            ctx.strokeStyle = 'rgba(239, 68, 68, 0.7)';
-            ctx.lineWidth = 1.2 * dpr;
-            ctx.setLineDash([2 * dpr, 2 * dpr]);
-            ctx.beginPath();
-            ctx.moveTo(nowX, padT);
-            ctx.lineTo(nowX, padT + plotH);
             ctx.stroke();
             ctx.restore();
 
@@ -6683,7 +6964,7 @@ function CUSTOMER_DEVICE_HTML(d) {
                 ctx.restore();
             }
 
-            // VẼ CÁC NHÃN GIỜ 00:00, 04:00, 08:00, 12:00, 16:00, 20:00, 24:00 DƯỚI TRỤC X
+            // VẼ CÁC NHÃN GIỜ DƯỚI TRỤC X
             ctx.fillStyle = '#64748b';
             ctx.font = (8.5 * dpr) + 'px monospace';
             timeMarks.forEach(function(tm) {
@@ -6711,8 +6992,8 @@ function CUSTOMER_DEVICE_HTML(d) {
 
             if (lbl1) lbl1.textContent = 'Tổng sạc:';
             if (lbl2) lbl2.textContent = 'Tổng xả:';
-            if (pBadge && res.summary) { pBadge.textContent = res.summary.totalChgKwh + ' kWh'; pBadge.style.color = '#10b981'; }
-            if (sBadge && res.summary) { sBadge.textContent = res.summary.totalDsgKwh + ' kWh'; sBadge.style.color = '#f59e0b'; }
+            if (pBadge && res.summary) { pBadge.textContent = '+' + res.summary.totalChgKwh + ' kWh'; pBadge.style.color = '#10b981'; }
+            if (sBadge && res.summary) { sBadge.textContent = '-' + res.summary.totalDsgKwh + ' kWh'; sBadge.style.color = '#f59e0b'; }
             if (fLeft) fLeft.textContent = items[0].date || '';
             if (fRight) fRight.textContent = items[items.length - 1].date || 'Hôm nay';
             if (fCenter) fCenter.textContent = 'Đo thực tế: ' + (res.summary ? res.summary.recordedDays : 0) + '/' + items.length + ' ngày • Cột xanh: Sạc • Cột cam: Xả (kWh)';
@@ -6750,8 +7031,13 @@ function CUSTOMER_DEVICE_HTML(d) {
                 var grpX = padL + b * groupW;
                 var itm = items[b];
 
+                if (chartHoverIdx === b) {
+                    ctx.fillStyle = 'rgba(255, 255, 255, 0.06)';
+                    ctx.fillRect(grpX + (groupW * 0.05), padT, groupW * 0.9, plotH);
+                }
+
                 if (itm.hasData && (itm.chgKwh > 0 || itm.dsgKwh > 0)) {
-                    var chgH = (itm.chgKwh / maxKwh) * plotH;
+                    var chgH = Math.max(3 * dpr, (itm.chgKwh / maxKwh) * plotH);
                     var chgX = grpX + (groupW * 0.12);
                     var chgY = padT + plotH - chgH;
                     
@@ -6761,7 +7047,14 @@ function CUSTOMER_DEVICE_HTML(d) {
                     ctx.fillStyle = bGrad1;
                     ctx.fillRect(chgX, chgY, barW, chgH);
 
-                    var dsgH = (itm.dsgKwh / maxKwh) * plotH;
+                    if (range === 'week' && itm.chgKwh > 0) {
+                        ctx.fillStyle = '#10b981';
+                        ctx.font = 'bold ' + (7 * dpr) + 'px monospace';
+                        ctx.textAlign = 'center';
+                        ctx.fillText(itm.chgKwh.toFixed(1) + 'k', chgX + barW / 2, Math.max(padT + 9 * dpr, chgY - (3 * dpr)));
+                    }
+
+                    var dsgH = Math.max(3 * dpr, (itm.dsgKwh / maxKwh) * plotH);
                     var dsgX = chgX + barW + (1.5 * dpr);
                     var dsgY = padT + plotH - dsgH;
 
@@ -6770,13 +7063,20 @@ function CUSTOMER_DEVICE_HTML(d) {
                     bGrad2.addColorStop(1, 'rgba(245, 158, 11, 0.45)');
                     ctx.fillStyle = bGrad2;
                     ctx.fillRect(dsgX, dsgY, barW, dsgH);
+
+                    if (range === 'week' && itm.dsgKwh > 0) {
+                        ctx.fillStyle = '#f59e0b';
+                        ctx.font = 'bold ' + (7 * dpr) + 'px monospace';
+                        ctx.textAlign = 'center';
+                        ctx.fillText(itm.dsgKwh.toFixed(1) + 'k', dsgX + barW / 2, Math.max(padT + 9 * dpr, dsgY - (3 * dpr)));
+                    }
                 } else {
-                    ctx.fillStyle = 'rgba(255, 255, 255, 0.08)';
-                    ctx.fillRect(grpX + groupW / 2 - 1, padT + plotH - 2, 2, 2);
+                    ctx.fillStyle = 'rgba(255, 255, 255, 0.1)';
+                    ctx.fillRect(grpX + groupW * 0.2, padT + plotH - 2 * dpr, groupW * 0.6, 1.5 * dpr);
                 }
 
-                ctx.fillStyle = '#64748b';
-                ctx.font = (8.5 * dpr) + 'px monospace';
+                ctx.fillStyle = (b === nItems - 1) ? '#38bdf8' : '#64748b';
+                ctx.font = ((b === nItems - 1 ? 'bold ' : '') + (8.5 * dpr)) + 'px monospace';
                 ctx.textAlign = 'center';
                 if (range === 'week') {
                     ctx.fillText(itm.dayName || itm.date, grpX + groupW / 2, h - (6 * dpr));
@@ -6799,79 +7099,41 @@ function CUSTOMER_DEVICE_HTML(d) {
                     ctx.restore();
                 }
             }
-            return;
-        }
 
-        // ── MODE: 12 THÁNG (YEAR) ──
-        if (range === 'year') {
-            var months = res.months || [];
-            if (months.length === 0) return;
+            // TOOLTIP KHI HOVER / CHẠM TRÊN CỘT TUẦN / THÁNG
+            if (chartHoverIdx >= 0 && chartHoverIdx < nItems) {
+                var hItm = items[chartHoverIdx];
+                var hGrpX = padL + chartHoverIdx * groupW;
+                var tipW = 150 * dpr;
+                var tipH = 54 * dpr;
+                var tipX = hGrpX + groupW + 8 * dpr;
+                if (tipX + tipW > w - padR) tipX = hGrpX - tipW - 8 * dpr;
+                var tipY = padT + 10 * dpr;
 
-            var maxM = 5;
-            for (var y = 0; y < months.length; y++) {
-                if (months[y].chgKwh > maxM) maxM = months[y].chgKwh;
-                if (months[y].dsgKwh > maxM) maxM = months[y].dsgKwh;
-            }
-            maxM = Math.ceil(maxM * 1.25);
-            if (maxM < 5) maxM = 5;
-
-            if (lbl1) lbl1.textContent = 'Năm sạc:';
-            if (lbl2) lbl2.textContent = 'Năm xả:';
-            if (pBadge && res.summary) { pBadge.textContent = res.summary.totalChgKwh + ' kWh'; pBadge.style.color = '#10b981'; }
-            if (sBadge && res.summary) { sBadge.textContent = res.summary.totalDsgKwh + ' kWh'; sBadge.style.color = '#f59e0b'; }
-            if (fLeft) fLeft.textContent = 'Tháng 1';
-            if (fRight) fRight.textContent = 'Tháng 12';
-            if (fCenter) fCenter.textContent = 'Sản lượng thực tế năm (kWh) • Chu kỳ pin BMS: ' + (res.summary ? res.summary.cycleCount : 0) + ' cycles';
-
-            ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
-            ctx.lineWidth = 1 * dpr;
-            ctx.setLineDash([3 * dpr, 3 * dpr]);
-            for (var q = 0; q <= 3; q++) {
-                var gy3 = padT + (plotH / 3) * q;
+                ctx.save();
+                ctx.fillStyle = 'rgba(15, 23, 42, 0.94)';
+                ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
+                ctx.lineWidth = 1 * dpr;
                 ctx.beginPath();
-                ctx.moveTo(padL, gy3);
-                ctx.lineTo(w - padR, gy3);
+                if (ctx.roundRect) ctx.roundRect(tipX, tipY, tipW, tipH, 6 * dpr);
+                else ctx.rect(tipX, tipY, tipW, tipH);
+                ctx.fill();
                 ctx.stroke();
 
-                ctx.setLineDash([]);
+                ctx.font = 'bold ' + (8.5 * dpr) + 'px monospace';
+                ctx.textAlign = 'left';
+                ctx.fillStyle = '#94a3b8';
+                ctx.fillText('📅 ' + (hItm.dayName ? hItm.dayName + ' (' + hItm.date + ')' : hItm.date), tipX + 8 * dpr, tipY + 15 * dpr);
+
                 ctx.fillStyle = '#10b981';
-                ctx.font = 'bold ' + (9 * dpr) + 'px monospace';
-                ctx.textAlign = 'right';
-                var mVal = Math.round(maxM - (maxM / 3) * q);
-                ctx.fillText(mVal + 'k', padL - (4 * dpr), gy3 + (3 * dpr));
-                ctx.setLineDash([3 * dpr, 3 * dpr]);
+                ctx.fillText('⚡ Sạc: +' + (hItm.chgKwh || 0).toFixed(2) + ' kWh', tipX + 8 * dpr, tipY + 31 * dpr);
+
+                var socStr = hItm.maxSoc ? (' • ' + hItm.maxSoc + '%') : '';
+                ctx.fillStyle = '#f59e0b';
+                ctx.fillText('⚡ Xả: -' + (hItm.dsgKwh || 0).toFixed(2) + ' kWh' + socStr, tipX + 8 * dpr, tipY + 47 * dpr);
+                ctx.restore();
             }
-            ctx.setLineDash([]);
-
-            var grpW = plotW / 12;
-            var barWidth = Math.max(3 * dpr, (grpW * 0.35));
-
-            for (var m2 = 0; m2 < 12; m2++) {
-                var itmM = months[m2] || { chgKwh: 0, dsgKwh: 0, month: 'T' + (m2 + 1) };
-                var gX = padL + m2 * grpW;
-
-                if (itmM.hasData && (itmM.chgKwh > 0 || itmM.dsgKwh > 0)) {
-                    var cHeight = (itmM.chgKwh / maxM) * plotH;
-                    var cX2 = gX + (grpW * 0.12);
-                    var cY2 = padT + plotH - cHeight;
-                    ctx.fillStyle = '#10b981';
-                    ctx.fillRect(cX2, cY2, barWidth, cHeight);
-
-                    var dHeight = (itmM.dsgKwh / maxM) * plotH;
-                    var dX2 = cX2 + barWidth + (1.5 * dpr);
-                    var dY2 = padT + plotH - dHeight;
-                    ctx.fillStyle = '#f59e0b';
-                    ctx.fillRect(dX2, dY2, barWidth, dHeight);
-                } else {
-                    ctx.fillStyle = 'rgba(255, 255, 255, 0.08)';
-                    ctx.fillRect(gX + grpW / 2 - 1, padT + plotH - 2, 2, 2);
-                }
-
-                ctx.fillStyle = '#64748b';
-                ctx.font = (8.5 * dpr) + 'px monospace';
-                ctx.textAlign = 'center';
-                ctx.fillText(itmM.month, gX + grpW / 2, h - (6 * dpr));
-            }
+            return;
         }
     }
 
@@ -6886,31 +7148,22 @@ function CUSTOMER_DEVICE_HTML(d) {
             var scale = liveCanvas.width / rect.width;
             var canvasX = (clientX - rect.left) * scale;
 
-            var padL = 52 * dpr;
+            var padL = 48 * dpr;
             var padR = 42 * dpr;
             var plotW = liveCanvas.width - padL - padR;
 
-            if (currentChartRange === 'realtime' && chartHistory.length > 0) {
-                var numPts = chartHistory.length;
-                var stepX = plotW / Math.max(1, MAX_CHART_POINTS - 1);
-                var startX = padL + (MAX_CHART_POINTS - numPts) * stepX;
-                var nearestIdx = Math.round((canvasX - startX) / stepX);
-                nearestIdx = Math.max(0, Math.min(numPts - 1, nearestIdx));
-                if (chartHoverIdx !== nearestIdx) {
-                    chartHoverIdx = nearestIdx;
-                    drawLiveChart();
-                }
-            } else if (currentChartRange === 'day' && cachedHistoryData['day'] && cachedHistoryData['day'].points) {
+            if (currentChartRange === 'day' && cachedHistoryData['day'] && cachedHistoryData['day'].points) {
                 var pts = cachedHistoryData['day'].points;
                 if (pts.length > 0) {
                     var startTs = cachedHistoryData['day'].start_ts || (new Date().setHours(0, 0, 0, 0));
-                    var endTs = cachedHistoryData['day'].end_ts || (startTs + 24 * 3600 * 1000);
+                    var endTs = cachedHistoryData['day'].end_ts || (cachedHistoryData['day'].current_ts || Date.now());
+                    if (endTs <= startTs + 10 * 60 * 1000) endTs = startTs + 60 * 60 * 1000;
                     var totalDuration = endTs - startTs;
                     var bestDist = 999999;
                     var nearestIdx = 0;
                     for (var i = 0; i < pts.length; i++) {
                         var ptTime = pts[i].t || (startTs + (i / Math.max(1, pts.length - 1)) * totalDuration);
-                        var ptX = padL + ((ptTime - startTs) / totalDuration) * plotW;
+                        var ptX = padL + Math.max(0, Math.min(1, (ptTime - startTs) / totalDuration)) * plotW;
                         var dist = Math.abs(ptX - canvasX);
                         if (dist < bestDist) {
                             bestDist = dist;
@@ -6922,14 +7175,24 @@ function CUSTOMER_DEVICE_HTML(d) {
                         drawHistoricalChart('day', cachedHistoryData['day']);
                     }
                 }
+            } else if ((currentChartRange === 'week' || currentChartRange === 'month') && cachedHistoryData[currentChartRange] && cachedHistoryData[currentChartRange].days) {
+                var daysArr = cachedHistoryData[currentChartRange].days;
+                if (daysArr.length > 0) {
+                    var grpWidth = plotW / daysArr.length;
+                    var bIdx = Math.floor((canvasX - padL) / grpWidth);
+                    bIdx = Math.max(0, Math.min(daysArr.length - 1, bIdx));
+                    if (chartHoverIdx !== bIdx) {
+                        chartHoverIdx = bIdx;
+                        drawHistoricalChart(currentChartRange, cachedHistoryData[currentChartRange]);
+                    }
+                }
             }
         }
 
         function clearChartPointer() {
             if (chartHoverIdx !== -1) {
                 chartHoverIdx = -1;
-                if (currentChartRange === 'realtime') drawLiveChart();
-                else if (currentChartRange === 'day' && cachedHistoryData['day']) drawHistoricalChart('day', cachedHistoryData['day']);
+                if (cachedHistoryData[currentChartRange]) drawHistoricalChart(currentChartRange, cachedHistoryData[currentChartRange]);
             }
         }
 
@@ -6940,13 +7203,18 @@ function CUSTOMER_DEVICE_HTML(d) {
     }
 
     window.addEventListener('resize', function() {
-        if (currentChartRange === 'realtime') drawLiveChart();
-        else if (cachedHistoryData[currentChartRange]) drawHistoricalChart(currentChartRange, cachedHistoryData[currentChartRange]);
+        if (cachedHistoryData[currentChartRange]) drawHistoricalChart(currentChartRange, cachedHistoryData[currentChartRange]);
     });
 
     try {
         pushChartPoint(${parseFloat(power) || 0}, ${parseFloat(soc) || 0}, ${parseFloat(current) || 0});
     } catch(e) {}
+
+    // Khởi tạo tải và vẽ biểu đồ 24h ngay lập tức khi mở trang, tải trước 7 ngày & tháng ngầm
+    setTimeout(function() {
+        setChartRange('day');
+        setTimeout(prefetchHistory, 600);
+    }, 120);
 
     function showTab(id, btn) {
         const tabs = ['tab-home', 'tab-status', 'tab-settings'];
@@ -7170,6 +7438,15 @@ function CUSTOMER_DEVICE_HTML(d) {
         }
     }
 
+    function isHwModel(n) {
+        if (!n || typeof n !== 'string') return true;
+        const s = n.trim();
+        if (!s || s === '—' || s === '(Không có tên)') return true;
+        if (/^JK[_-]PB\d+/i.test(s) || /^JK[_-]B\d+A/i.test(s) || /^JK0[24]/i.test(s)) return true;
+        if (s === 'JK-BMS' || s === 'JK_BMS' || s.startsWith('JK-BMS [')) return true;
+        return false;
+    }
+
     function updatePackTabs(packsSummary, activeIdx, forceRebuild = false) {
         if (!packsSummary || !Array.isArray(packsSummary) || packsSummary.length <= 1) {
             const container = document.getElementById('pack-selector');
@@ -7195,7 +7472,8 @@ function CUSTOMER_DEVICE_HTML(d) {
         if (needsRebuild) {
             let html = '';
             packsSummary.forEach((p, i) => {
-                const pName = (p.name && p.name.length > 0) ? p.name : ('Pack ' + (i + 1));
+                const rawName = p.name || p.alias || '';
+                const pName = (rawName && !isHwModel(rawName)) ? rawName : ('Pack ' + (p.idx !== undefined ? p.idx + 1 : (i + 1)));
                 const pVolt = p.voltage > 0 ? (p.voltage.toFixed(1) + 'V') : '?V';
                 const pSoc  = p.soc > 0 ? (p.soc + '%') : '?%';
                 const isAct = (p.idx === activeIdx);
@@ -7203,7 +7481,7 @@ function CUSTOMER_DEVICE_HTML(d) {
                 const color = isAct ? '#fff' : 'var(--text-sub)';
                 const shadow = isAct ? '0 0 8px rgba(14,165,233,0.5)' : 'none';
                 const fw = isAct ? '700' : '400';
-                const displayName = pName.length > 10 ? (pName.slice(0, 10) + '..') : pName;
+                const displayName = pName.length > 16 ? (pName.slice(0, 15) + '..') : pName;
                 const statusTxt = p.connected ? '● Online' : '○ Cached';
 
                 html += '<div id="pack-tab-' + p.idx + '" style="' +
@@ -7234,8 +7512,9 @@ function CUSTOMER_DEVICE_HTML(d) {
             tab.style.boxShadow = isAct ? '0 0 8px rgba(14,165,233,0.5)' : 'none';
             tab.style.fontWeight = isAct ? '700' : '400';
             const spans = tab.querySelectorAll('span');
-            const pName = (p.name && p.name.length > 0) ? p.name : ('Pack ' + (p.idx + 1));
-            const displayName = pName.length > 10 ? (pName.slice(0, 10) + '..') : pName;
+            const rawName = p.name || p.alias || '';
+            const pName = (rawName && !isHwModel(rawName)) ? rawName : ('Pack ' + (p.idx !== undefined ? p.idx + 1 : 1));
+            const displayName = pName.length > 16 ? (pName.slice(0, 15) + '..') : pName;
             if (spans[0]) spans[0].innerText = displayName;
             if (spans.length >= 2) {
                 if (p.voltage > 0) {
@@ -7801,7 +8080,37 @@ function CUSTOMER_DEVICE_HTML(d) {
             _set('rt-runtime', curRuntimeStr);
 
             // Name & Protocol Live Update
-            const bmsName = (dev.active_bms_name && dev.active_bms_name !== 'JK_PB2A16S15P' && !dev.active_bms_name.startsWith('JK-BMS [') ? dev.active_bms_name : null) || dev.active_pack_name || dev.active_pack_alias || dev.active_bms_name || (isBalancer ? 'JK Active Balancer' : (isMod ? 'JK-PB Modbus' : 'JK-BMS'));
+            let bmsName = null;
+            if (isBalancer) {
+                bmsName = 'JK Active Balancer';
+            } else if (isMod) {
+                bmsName = dev.active_bms_name || 'JK-PB Modbus';
+            } else {
+                const normActMac = (dev.active_bms_mac || '').toLowerCase().replace(/[:-]/g, '');
+                if (dev.packs_summary && Array.isArray(dev.packs_summary)) {
+                    let p = dev.packs_summary.find(pk => (pk.mac || '').toLowerCase().replace(/[:-]/g, '') === normActMac);
+                    if (!p && dev.active_pack_idx !== undefined && dev.packs_summary[dev.active_pack_idx]) {
+                        p = dev.packs_summary[dev.active_pack_idx];
+                    }
+                    if (p) {
+                        const cand = p.name || p.alias;
+                        if (cand && !isHwModel(cand)) bmsName = cand;
+                    }
+                }
+                if (!bmsName && dev.ble_pack_names && normActMac && dev.ble_pack_names[normActMac]) {
+                    const cand = dev.ble_pack_names[normActMac];
+                    if (cand && !isHwModel(cand)) bmsName = cand;
+                }
+                if (!bmsName && dev.active_bms_name && !isHwModel(dev.active_bms_name)) {
+                    bmsName = dev.active_bms_name;
+                }
+                if (!bmsName && dev.active_pack_name && !isHwModel(dev.active_pack_name)) {
+                    bmsName = dev.active_pack_name;
+                }
+                if (!bmsName) {
+                    bmsName = (dev.packs_summary && dev.packs_summary.length > 1) ? ('Pack ' + ((dev.active_pack_idx || 0) + 1)) : (dev.active_bms_name || 'JK-BMS');
+                }
+            }
             _set('head-bms-title', (isConn || hasData) ? bmsName : (dev.active_bms_mac ? bmsName : (isBalancer ? 'JK Active Balancer' : 'Chưa kết nối BMS')));
             const badgeEl = _c('conn-type-badge');
             if (badgeEl) {

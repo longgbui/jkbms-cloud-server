@@ -94,7 +94,7 @@
   <div class="nav-right">
     <div class="user-badge">
       <span>👤</span>
-      <span id="user-display-name">Khách Hàng</span>
+      <span>Quý Khách</span>
     </div>
     <button onclick="openAddModal()" class="btn-add">➕ Thêm Bộ Pin</button>
     <button onclick="logoutUser()" class="btn-logout" title="Đăng Xuất">🚪</button>
@@ -134,37 +134,47 @@
       <button class="btn-close-modal" onclick="closeAddModal()">&times;</button>
     </div>
     <div class="modal-tabs">
-      <button class="modal-tab-btn active" id="mtab-auto" onclick="switchModalTab('auto')">⚡ Tự Động (Quét Token)</button>
-      <button class="modal-tab-btn" id="mtab-manual" onclick="switchModalTab('manual')">⌨️ Thủ Công (Nhập ID)</button>
+      <button class="modal-tab-btn active" id="mtab-claim" onclick="switchModalTab('claim')">🔑 Dán Mã Liên Kết</button>
+      <button class="modal-tab-btn" id="mtab-manual" onclick="switchModalTab('manual')">⌨️ Nhập Device ID</button>
     </div>
 
-    <!-- TAB AUTO BIND TOKEN -->
-    <div id="mcontent-auto">
+    <!-- TAB 1: CLAIM CODE (DÁN MÃ TỪ TRANG CẤU HÌNH WIFI ESP) -->
+    <div id="mcontent-claim">
       <div style="font-size:0.82rem;color:var(--subtext);line-height:1.5;margin-bottom:14px;">
-        Truy cập trang cấu hình WiFi của mạch ESP32, nhập mã Token bên dưới vào ô <strong>"Account Token"</strong> để hệ thống tự động nhận diện thiết bị của bạn:
+        Khi cấu hình Wi-Fi cho mạch ESP32 (trang <strong>192.168.4.1</strong>), bạn sẽ thấy ô <strong>"🔑 Mã Liên Kết Tài Khoản"</strong>. Hãy sao chép và dán vào đây:
       </div>
-      <div style="background:var(--surface2);border:1px dashed var(--cyan);border-radius:10px;padding:12px;text-align:center;margin-bottom:14px;">
-        <div style="font-size:0.75rem;color:var(--subtext);margin-bottom:4px;">MÃ LIÊN KẾT NHANH (TOKEN):</div>
-        <div id="my-bind-token" style="font-family:monospace;font-size:1.25rem;font-weight:800;color:var(--cyan);letter-spacing:1px;word-break:break-all;">Đang tạo...</div>
-      </div>
-      <button onclick="copyBindToken()" class="btn-submit-modal" style="background:var(--surface2);border:1px solid var(--border);">📋 Sao Chép Mã Token</button>
+      <form onsubmit="handleClaimDevice(event)">
+        <div class="form-group">
+          <label>Mã Liên Kết (Gồm 6 ký tự, ví dụ: 8F2A1C)</label>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <input type="text" id="claim-code-input" placeholder="Dán mã vào đây..." required maxlength="10" autocomplete="off" autocorrect="off" autocapitalize="characters" spellcheck="false" style="flex:1;font-family:monospace;font-size:1.15rem;font-weight:800;letter-spacing:2px;text-transform:uppercase;text-align:center;">
+            <button type="button" id="btn-paste-claim" onclick="pasteClaimCodeFromClipboard()" style="background:var(--surface2);border:1px solid var(--cyan);color:var(--cyan);border-radius:10px;padding:10px 14px;font-size:0.85rem;font-weight:700;cursor:pointer;white-space:nowrap;display:flex;align-items:center;gap:6px;transition:all 0.2s;">📋 Dán Mã</button>
+          </div>
+          <div id="claim-paste-status" style="display:none;font-size:0.75rem;margin-top:5px;font-weight:600;"></div>
+        </div>
+        <div class="form-group">
+          <label>Đặt Tên Gợi Nhớ (Tùy chọn)</label>
+          <input type="text" id="claim-dev-name" placeholder="Ví dụ: Pin Năng Lượng Tầng 2...">
+        </div>
+        <button type="submit" class="btn-submit-modal" id="btn-claim-submit">🎉 Xác Nhận Liên Kết Ngay</button>
+      </form>
     </div>
 
-    <!-- TAB MANUAL BIND -->
+    <!-- TAB 2: MANUAL BIND (DÀNH CHO ADMIN HOẶC NHẬP ID CŨ) -->
     <div id="mcontent-manual" style="display:none;">
       <form onsubmit="handleManualLink(event)">
         <div class="form-group">
-          <label>Mã Device ID (Ví dụ: JKBMS-ACCA hoặc JKBMS-C4CA)</label>
+          <label>Mã Device ID (Ví dụ: JKBMS-ACCA)</label>
           <input type="text" id="manual-dev-id" placeholder="Nhập Device ID..." required style="font-family:monospace;text-transform:uppercase;">
         </div>
         <div class="form-group">
-          <label>Đặt Tên Gợi Nhớ (Ví dụ: Pin Năng Lượng Mặt Trời Tầng 2)</label>
+          <label>Đặt Tên Gợi Nhớ (Tùy chọn)</label>
           <input type="text" id="manual-dev-name" placeholder="Tên gợi nhớ cho bộ pin...">
         </div>
         <div class="form-group">
           <label>Mã PIN BMS (Nếu có đặt mã bảo vệ PIN)</label>
           <div class="input-wrap">
-            <input type="password" id="manual-dev-pin" placeholder="Mã PIN 4 số (để trống nếu mặc định 1234)">
+            <input type="password" id="manual-dev-pin" placeholder="Mã PIN bảo vệ BMS">
             <button type="button" class="btn-eye" onclick="togglePass('manual-dev-pin', this)" title="Ẩn/hiện mã PIN">👁️</button>
           </div>
         </div>
@@ -175,6 +185,46 @@
 </div>
 
 <script>
+  async function pasteClaimCodeFromClipboard() {
+    const inp = document.getElementById('claim-code-input');
+    const status = document.getElementById('claim-paste-status');
+    if (!inp) return;
+    let pastedText = '';
+    if (navigator.clipboard && navigator.clipboard.readText) {
+      try {
+        pastedText = await navigator.clipboard.readText();
+      } catch(e) {}
+    }
+    if (!pastedText) {
+      try {
+        inp.focus();
+        inp.select();
+        document.execCommand('paste');
+        pastedText = inp.value;
+      } catch(e) {}
+    }
+    if (!pastedText) {
+      pastedText = prompt('Vui lòng dán mã liên kết (6 ký tự) vào đây:') || '';
+    }
+    const clean = (pastedText || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (clean) {
+      inp.value = clean;
+      if (status) {
+        status.style.display = 'block';
+        status.style.color = 'var(--green)';
+        status.textContent = '✅ Đã dán mã: ' + clean;
+        setTimeout(() => { status.style.display = 'none'; }, 3000);
+      }
+    } else {
+      if (status) {
+        status.style.display = 'block';
+        status.style.color = 'var(--danger)';
+        status.textContent = '⚠️ Bộ nhớ tạm chưa có mã liên kết!';
+        setTimeout(() => { status.style.display = 'none'; }, 3000);
+      }
+    }
+  }
+
   function togglePass(id, btn) {
     const el = document.getElementById(id);
     if (!el) return;
@@ -189,40 +239,72 @@
     }
   }
 
-  let currentBindToken = '';
-
   function openAddModal() {
     document.getElementById('add-modal').style.display = 'flex';
-    createBindToken();
+    setTimeout(() => {
+      const inp = document.getElementById('claim-code-input');
+      if (inp) {
+        inp.focus();
+        // Tự động kiểm tra clipboard nếu ô input còn trống
+        if (!inp.value && navigator.clipboard && navigator.clipboard.readText) {
+          navigator.clipboard.readText().then(txt => {
+            const clean = (txt || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+            if (clean && clean.length >= 5 && clean.length <= 8) {
+              inp.value = clean;
+              const status = document.getElementById('claim-paste-status');
+              if (status) {
+                status.style.display = 'block';
+                status.style.color = 'var(--green)';
+                status.textContent = '📋 Tự động nhận mã từ bộ nhớ tạm: ' + clean;
+                setTimeout(() => { status.style.display = 'none'; }, 3500);
+              }
+            }
+          }).catch(() => {});
+        }
+      }
+    }, 150);
   }
   function closeAddModal() {
     document.getElementById('add-modal').style.display = 'none';
   }
 
   function switchModalTab(tab) {
-    const isAuto = (tab === 'auto');
-    document.getElementById('mtab-auto').className = 'modal-tab-btn ' + (isAuto ? 'active' : '');
-    document.getElementById('mtab-manual').className = 'modal-tab-btn ' + (!isAuto ? 'active' : '');
-    document.getElementById('mcontent-auto').style.display = isAuto ? 'block' : 'none';
-    document.getElementById('mcontent-manual').style.display = !isAuto ? 'block' : 'none';
+    const isClaim = (tab === 'claim');
+    document.getElementById('mtab-claim').className = 'modal-tab-btn ' + (isClaim ? 'active' : '');
+    document.getElementById('mtab-manual').className = 'modal-tab-btn ' + (!isClaim ? 'active' : '');
+    document.getElementById('mcontent-claim').style.display = isClaim ? 'block' : 'none';
+    document.getElementById('mcontent-manual').style.display = !isClaim ? 'block' : 'none';
   }
 
-  async function createBindToken() {
+  async function handleClaimDevice(e) {
+    e.preventDefault();
+    const btn = document.getElementById('btn-claim-submit');
+    const code = document.getElementById('claim-code-input').value.trim().toUpperCase();
+    const name = document.getElementById('claim-dev-name').value.trim();
+
+    btn.disabled = true;
+    btn.textContent = 'Đang kiểm tra mã...';
+
     try {
-      const res = await fetch('/api/user/create-bind-token', { method: 'POST' });
+      const res = await fetch('/api/user/claim-device', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ claim_code: code, custom_name: name })
+      });
       const data = await res.json();
-      if (data.status === 'ok') {
-        currentBindToken = data.token;
-        document.getElementById('my-bind-token').textContent = data.token;
+      if (res.ok && data.status === 'ok') {
+        alert(data.message || '🎉 Liên kết thành công!');
+        closeAddModal();
+        fetchMyDevices();
+      } else {
+        alert('⚠️ ' + (data.error || 'Mã liên kết không hợp lệ'));
       }
-    } catch(e) {}
-  }
-
-  function copyBindToken() {
-    if (!currentBindToken) return;
-    navigator.clipboard.writeText(currentBindToken).then(() => {
-      alert('✅ Đã sao chép mã Token: ' + currentBindToken);
-    });
+    } catch(err) {
+      alert('⚠️ Lỗi kết nối!');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '🎉 Xác Nhận Liên Kết Ngay';
+    }
   }
 
   async function handleManualLink(e) {
@@ -245,21 +327,7 @@
       if (res.ok && data.status === 'ok') {
         alert('🎉 ' + data.message);
         closeAddModal();
-        
-  // Load thông tin người dùng
-  async function loadUserInfo() {
-    try {
-      const res = await fetch('/api/auth/me');
-      const data = await res.json();
-      if (data && data.authenticated && data.user) {
-        const el = document.getElementById('user-display-name');
-        if (el) el.textContent = data.user.fullname || data.user.username;
-      }
-    } catch(e) {}
-  }
-  loadUserInfo();
-
-  fetchMyDevices();
+        fetchMyDevices();
       } else {
         alert('⚠️ ' + (data.error || 'Không thể liên kết thiết bị'));
       }
@@ -303,10 +371,51 @@
     try {
       const res = await fetch('/api/user/devices');
       if (!res.ok) {
-        if (res.status === 401) window.location.href = '/login';
+        if (res.status === 401) {
+          window.location.href = '/login';
+          return;
+        }
+        if (grid && grid.querySelector('.empty-icon')?.textContent === '⏳') {
+          grid.innerHTML = `
+            <div class="empty-state">
+              <div class="empty-icon">⚠️</div>
+              <h3 style="font-size:1.15rem;margin-bottom:8px;color:var(--danger);">Không Thể Tải Thiết Bị</h3>
+              <p style="font-size:0.85rem;color:var(--subtext);max-width:400px;margin:0 auto 18px;">
+                Máy chủ phản hồi lỗi (Mã ${res.status}). Vui lòng thử lại.
+              </p>
+              <button onclick="fetchMyDevices()" class="btn-add" style="margin:0 auto;">🔄 Thử Lại</button>
+            </div>
+          `;
+        }
         return;
       }
       const list = await res.json();
+      if (!Array.isArray(list)) {
+        console.error('Invalid devices response:', list);
+        if (grid && grid.querySelector('.empty-icon')?.textContent === '⏳') {
+          grid.innerHTML = `
+            <div class="empty-state">
+              <div class="empty-icon">⚠️</div>
+              <h3 style="font-size:1.15rem;margin-bottom:8px;color:var(--danger);">Dữ Liệu Không Hợp Lệ</h3>
+              <p style="font-size:0.85rem;color:var(--subtext);max-width:400px;margin:0 auto 18px;">
+                ${(list && list.error) ? list.error : 'Máy chủ gửi dữ liệu không đúng định dạng.'}
+              </p>
+              <button onclick="fetchMyDevices()" class="btn-add" style="margin:0 auto;">🔄 Thử Lại</button>
+            </div>
+          `;
+        }
+        return;
+      }
+
+      list.sort((a, b) => {
+        const onA = a.online ? 1 : 0;
+        const onB = b.online ? 1 : 0;
+        if (onA !== onB) return onB - onA; // Online lên đầu tiên
+        const nA = (a.custom_name || a.device_id || '').trim();
+        const nB = (b.custom_name || b.device_id || '').trim();
+        const c = nA.localeCompare(nB, 'vi', { numeric: true, sensitivity: 'base' });
+        return c !== 0 ? c : (a.device_id || '').localeCompare(b.device_id || '', 'vi', { numeric: true, sensitivity: 'base' });
+      });
 
       let onlineCnt = 0;
       let offlineCnt = 0;
@@ -318,7 +427,7 @@
       document.getElementById('stat-online').textContent = onlineCnt;
       document.getElementById('stat-offline').textContent = offlineCnt;
 
-      if (!list || list.length === 0) {
+      if (list.length === 0) {
         grid.innerHTML = `
           <div class="empty-state">
             <div class="empty-icon">📡</div>
@@ -343,20 +452,51 @@
         const statusTxt = isOnline ? '🟢 Hoạt động' : '🔴 Ngoại tuyến';
         const badgeCls = isOnline ? 'badge-online' : 'badge-offline';
 
+        const isBle = (d.firmware_version && d.firmware_version.indexOf('BLE') !== -1) || (d.conn_type === 'ble') || (d.conn_type_num === 1);
+        const isMod = !isBle && ((d.conn_type === 'modbus') || (d.conn_type === 'rs485') || (d.conn_type_num === 2) || (d.firmware_version && d.firmware_version.indexOf('RS485') !== -1) || (d.active_bms_mac && String(d.active_bms_mac).startsWith('RS485')));
+        const isBal = !isBle && !isMod && ((d.conn_type === 'uart_lcd') || (d.conn_type === 'balancer') || (d.conn_type_num === 3) || (d.firmware_version && d.firmware_version.indexOf('BALANCER') !== -1) || (d.device_id && d.device_id.startsWith('JKBAL')));
+
+        const typeBadge = isBal 
+          ? '<span style="background:rgba(16,185,129,0.18);color:#10b981;border:1px solid rgba(16,185,129,0.45);font-size:0.65rem;padding:2px 7px;border-radius:4px;font-weight:800;letter-spacing:0.5px;margin-left:6px;vertical-align:middle;">⚡ CÂN BẰNG JK</span>'
+          : (isMod 
+            ? '<span style="background:rgba(245,158,11,0.18);color:#f59e0b;border:1px solid rgba(245,158,11,0.45);font-size:0.65rem;padding:2px 7px;border-radius:4px;font-weight:800;letter-spacing:0.5px;margin-left:6px;vertical-align:middle;">🟠 MODBUS</span>'
+            : '<span style="background:rgba(56,189,248,0.18);color:#38bdf8;border:1px solid rgba(56,189,248,0.45);font-size:0.65rem;padding:2px 7px;border-radius:4px;font-weight:800;letter-spacing:0.5px;margin-left:6px;vertical-align:middle;">🔵 BLUETOOTH</span>');
+
         const chgOn = d.charge_mos || d.chargeMosOn;
         const dsgOn = d.discharge_mos || d.dischargeMosOn;
         const balOn = d.balance || d.balanceActive;
 
-        html += `
-          <div class="device-card">
-            <div class="card-top">
-              <div>
-                <div class="dev-name">${titleName}</div>
-                <div class="dev-id-tag">Mã ID: ${subId}</div>
-              </div>
-              <div class="badge-status ${badgeCls}">${statusTxt}</div>
-            </div>
+        let metricsHtml = '';
+        let switchesHtml = '';
 
+        if (isBal) {
+          const deltaV = (d.delta_cell_voltage !== undefined && d.delta_cell_voltage !== null) ? Number(d.delta_cell_voltage).toFixed(3) : ((d.cell_diff_v !== undefined && d.cell_diff_v !== null) ? Number(d.cell_diff_v).toFixed(3) : '0.000');
+          const balCur = (d.balance_current !== undefined && d.balance_current !== null) ? Number(d.balance_current).toFixed(2) : '0.00';
+          metricsHtml = `
+            <div class="metrics-row">
+              <div class="metric-item">
+                <div style="color:var(--cyan);">${v} V</div>
+                <div>Điện Áp Tổng</div>
+              </div>
+              <div class="metric-item">
+                <div style="color:${parseFloat(deltaV) > 0.030 ? 'var(--warning)' : 'var(--green)'};">${deltaV} V</div>
+                <div>Lệch Cell (ΔV)</div>
+              </div>
+              <div class="metric-item">
+                <div style="color:var(--warning);">${balCur} A</div>
+                <div>Dòng Cân Bằng</div>
+              </div>
+            </div>
+          `;
+          switchesHtml = `
+            <div class="switches-row">
+              <div>Cân Bằng: <span class="sw-badge ${balOn ? 'sw-on' : 'sw-off'}">${balOn ? 'BẬT' : 'TẮT'}</span></div>
+              <div>Số Cell: <span style="font-weight:700;color:var(--cyan);">${d.cell_count || 24}S</span></div>
+              <div>Cổng: <span style="font-weight:700;color:#10b981;">UART-LCD</span></div>
+            </div>
+          `;
+        } else {
+          metricsHtml = `
             <div class="metrics-row">
               <div class="metric-item">
                 <div style="color:var(--cyan);">${v} V</div>
@@ -371,12 +511,32 @@
                 <div>Nhiệt Độ MOS</div>
               </div>
             </div>
-
+          `;
+          switchesHtml = `
             <div class="switches-row">
               <div>Sạc: <span class="sw-badge ${chgOn ? 'sw-on' : 'sw-off'}">${chgOn ? 'BẬT' : 'TẮT'}</span></div>
               <div>Xả: <span class="sw-badge ${dsgOn ? 'sw-on' : 'sw-off'}">${dsgOn ? 'BẬT' : 'TẮT'}</span></div>
               <div>Cân Bằng: <span class="sw-badge ${balOn ? 'sw-on' : 'sw-off'}">${balOn ? 'BẬT' : 'TẮT'}</span></div>
             </div>
+            <div class="switches-row" style="margin-top:6px;font-size:0.75rem;color:var(--text-sub);">
+              <div>Pass ${isMod ? 'PIN' : 'BLE'}: <strong style="color:#38bdf8;font-family:monospace;">${d.devicePasscode || d.device_passcode || '1234'}</strong></div>
+              <div>Pass Setup: <strong style="color:var(--green);font-family:monospace;">${d.setup_passcode || d.setupPasscode || '123456'}</strong></div>
+            </div>
+          `;
+        }
+
+        html += `
+          <div class="device-card" style="border-left: 4px solid ${isBal ? '#10b981' : (isMod ? '#f59e0b' : '#38bdf8')};">
+            <div class="card-top">
+              <div>
+                <div class="dev-name" style="display:flex;align-items:center;">${titleName} ${typeBadge}</div>
+                <div class="dev-id-tag">Mã ID: ${subId}</div>
+              </div>
+              <div class="badge-status ${badgeCls}">${statusTxt}</div>
+            </div>
+
+            ${metricsHtml}
+            ${switchesHtml}
 
             <div class="card-actions">
               <a href="/d/${d.device_id}" class="btn-open-dev">🚀 Vào Điều Khiển & Cài Đặt</a>
@@ -388,6 +548,18 @@
       grid.innerHTML = html;
     } catch(e) {
       console.warn('Error fetching devices:', e);
+      if (grid && grid.querySelector('.empty-icon')?.textContent === '⏳') {
+        grid.innerHTML = `
+          <div class="empty-state">
+            <div class="empty-icon">⚠️</div>
+            <h3 style="font-size:1.15rem;margin-bottom:8px;color:var(--danger);">Mất Kết Nối Máy Chủ</h3>
+            <p style="font-size:0.85rem;color:var(--subtext);max-width:400px;margin:0 auto 18px;">
+              Không thể kết nối đến máy chủ Cloud. Vui lòng kiểm tra lại kết nối mạng.
+            </p>
+            <button onclick="fetchMyDevices()" class="btn-add" style="margin:0 auto;">🔄 Thử Lại</button>
+          </div>
+        `;
+      }
     }
   }
 

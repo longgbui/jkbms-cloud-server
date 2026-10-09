@@ -1,6 +1,6 @@
 {
   "name": "JK BMS Monitor - Bluetooth BLE",
-  "version": "v2.9.9-BLE",
+  "version": "v3.0.1-BLE",
   "new_install_prompt_erase": false,
   "builds": [
     {

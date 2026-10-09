@@ -1,6 +1,6 @@
 {
   "name": "JK BMS Monitor - RS485 Modbus RTU",
-  "version": "v2.9.8-RS485",
+  "version": "v2.9.9-RS485",
   "new_install_prompt_erase": false,
   "builds": [
     {
