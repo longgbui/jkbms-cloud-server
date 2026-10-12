@@ -2020,6 +2020,25 @@ app.get('/manifest-balancer.json', (req, res) => {
     });
 });
 
+app.get('/manifest-jk-can.json', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+    const p = path.join(__dirname, 'manifest-jk-can.json');
+    if (fs.existsSync(p)) {
+        try {
+            const data = JSON.parse(fs.readFileSync(p, 'utf8'));
+            if (data.version && data.version !== 'latest') return res.json(data);
+        } catch(e) {}
+    }
+    res.json({
+        name: "JK-BMS PB & CAN Biến Tần Monitor (ESP32 CYD)",
+        version: "v1.0.0-JK-CAN",
+        new_install_prompt_erase: false,
+        builds: [
+            { chipFamily: "ESP32", parts: [{ path: "/firmware/factory_jk_can.bin", offset: 0 }] }
+        ]
+    });
+});
+
 app.get('/manifest-vf.json', (req, res) => {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
     const p = path.join(__dirname, 'manifest-vf.json');
@@ -7581,6 +7600,741 @@ const WEB_FLASHER_HTML = `<!DOCTYPE html>
     <style>
         :root {
             --bg: #0b0f17;
+            --surface: #151d28;
+            --surface-hover: #1e293b;
+            --border: #243247;
+            --cyan: #38bdf8;
+            --cyan-dim: rgba(56,189,248,0.12);
+            --green: #22c55e;
+            --green-dim: rgba(34,197,94,0.12);
+            --yellow: #f59e0b;
+            --yellow-dim: rgba(245,158,11,0.12);
+            --purple: #a855f7;
+            --purple-dim: rgba(168,85,247,0.12);
+            --text-main: #f8fafc;
+            --text-sub: #94a3b8;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', sans-serif; }
+        body { background: var(--bg); color: var(--text-main); min-height: 100vh; padding: 24px 16px; display: flex; flex-direction: column; align-items: center; }
+
+        .container { width: 100%; max-width: 860px; }
+
+        .header { text-align: center; margin-bottom: 28px; }
+        .logo-badge { display: inline-flex; align-items: center; gap: 8px; background: var(--cyan-dim); border: 1px solid rgba(56,189,248,0.3); color: var(--cyan); padding: 6px 16px; border-radius: 99px; font-size: 0.85rem; font-weight: 700; margin-bottom: 12px; }
+        .title { font-size: 2.1rem; font-weight: 800; letter-spacing: -0.5px; margin-bottom: 8px; background: linear-gradient(135deg, #fff 40%, var(--cyan) 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .subtitle { font-size: 0.95rem; color: var(--text-sub); line-height: 1.5; }
+
+        .warning-box { background: rgba(56,189,248,0.06); border: 1px solid var(--border); border-radius: 12px; padding: 14px 18px; margin-bottom: 24px; font-size: 0.85rem; color: #cbd5e1; display: flex; align-items: center; gap: 12px; }
+        .warning-icon { font-size: 1.5rem; flex-shrink: 0; }
+
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 18px; margin-bottom: 28px; }
+
+        .card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 22px; display: flex; flex-direction: column; justify-content: space-between; transition: 0.2s; position: relative; overflow: hidden; }
+        .card:hover { transform: translateY(-2px); border-color: rgba(56,189,248,0.4); box-shadow: 0 10px 25px -5px rgba(0,0,0,0.5); }
+
+        .card-header { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+        .card-icon { width: 44px; height: 44px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 1.4rem; flex-shrink: 0; }
+        .card-title { font-size: 1.1rem; font-weight: 700; color: #fff; line-height: 1.3; }
+        .card-ver { font-size: 0.78rem; font-weight: 700; padding: 2px 8px; border-radius: 6px; display: inline-block; margin-top: 4px; }
+
+        .card-desc { font-size: 0.84rem; color: var(--text-sub); line-height: 1.5; margin-bottom: 20px; flex-grow: 1; }
+        .card-features { list-style: none; margin-bottom: 18px; }
+        .card-features li { font-size: 0.78rem; color: #cbd5e1; margin-bottom: 5px; display: flex; align-items: center; gap: 6px; }
+        .card-features li::before { content: "✔"; color: var(--green); font-weight: bold; }
+
+        /* Color accents */
+        .card-ble .card-icon { background: var(--cyan-dim); border: 1px solid rgba(56,189,248,0.3); }
+        .card-ble .card-ver { background: var(--cyan-dim); color: var(--cyan); border: 1px solid rgba(56,189,248,0.3); }
+
+        .card-rs485 .card-icon { background: var(--yellow-dim); border: 1px solid rgba(245,158,11,0.3); }
+        .card-rs485 .card-ver { background: var(--yellow-dim); color: var(--yellow); border: 1px solid rgba(245,158,11,0.3); }
+
+        .card-bal .card-icon { background: var(--purple-dim); border: 1px solid rgba(168,85,247,0.3); }
+        .card-bal .card-ver { background: var(--purple-dim); color: var(--purple); border: 1px solid rgba(168,85,247,0.3); }
+
+        .card-vf .card-icon { background: var(--green-dim); border: 1px solid rgba(34,197,94,0.3); }
+        .card-vf .card-ver { background: var(--green-dim); color: var(--green); border: 1px solid rgba(34,197,94,0.3); }
+
+        .card-jk-can .card-icon { background: rgba(6,182,212,0.15); border: 1px solid rgba(6,182,212,0.3); }
+        .card-jk-can .card-ver { background: rgba(6,182,212,0.15); color: #06b6d4; border: 1px solid rgba(6,182,212,0.3); }
+        .btn-jk-can { background: linear-gradient(135deg, #06b6d4, #0284c7); color: #fff; }
+        .btn-jk-can:hover { opacity: 0.9; box-shadow: 0 4px 15px rgba(6,182,212,0.4); }
+
+        /* Custom Button for ESP Web Tools */
+        esp-web-install-button { width: 100%; display: block; }
+        .btn-install {
+            width: 100%;
+            padding: 13px 16px;
+            border-radius: 10px;
+            font-size: 0.95rem;
+            font-weight: 700;
+            border: none;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            transition: 0.2s;
+        }
+
+        .btn-ble { background: var(--cyan); color: #051923; }
+        .btn-ble:hover { background: #7dd3fc; }
+
+        .btn-rs485 { background: var(--yellow); color: #2e1065; }
+        .btn-rs485:hover { background: #fde047; }
+
+        .btn-bal { background: var(--purple); color: #fff; }
+        .btn-bal:hover { background: #c084fc; }
+
+        .btn-vf { background: var(--green); color: #052e16; }
+        .btn-vf:hover { background: #4ade80; }
+
+        /* Steps guide */
+        .guide-box { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 22px; margin-bottom: 28px; }
+        .guide-title { font-size: 1.05rem; font-weight: 700; margin-bottom: 14px; color: var(--cyan); display: flex; align-items: center; gap: 8px; }
+        .steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }
+        .step-item { background: rgba(0,0,0,0.25); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
+        .step-num { width: 28px; height: 28px; border-radius: 99px; background: var(--cyan); color: #000; font-weight: 800; font-size: 0.85rem; display: flex; align-items: center; justify-content: center; margin-bottom: 8px; }
+        .step-txt { font-size: 0.82rem; color: #cbd5e1; line-height: 1.45; }
+
+        .footer { text-align: center; font-size: 0.8rem; color: var(--text-sub); border-top: 1px solid var(--border); padding-top: 20px; }
+        .not-supported { display: none; background: rgba(239,68,68,0.15); border: 1px solid #ef4444; color: #fca5a5; padding: 14px; border-radius: 10px; text-align: center; margin-bottom: 20px; font-weight: 600; font-size: 0.9rem; }
+    
+        /* AUTH OVERLAY & LOGIN */
+        #auth-overlay {
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(11, 15, 23, 0.92);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            z-index: 99999;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .login-card {
+            background: #151d28;
+            border: 1px solid #243247;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.7), 0 0 40px rgba(56, 189, 248, 0.2);
+            border-radius: 20px;
+            padding: 36px 30px;
+            max-width: 420px;
+            width: 100%;
+            text-align: center;
+        }
+        .login-icon {
+            font-size: 2.8rem;
+            margin-bottom: 12px;
+        }
+        .login-title {
+            font-size: 1.4rem;
+            font-weight: 800;
+            color: #fff;
+            margin-bottom: 8px;
+        }
+        .login-desc {
+            font-size: 0.88rem;
+            color: #94a3b8;
+            margin-bottom: 24px;
+            line-height: 1.5;
+        }
+        .login-input {
+            width: 100%;
+            background: #0b0f17;
+            border: 1.5px solid #243247;
+            border-radius: 12px;
+            padding: 14px 16px;
+            color: #fff;
+            font-size: 1rem;
+            outline: none;
+            margin-bottom: 16px;
+            text-align: center;
+            letter-spacing: 2px;
+            transition: 0.2s;
+        }
+        .login-input:focus {
+            border-color: #38bdf8;
+            box-shadow: 0 0 15px rgba(56, 189, 248, 0.3);
+        }
+        .login-btn {
+            width: 100%;
+            background: linear-gradient(135deg, #0284c7 0%, #38bdf8 100%);
+            border: none;
+            border-radius: 12px;
+            padding: 14px;
+            color: #fff;
+            font-size: 1rem;
+            font-weight: 700;
+            cursor: pointer;
+            transition: 0.2s;
+        }
+        .login-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(2, 132, 199, 0.4);
+        }
+        .login-error {
+            color: #f87171;
+            font-size: 0.82rem;
+            margin-top: 12px;
+            display: none;
+            font-weight: 600;
+        }
+
+        /* TOP BAR WITH LOGOUT */
+        .top-admin-bar {
+            display: flex;
+            justify-content: flex-end;
+            margin-bottom: 12px;
+        }
+        .btn-logout {
+            background: rgba(239, 68, 68, 0.15);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            color: #fca5a5;
+            padding: 6px 14px;
+            border-radius: 8px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            transition: 0.2s;
+        }
+        .btn-logout:hover {
+            background: rgba(239, 68, 68, 0.25);
+        }
+
+        /* KEYGEN CARD STYLING */
+        .keygen-card {
+            background: linear-gradient(145deg, #151d28 0%, #0f172a 100%);
+            border: 1.5px solid rgba(56, 189, 248, 0.4);
+            border-radius: 16px;
+            padding: 24px;
+            margin-bottom: 28px;
+            box-shadow: 0 12px 30px rgba(0, 0, 0, 0.4), 0 0 25px rgba(56, 189, 248, 0.15);
+        }
+        .keygen-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 16px;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        .keygen-title-box {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .keygen-icon {
+            width: 44px;
+            height: 44px;
+            border-radius: 10px;
+            background: rgba(56, 189, 248, 0.15);
+            border: 1px solid rgba(56, 189, 248, 0.3);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.4rem;
+        }
+        .keygen-title {
+            font-size: 1.2rem;
+            font-weight: 800;
+            color: #fff;
+        }
+        .keygen-badge {
+            background: rgba(34, 197, 94, 0.15);
+            border: 1px solid rgba(34, 197, 94, 0.3);
+            color: #4ade80;
+            padding: 4px 10px;
+            border-radius: 6px;
+            font-size: 0.75rem;
+            font-weight: 700;
+            text-transform: uppercase;
+        }
+        .keygen-body {
+            display: grid;
+            grid-template-columns: 1fr auto 1fr;
+            gap: 16px;
+            align-items: center;
+        }
+        @media (max-width: 768px) {
+            .keygen-body {
+                grid-template-columns: 1fr;
+            }
+        }
+        .mac-input-group {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        .mac-input-label {
+            font-size: 0.8rem;
+            font-weight: 600;
+            color: #94a3b8;
+            text-transform: uppercase;
+        }
+        .mac-input-field {
+            background: #0b0f17;
+            border: 1.5px solid #243247;
+            border-radius: 10px;
+            padding: 12px 14px;
+            color: #fff;
+            font-size: 1.1rem;
+            font-family: 'JetBrains Mono', monospace;
+            font-weight: 700;
+            letter-spacing: 1.5px;
+            outline: none;
+            text-transform: uppercase;
+            transition: 0.2s;
+        }
+        .mac-input-field:focus {
+            border-color: #38bdf8;
+            box-shadow: 0 0 12px rgba(56, 189, 248, 0.3);
+        }
+        .btn-keygen-act {
+            background: linear-gradient(135deg, #0284c7 0%, #38bdf8 100%);
+            border: none;
+            border-radius: 10px;
+            padding: 13px 20px;
+            color: #fff;
+            font-size: 0.95rem;
+            font-weight: 700;
+            cursor: pointer;
+            transition: 0.2s;
+            white-space: nowrap;
+            height: 48px;
+            margin-top: 22px;
+            box-shadow: 0 4px 15px rgba(2, 132, 199, 0.3);
+        }
+        @media (max-width: 768px) {
+            .btn-keygen-act {
+                margin-top: 0;
+            }
+        }
+        .btn-keygen-act:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(2, 132, 199, 0.5);
+        }
+        .key-result-box {
+            background: rgba(11, 15, 23, 0.9);
+            border: 1.5px dashed rgba(34, 197, 94, 0.4);
+            border-radius: 12px;
+            padding: 10px 16px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            min-height: 48px;
+            margin-top: 22px;
+        }
+        @media (max-width: 768px) {
+            .key-result-box {
+                margin-top: 0;
+            }
+        }
+        .key-val-display {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 1.6rem;
+            font-weight: 800;
+            color: #4ade80;
+            letter-spacing: 3px;
+        }
+        .btn-copy-mini {
+            background: rgba(34, 197, 94, 0.15);
+            border: 1px solid rgba(34, 197, 94, 0.3);
+            color: #4ade80;
+            border-radius: 6px;
+            padding: 6px 12px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: 0.2s;
+        }
+        .btn-copy-mini:hover {
+            background: rgba(34, 197, 94, 0.3);
+        }
+
+    </style>
+</head>
+<body>
+
+    <!-- AUTHENTICATION OVERLAY (BẢO VỆ NỘI BỘ) -->
+    <div id="auth-overlay">
+        <div class="login-card">
+            <div class="login-icon">🔒</div>
+            <h2 class="login-title">Hệ Thống Quản Trị Nội Bộ</h2>
+            <p class="login-desc">Trang nạp firmware & tạo mã bản quyền dành riêng cho kỹ thuật viên. Vui lòng nhập mật khẩu quản trị để tiếp tục.</p>
+            <form onsubmit="handleAdminLogin(event)">
+                <input type="password" id="admin-pass-input" class="login-input" placeholder="Nhập Mật Khẩu Admin" autocomplete="current-password" autofocus required>
+                <button type="submit" class="login-btn">ĐĂNG NHẬP HỆ THỐNG</button>
+            </form>
+            <div id="login-err-msg" class="login-error">Mật khẩu không chính xác! Vui lòng thử lại.</div>
+        </div>
+    </div>
+
+    <div class="container">
+
+        <div class="top-admin-bar">
+            <button class="btn-logout" onclick="handleAdminLogout()">
+                <span>🚪</span> Đăng Xuất Quản Trị
+            </button>
+        </div>
+        <div class="header">
+            <div class="logo-badge">⚡ WEB SERIAL FLASHER</div>
+            <h1 class="title">Nạp Firmware ESP32 Qua Cáp USB</h1>
+            <p class="subtitle">Khách hàng chỉ cần cắm cáp USB vào máy tính và ấn nút nạp trực tiếp trên trình duyệt.<br>Hoàn toàn không cần cài đặt Python, PlatformIO hay driver phức tạp!</p>
+        </div>
+
+        <div id="unsupported-alert" class="not-supported">
+            ⚠️ Trình duyệt của bạn không hỗ trợ Web Serial API. Vui lòng mở trang web này bằng <strong>Google Chrome</strong>, <strong>Microsoft Edge</strong> hoặc <strong>Cốc Cốc</strong> trên máy tính!
+        </div>
+
+        <div class="warning-box">
+            <span class="warning-icon">💡</span>
+            <div>
+                <strong>Lưu ý quan trọng:</strong> Chọn đúng loại thiết bị của bạn bên dưới để nạp firmware chuẩn. Bản nạp là <strong>Full Factory Image (0x0)</strong> bao gồm Bootloader, Partition và Firmware mới nhất, khôi phục 100% chip về trạng thái xuất xưởng hoàn hảo.
+            </div>
+        </div>
+
+        <!-- 3 FIRMWARE CARDS -->
+        
+        <!-- CÔNG CỤ TẠO MÃ KÍCH HOẠT (CYD LICENSE KEYGEN) -->
+        <div class="keygen-card">
+            <div class="keygen-header">
+                <div class="keygen-title-box">
+                    <div class="keygen-icon">🔑</div>
+                    <div>
+                        <div class="keygen-title">Trình Tạo Mã Kích Hoạt (VinFast CYD)</div>
+                        <div style="font-size: 0.8rem; color: #94a3b8;">Tạo mã mở khóa vĩnh viễn theo Chip MAC ESP32 (Chống sao chép firmware)</div>
+                    </div>
+                </div>
+                <div class="keygen-badge">Chỉ Admin &bull; Nội Bộ</div>
+            </div>
+            <div class="keygen-body">
+                <div class="mac-input-group">
+                    <label class="mac-input-label" for="web-mac-input">Mã MAC / ID Mạch (CYD Display):</label>
+                    <input type="text" id="web-mac-input" class="mac-input-field" placeholder="C4:DE:E2:4A:8B:90" maxlength="20" spellcheck="false" autocomplete="off">
+                </div>
+                <button type="button" class="btn-keygen-act" onclick="generateWebKey()">
+                    ⚡ TẠO MÃ KEY
+                </button>
+                <div class="key-result-box">
+                    <div class="key-val-display" id="web-key-val">------</div>
+                    <button type="button" class="btn-copy-mini" id="web-btn-copy" onclick="copyWebKey()">Sao chép</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="grid">
+            <!-- 1. BLUETOOTH BLE -->
+            <div class="card card-ble">
+                <div>
+                    <div class="card-header">
+                        <div class="card-icon">📡</div>
+                        <div>
+                            <div class="card-title">JK BMS Bluetooth</div>
+                            <span class="card-ver" id="ver-ble">Phiên bản v2.9.9-BLE</span>
+                        </div>
+                    </div>
+                    <p class="card-desc">Dành cho mạch ESP32 kết nối không dây với JK BMS qua Bluetooth BLE.</p>
+                    <ul class="card-features">
+                        <li>Hỗ trợ đổi Pack pin & xóa Pack linh hoạt</li>
+                        <li>Ngắt BMS an toàn khi nhận OTA từ xa</li>
+                        <li>Đọc cell điện áp, nhiệt độ, bảo vệ 24/7</li>
+                    </ul>
+                </div>
+                <div>
+                    <esp-web-install-button manifest="/manifest-ble.json">
+                        <button slot="activate" class="btn-install btn-ble">
+                            ⚡ Kết Nối & Nạp BLE
+                        </button>
+                    </esp-web-install-button>
+                </div>
+            </div>
+
+            <!-- 2. RS485 MODBUS -->
+            <div class="card card-rs485">
+                <div>
+                    <div class="card-header">
+                        <div class="card-icon">🔌</div>
+                        <div>
+                            <div class="card-title">JK BMS RS485</div>
+                            <span class="card-ver" id="ver-rs485">Phiên bản v2.9.8-RS485</span>
+                        </div>
+                    </div>
+                    <p class="card-desc">Dành cho ESP32 kết nối có dây với JK BMS qua cổng RS485 Modbus RTU.</p>
+                    <ul class="card-features">
+                        <li>Giao tiếp có dây chống nhiễu cực tốt</li>
+                        <li>Hỗ trợ song song tới 16 Pack BMS</li>
+                        <li>Đã tắt Watchdog & dừng đọc khi nạp OTA</li>
+                    </ul>
+                </div>
+                <div>
+                    <esp-web-install-button manifest="/manifest-rs485.json">
+                        <button slot="activate" class="btn-install btn-rs485">
+                            ⚡ Kết Nối & Nạp RS485
+                        </button>
+                    </esp-web-install-button>
+                </div>
+            </div>
+
+            <!-- 3. BALANCER LCD -->
+            <div class="card card-bal">
+                <div>
+                    <div class="card-header">
+                        <div class="card-icon">⚖️</div>
+                        <div>
+                            <div class="card-title">JK Active Balancer</div>
+                            <span class="card-ver" id="ver-bal">Phiên bản v1.0.4-BALANCER</span>
+                        </div>
+                    </div>
+                    <p class="card-desc">Dành riêng cho Mạch Cân Bằng Chủ Động JK kết nối qua cổng LCD UART TTL.</p>
+                    <ul class="card-features">
+                        <li>Giao tiếp cổng màn hình LCD 115200</li>
+                        <li>Đọc và cài đặt dòng cân bằng 5A/10A/15A</li>
+                        <li>Bảo vệ chống nạp nhầm Firmware BMS</li>
+                    </ul>
+                </div>
+                <div>
+                    <esp-web-install-button manifest="/manifest-balancer.json">
+                        <button slot="activate" class="btn-install btn-bal">
+                            ⚡ Kết Nối & Nạp Balancer
+                        </button>
+                    </esp-web-install-button>
+                </div>
+            </div>
+
+            <!-- 4. XOA LOI PIN VF -->
+            <div class="card card-vf">
+                <div>
+                    <div class="card-header">
+                        <div class="card-icon">🔧</div>
+                        <div>
+                            <div class="card-title">Xóa Lỗi Pin VinFast</div>
+                            <span class="card-ver" id="ver-vf">Phiên bản v1.3.5-VF-PIN</span>
+                        </div>
+                    </div>
+                    <p class="card-desc">Dành cho mạch ESP32 CYD (màn hình cảm ứng 2.8") xóa lỗi BMS pin VinFast qua giao tiếp BLE & CAN Bus.</p>
+                    <ul class="card-features">
+                        <li>Hiển thị trạng thái pin trực tiếp trên màn hình TFT</li>
+                        <li>Xóa mã lỗi BMS pin VinFast qua CAN Bus</li>
+                        <li>Hỗ trợ ESP32 Dev Module (ESP32-2432S028)</li>
+                    </ul>
+                </div>
+                <div>
+                    <esp-web-install-button manifest="/manifest-vf.json">
+                        <button slot="activate" class="btn-install btn-vf">
+                            🔧 Kết Nối &amp; Nạp VF Pin Tool
+                        </button>
+                    </esp-web-install-button>
+                </div>
+            </div>
+
+            <!-- 5. JK-BMS PB & CAN BIEN TAN -->
+            <div class="card card-jk-can">
+                <div>
+                    <div class="card-header">
+                        <div class="card-icon">⚡</div>
+                        <div>
+                            <div class="card-title">JK-BMS PB &amp; CAN Biến Tần</div>
+                            <span class="card-ver" id="ver-jk-can">Phiên bản v1.0.0-JK-CAN</span>
+                        </div>
+                    </div>
+                    <p class="card-desc">Dành cho ESP32 CYD (ESP32-2432S028) kết nối JK-BMS qua Bluetooth BLE và giao tiếp CAN Bus với Biến Tần Inverter.</p>
+                    <ul class="card-features">
+                        <li>Màn hình cảm ứng LCD hiển thị V, A, W, SOC, SOH, Cells, Nhiệt độ</li>
+                        <li>Cầu nối CAN Bus đa giao thức: Deye, Luxpower, Pylontech, Victron, Growatt...</li>
+                        <li>Hỗ trợ nạp firmware và Cập nhật OTA tự động qua WiFi</li>
+                    </ul>
+                </div>
+                <div>
+                    <esp-web-install-button manifest="/manifest-jk-can.json">
+                        <button slot="activate" class="btn-install btn-jk-can">
+                            ⚡ Kết Nối &amp; Nạp JK-CAN Tool
+                        </button>
+                    </esp-web-install-button>
+                </div>
+            </div>
+        </div>
+
+        <!-- 4-STEP INSTRUCTIONS FOR CUSTOMERS -->
+        <div class="guide-box">
+            <div class="guide-title">
+                <span>📖</span> Hướng Dẫn 4 Bước Cho Khách Hàng
+            </div>
+            <div class="steps">
+                <div class="step-item">
+                    <div class="step-num">1</div>
+                    <div class="step-txt">Cắm cáp sạc/truyền dữ liệu Type-C từ ESP32 vào cổng USB máy tính.</div>
+                </div>
+                <div class="step-item">
+                    <div class="step-num">2</div>
+                    <div class="step-txt">Nhấn nút <strong>"Kết Nối & Nạp"</strong> tương ứng với loại mạch của bạn ở trên.</div>
+                </div>
+                <div class="step-item">
+                    <div class="step-num">3</div>
+                    <div class="step-txt">Trình duyệt hiện hộp thoại chọn cổng: Chọn cổng COM (VD: <em>USB Serial</em>) rồi bấm <strong>Connect</strong>.</div>
+                </div>
+                <div class="step-item">
+                    <div class="step-num">4</div>
+                    <div class="step-txt">Chờ nạp xong 100% trong 15-20 giây. ESP32 sẽ tự khởi động lại vào firmware mới sạch sẽ!</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="footer">
+            Hệ Thống Giám Sát JK BMS WiFi Monitor &bull; Server: bms.lha.io.vn &bull; ESP32-C3 / ESP32-C6 / ESP32 / ESP32 CYD
+        </div>
+    </div>
+
+    <script>
+        if (!('serial' in navigator)) {
+            document.getElementById('unsupported-alert').style.display = 'block';
+        }
+
+        // Tự động đọc phiên bản mới nhất trực tiếp từ manifest của server
+        async function loadLiveVersions() {
+            const targets = [
+                { id: 'ver-ble', url: '/manifest-ble.json', prefix: 'Phiên bản ' },
+                { id: 'ver-rs485', url: '/manifest-rs485.json', prefix: 'Phiên bản ' },
+                { id: 'ver-bal', url: '/manifest-balancer.json', prefix: 'Phiên bản ' },
+                { id: 'ver-vf', url: '/manifest-vf.json', prefix: 'Phiên bản ' }
+            { id: 'ver-jk-can', url: '/manifest-jk-can.json', prefix: 'Phiên bản ' },
+            ];
+            for (const t of targets) {
+                try {
+                    const r = await fetch(t.url + '?t=' + Date.now());
+                    if (r.ok) {
+                        const data = await r.json();
+                        if (data && data.version) {
+                            const el = document.getElementById(t.id);
+                            if (el) el.textContent = t.prefix + data.version;
+                        }
+                    }
+                } catch (e) {}
+            }
+        }
+        loadLiveVersions();
+
+        // ==========================================
+        // BẢO VỆ MẬT KHẨU QUẢN TRỊ (ADMIN AUTH)
+        // ==========================================
+        const ADMIN_HASH_KEY = "vf_flasher_admin_auth_2026";
+        const ADMIN_PASS_REAL = "admintool2026"; // Mật khẩu quản trị
+
+        function checkAuthStatus() {
+            const isAuth = sessionStorage.getItem(ADMIN_HASH_KEY) || localStorage.getItem(ADMIN_HASH_KEY);
+            const overlay = document.getElementById('auth-overlay');
+            if (isAuth === "true") {
+                overlay.style.display = 'none';
+            } else {
+                overlay.style.display = 'flex';
+                setTimeout(() => {
+                    const inp = document.getElementById('admin-pass-input');
+                    if (inp) inp.focus();
+                }, 100);
+            }
+        }
+
+        function handleAdminLogin(e) {
+            e.preventDefault();
+            const inp = document.getElementById('admin-pass-input');
+            const err = document.getElementById('login-err-msg');
+            const val = inp.value.trim();
+
+            if (val === ADMIN_PASS_REAL) {
+                sessionStorage.setItem(ADMIN_HASH_KEY, "true");
+                localStorage.setItem(ADMIN_HASH_KEY, "true");
+                err.style.display = 'none';
+                document.getElementById('auth-overlay').style.display = 'none';
+            } else {
+                err.style.display = 'block';
+                inp.value = '';
+                inp.focus();
+            }
+        }
+
+        function handleAdminLogout() {
+            if (confirm("Bạn có chắc chắn muốn đăng xuất khỏi trang quản trị?")) {
+                sessionStorage.removeItem(ADMIN_HASH_KEY);
+                localStorage.removeItem(ADMIN_HASH_KEY);
+                location.reload();
+            }
+        }
+
+        checkAuthStatus();
+
+        // ==========================================
+        // THUẬT TOÁN SINH MÃ BẢN QUYỀN (KEYGEN FNV-1A)
+        // ==========================================
+        const SECRET_SALT = "VF_SECURE_CYD_2026_ANTI_THEFT";
+
+        function fnv1a32(str) {
+            let hash = 2166136261 >>> 0;
+            const prime = 16777619 >>> 0;
+            for (let i = 0; i < str.length; i++) {
+                hash = (hash ^ str.charCodeAt(i)) >>> 0;
+                hash = Math.imul(hash, prime) >>> 0;
+            }
+            return hash;
+        }
+
+        function generateWebKey() {
+            const inp = document.getElementById("web-mac-input");
+            const cleanMac = inp.value.replace(/[^0-9A-Fa-f]/g, '').toUpperCase();
+            if (cleanMac.length !== 12) {
+                alert("Vui lòng nhập đúng 12 ký tự MAC (Ví dụ: C4:DE:E2:4A:8B:90 hoặc C4DEE24A8B90)!");
+                inp.focus();
+                return;
+            }
+            const combined = cleanMac + "_" + SECRET_SALT;
+            const hash = fnv1a32(combined);
+            const key = (hash % 900000) + 100000;
+
+            document.getElementById("web-key-val").innerText = key;
+            const btnCopy = document.getElementById("web-btn-copy");
+            btnCopy.innerText = "Sao chép";
+        }
+
+        function copyWebKey() {
+            const keyVal = document.getElementById("web-key-val").innerText;
+            if (keyVal === "------") return;
+            navigator.clipboard.writeText(keyVal).then(() => {
+                const btn = document.getElementById("web-btn-copy");
+                btn.innerText = "Đã sao chép!";
+                setTimeout(() => { btn.innerText = "Sao chép"; }, 2000);
+            });
+        }
+
+        // Tự động định dạng MAC khi gõ
+        const macInp = document.getElementById("web-mac-input");
+        if (macInp) {
+            macInp.addEventListener("input", function(e) {
+                let val = e.target.value.replace(/[^0-9A-Fa-f]/g, '').toUpperCase();
+                if (val.length > 12) val = val.substring(0, 12);
+                let formatted = "";
+                for (let i = 0; i < val.length; i++) {
+                    if (i > 0 && i % 2 === 0 && i < 12) formatted += ":";
+                    formatted += val[i];
+                }
+                e.target.value = formatted;
+                if (val.length === 12) {
+                    generateWebKey();
+                }
+            });
+            macInp.addEventListener("keydown", function(e) {
+                if (e.key === "Enter") {
+                    generateWebKey();
+                }
+            });
+        }
+
+    </script>
+</body>
+</html>
+`;
             --surface: #151d28;
             --surface-hover: #1e293b;
             --border: #243247;

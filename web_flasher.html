@@ -66,6 +66,11 @@
         .card-vf .card-icon { background: var(--green-dim); border: 1px solid rgba(34,197,94,0.3); }
         .card-vf .card-ver { background: var(--green-dim); color: var(--green); border: 1px solid rgba(34,197,94,0.3); }
 
+        .card-jk-can .card-icon { background: rgba(6,182,212,0.15); border: 1px solid rgba(6,182,212,0.3); }
+        .card-jk-can .card-ver { background: rgba(6,182,212,0.15); color: #06b6d4; border: 1px solid rgba(6,182,212,0.3); }
+        .btn-jk-can { background: linear-gradient(135deg, #06b6d4, #0284c7); color: #fff; }
+        .btn-jk-can:hover { opacity: 0.9; box-shadow: 0 4px 15px rgba(6,182,212,0.4); }
+
         /* Custom Button for ESP Web Tools */
         esp-web-install-button { width: 100%; display: block; }
         .btn-install {
@@ -536,6 +541,32 @@
                     </esp-web-install-button>
                 </div>
             </div>
+
+            <!-- 5. JK-BMS PB & CAN BIEN TAN -->
+            <div class="card card-jk-can">
+                <div>
+                    <div class="card-header">
+                        <div class="card-icon">⚡</div>
+                        <div>
+                            <div class="card-title">JK-BMS PB &amp; CAN Biến Tần</div>
+                            <span class="card-ver" id="ver-jk-can">Phiên bản v1.0.0-JK-CAN</span>
+                        </div>
+                    </div>
+                    <p class="card-desc">Dành cho ESP32 CYD (ESP32-2432S028) kết nối JK-BMS qua Bluetooth BLE và giao tiếp CAN Bus với Biến Tần Inverter.</p>
+                    <ul class="card-features">
+                        <li>Màn hình cảm ứng LCD hiển thị V, A, W, SOC, SOH, Cells, Nhiệt độ</li>
+                        <li>Cầu nối CAN Bus đa giao thức: Deye, Luxpower, Pylontech, Victron, Growatt...</li>
+                        <li>Hỗ trợ nạp firmware và Cập nhật OTA tự động qua WiFi</li>
+                    </ul>
+                </div>
+                <div>
+                    <esp-web-install-button manifest="/manifest-jk-can.json">
+                        <button slot="activate" class="btn-install btn-jk-can">
+                            ⚡ Kết Nối &amp; Nạp JK-CAN Tool
+                        </button>
+                    </esp-web-install-button>
+                </div>
+            </div>
         </div>
 
         <!-- 4-STEP INSTRUCTIONS FOR CUSTOMERS -->
@@ -580,6 +611,7 @@
                 { id: 'ver-rs485', url: '/manifest-rs485.json', prefix: 'Phiên bản ' },
                 { id: 'ver-bal', url: '/manifest-balancer.json', prefix: 'Phiên bản ' },
                 { id: 'ver-vf', url: '/manifest-vf.json', prefix: 'Phiên bản ' }
+            { id: 'ver-jk-can', url: '/manifest-jk-can.json', prefix: 'Phiên bản ' },
             ];
             for (const t of targets) {
                 try {

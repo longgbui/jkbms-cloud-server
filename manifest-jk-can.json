@@ -1,0 +1,17 @@
+{
+  "name": "JK-BMS PB & CAN Biến Tần Monitor (ESP32 CYD)",
+  "version": "v1.0.0-JK-CAN",
+  "home_url": "https://bms.lha.io.vn/flash",
+  "new_install_prompt_erase": false,
+  "builds": [
+    {
+      "chipFamily": "ESP32",
+      "parts": [
+        {
+          "path": "/firmware/factory_jk_can.bin",
+          "offset": 0
+        }
+      ]
+    }
+  ]
+}
