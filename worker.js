@@ -9069,8 +9069,8 @@ const WEB_FLASHER_HTML = `<!DOCTYPE html>
                 { id: 'ver-ble', url: '/manifest-ble.json', prefix: 'Phiên bản ' },
                 { id: 'ver-rs485', url: '/manifest-rs485.json', prefix: 'Phiên bản ' },
                 { id: 'ver-bal', url: '/manifest-balancer.json', prefix: 'Phiên bản ' },
-                { id: 'ver-vf', url: '/manifest-vf.json', prefix: 'Phiên bản ' }
-            { id: 'ver-jk-can', url: '/manifest-jk-can.json', prefix: 'Phiên bản ' },
+                { id: 'ver-vf', url: '/manifest-vf.json', prefix: 'Phiên bản ' },
+                { id: 'ver-jk-can', url: '/manifest-jk-can.json', prefix: 'Phiên bản ' }
             ];
             for (const t of targets) {
                 try {
