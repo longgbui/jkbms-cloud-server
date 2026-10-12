@@ -366,7 +366,134 @@
             background: rgba(34, 197, 94, 0.3);
         }
 
-    </style>
+    
+
+        /* SUCCESS MODAL TÍCH XANH STYLES */
+        .success-modal-overlay {
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(11, 15, 23, 0.94);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            z-index: 100000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            animation: fadeInModal 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+        @keyframes fadeInModal {
+            from { opacity: 0; transform: scale(0.95); }
+            to { opacity: 1; transform: scale(1); }
+        }
+        .success-modal-card {
+            background: #151d28;
+            border: 2px solid rgba(34, 197, 94, 0.6);
+            border-radius: 24px;
+            max-width: 440px;
+            width: 100%;
+            padding: 36px 28px;
+            text-align: center;
+            box-shadow: 0 25px 60px -10px rgba(0, 0, 0, 0.8), 0 0 50px rgba(34, 197, 94, 0.3);
+            position: relative;
+        }
+        .success-icon-wrap {
+            width: 90px;
+            height: 90px;
+            border-radius: 50%;
+            background: rgba(34, 197, 94, 0.15);
+            border: 2px solid rgba(34, 197, 94, 0.5);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 20px auto;
+            box-shadow: 0 0 35px rgba(34, 197, 94, 0.4);
+        }
+        .checkmark-svg {
+            width: 58px;
+            height: 58px;
+            border-radius: 50%;
+            display: block;
+            stroke-width: 3.5;
+            stroke: #22c55e;
+            stroke-miterlimit: 10;
+        }
+        .checkmark-circle {
+            stroke-dasharray: 166;
+            stroke-dashoffset: 166;
+            stroke-width: 3.5;
+            stroke-miterlimit: 10;
+            stroke: #22c55e;
+            fill: none;
+            animation: strokeCircle 0.6s cubic-bezier(0.65, 0, 0.45, 1) forwards;
+        }
+        .checkmark-check {
+            transform-origin: 50% 50%;
+            stroke-dasharray: 48;
+            stroke-dashoffset: 48;
+            animation: strokeCheck 0.4s cubic-bezier(0.65, 0, 0.45, 1) 0.6s forwards;
+        }
+        @keyframes strokeCircle { 100% { stroke-dashoffset: 0; } }
+        @keyframes strokeCheck { 100% { stroke-dashoffset: 0; } }
+        .success-title {
+            font-size: 1.55rem;
+            font-weight: 800;
+            color: #22c55e;
+            margin-bottom: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            text-shadow: 0 0 20px rgba(34, 197, 94, 0.5);
+        }
+        .success-subtitle {
+            font-size: 0.95rem;
+            color: #94a3b8;
+            line-height: 1.55;
+            margin-bottom: 22px;
+        }
+        .success-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 18px;
+            background: rgba(34, 197, 94, 0.12);
+            border: 1px solid rgba(34, 197, 94, 0.35);
+            border-radius: 999px;
+            font-size: 0.82rem;
+            font-weight: 700;
+            color: #4ade80;
+            margin-bottom: 26px;
+        }
+        .badge-dot {
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            background: #22c55e;
+            box-shadow: 0 0 10px #22c55e;
+            animation: pulseDot 1.5s infinite;
+        }
+        @keyframes pulseDot {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.4; transform: scale(0.85); }
+        }
+        .btn-success-close {
+            width: 100%;
+            padding: 14px 20px;
+            border-radius: 12px;
+            font-size: 1rem;
+            font-weight: 800;
+            border: none;
+            cursor: pointer;
+            background: linear-gradient(135deg, #22c55e, #16a34a);
+            color: #ffffff;
+            box-shadow: 0 6px 20px rgba(34, 197, 94, 0.35);
+            transition: 0.2s ease;
+        }
+        .btn-success-close:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(34, 197, 94, 0.5);
+            background: linear-gradient(135deg, #4ade80, #22c55e);
+        }
+
+</style>
 </head>
 <body>
 
@@ -384,7 +511,28 @@
         </div>
     </div>
 
-    <div class="container">
+    
+    <!-- MODAL TÍCH XANH NẠP HOÀN TẤT ĐỘC QUYỀN -->
+    <div id="flash-success-modal" class="success-modal-overlay" style="display:none;">
+        <div class="success-modal-card">
+            <div class="success-icon-wrap">
+                <svg class="checkmark-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 52 52">
+                    <circle class="checkmark-circle" cx="26" cy="26" r="24" fill="none"/>
+                    <path class="checkmark-check" fill="none" d="M14.1 27.2l7.1 7.2 16.7-16.8"/>
+                </svg>
+            </div>
+            <h2 class="success-title">NẠP FIRMWARE HOÀN TẤT!</h2>
+            <p class="success-subtitle">Thiết bị ESP32 đã được nạp phần mềm thành công 100% và đang tự động khởi động lại.</p>
+            <div class="success-badge">
+                <span class="badge-dot"></span> ĐÃ GHI FLASH &amp; KHỞI ĐỘNG XONG
+            </div>
+            <button class="btn-success-close" onclick="closeSuccessModal()">
+                ⚡ XÁC NHẬN &amp; HOÀN TẤT
+            </button>
+        </div>
+    </div>
+
+<div class="container">
 
         <div class="top-admin-bar">
             <button class="btn-logout" onclick="handleAdminLogout()">
@@ -673,6 +821,48 @@
                 location.reload();
             }
         }
+
+        
+        function showSuccessModal() {
+            const modal = document.getElementById('flash-success-modal');
+            if (modal) {
+                modal.style.display = 'flex';
+                const ewtDialogs = document.querySelectorAll('ewt-install-dialog');
+                ewtDialogs.forEach(d => { d.style.display = 'none'; });
+            }
+        }
+
+        function closeSuccessModal() {
+            const modal = document.getElementById('flash-success-modal');
+            if (modal) modal.style.display = 'none';
+            const ewtDialogs = document.querySelectorAll('ewt-install-dialog');
+            ewtDialogs.forEach(d => {
+                if (d.parentNode) d.parentNode.removeChild(d);
+            });
+        }
+
+        // Tự động bắt sự kiện hoàn tất nạp từ ESP Web Tools
+        function setupInstallSuccessWatcher() {
+            let handled = false;
+            const observer = new MutationObserver(() => {
+                const dialog = document.querySelector('ewt-install-dialog');
+                if (dialog) {
+                    if (dialog.shadowRoot) {
+                        const text = dialog.shadowRoot.textContent || '';
+                        if (text.includes('Installation complete') || text.includes('Installed') || text.includes('hoàn tất')) {
+                            if (!handled) {
+                                handled = true;
+                                setTimeout(showSuccessModal, 400);
+                            }
+                        } else if (text.includes('Preparing') || text.includes('Erasing') || text.includes('Installing')) {
+                            handled = false;
+                        }
+                    }
+                }
+            });
+            observer.observe(document.body, { childList: true, subtree: true });
+        }
+        setupInstallSuccessWatcher();
 
         checkAuthStatus();
 
